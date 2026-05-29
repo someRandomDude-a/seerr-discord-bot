@@ -215,6 +215,15 @@ class SeerrBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
+    async def on_ready(self):
+        print(f"Bot logged in as {self.user}")
+        # Set the status with the Seerr URL
+        activity = discord.Activity(
+            type=discord.ActivityType.streaming,
+            name=f"Do /seerr for a clickable link!"
+        )
+        await self.change_presence(activity=activity)
+
     async def setup_hook(self):
         await self.tree.sync()   # sync slash commands globally
 
@@ -274,6 +283,17 @@ async def requests_cmd(interaction: discord.Interaction):
     view = RequestsView(interaction.user.id, requests_list)
     embed = view._build_embed()
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="seerr", description="Get a clickable Seerr server URL")
+async def seerr_cmd(interaction: discord.Interaction):
+    linked = get_seerr_user(interaction.user.id)
+    if not linked:
+        await interaction.response.send_message(
+            "You haven't linked your Jellyfin account yet. Use `/link` to get started.",
+            ephemeral=True
+        )
+        return
+    await interaction.response.send_message(f"🌐 Seerr: {SEERR_URL}", ephemeral=True)
 
 # Run
 if __name__ == "__main__":
