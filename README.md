@@ -98,7 +98,7 @@ python bot.py
 
 ---
 
-## 🎮 Usage (Slash Commands)
+## Usage (Slash Commands)
 
 All commands are private (ephemeral) – only you can see the responses.
 
@@ -125,7 +125,7 @@ All commands are private (ephemeral) – only you can see the responses.
 
 ---
 
-## 🔧 How It Works
+## How It Works
 
 ### 1. Sync Engine (`sync.py`)
 
