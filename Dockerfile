@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt /app
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ./seerr /app
+COPY ./seerr /app/seerr
 COPY bot.py /app
 
 CMD ["python", "bot.py"]
