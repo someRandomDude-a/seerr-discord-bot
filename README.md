@@ -55,7 +55,7 @@ A Discord bot that links Jellyfin users to Seerr and lets them view/remove their
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/yourusername/seerr-discord-bot.git
+   git clone https://github.com/someRandomDude-a/seerr-discord-bot.git
    cd seerr-discord-bot
    ```
 
