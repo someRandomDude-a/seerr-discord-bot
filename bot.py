@@ -12,7 +12,11 @@ SEERR_URL = os.getenv("SEERR_URL", "")
 SEERR_ADMIN_KEY = os.getenv("SEERR_ADMIN_KEY", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DB_PATH = os.getenv("DATABASE_PATH", "seerr_cache.db")
-LINKED_FILE = "linked_users.json"
+
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, DB_PATH)
+LINKED_FILE = os.path.join(DATA_DIR, "linked_users.json")
 
 #  Seerr API & Sync Manager
 api = SeerrAPI(SEERR_URL, api_key=SEERR_ADMIN_KEY)
