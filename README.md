@@ -28,7 +28,29 @@ A Discord bot that links Jellyfin users to Seerr and lets them view/remove their
 
 ---
 
-## Installation
+## Docker Installation
+
+1. **Create a `docker-compose.yaml` file:**
+
+   ```yaml
+   services:
+   discord-bot:
+      image: ghcr.io/somerandomdude-a/seerr-discord-bot:latest
+      volumes:
+         - ./data:/data
+      environment:
+         - SEERR_URL=https://movies.neblo.in/
+         - SEERR_ADMIN_KEY=your-seerr-key
+         - DISCORD_TOKEN=your-discord-bot-token
+      restart: unless-stopped
+   ```
+
+2. **Create a folder `./data` in your installation location** 
+      You can configure this by mounting your own volume in `/data` inside the container
+
+3. run `docker compose up -d` (you may need to use `sudo` depending on your environment)
+
+## Python Installation
 
 1. **Clone the repository**
 
