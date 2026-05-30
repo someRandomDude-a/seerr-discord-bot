@@ -4,8 +4,7 @@ import sqlite3
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from seerr import SeerrAPI
-from seerr import SyncManager
+from .seerr import SeerrAPI, SyncManager
 
 load_dotenv()
 SEERR_URL = os.getenv("SEERR_URL", "")
