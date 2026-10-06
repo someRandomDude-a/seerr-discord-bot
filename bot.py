@@ -1,303 +1,334 @@
-import os
-import json
-import sqlite3
+import asyncio
+import logging
+import time
+
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from seerr import SeerrAPI, SyncManager
 
-load_dotenv()
-SEERR_URL = os.getenv("SEERR_URL", "")
-SEERR_ADMIN_KEY = os.getenv("SEERR_ADMIN_KEY", "")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-DB_PATH = os.getenv("DATABASE_PATH", "seerr_cache.db")
+from media_bot.config import Config
+from media_bot.security import RateLimiter, UserError
+from media_bot.service import MediaService
+from media_bot.linking import QuickConnect
+from media_bot.activity import ActivityAPI
+from media_bot.admin import AdminMessaging
+from media_bot.ui import DashboardView, ItemsView, PreferencesView, clean, dashboard_embed, embed, error_message
+from media_bot.webhooks import WebhookServer
 
-DATA_DIR = os.getenv("DATA_DIR", "./data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, DB_PATH)
-LINKED_FILE = os.path.join(DATA_DIR, "linked_users.json")
+log = logging.getLogger(__name__)
 
-#  Seerr API & Sync Manager
-api = SeerrAPI(SEERR_URL, api_key=SEERR_ADMIN_KEY)
-sync_mgr = SyncManager(api, DB_PATH)
-sync_mgr.start_loop(interval=3600)   # sync every hour
 
-# User Link Storage (JSON)
-def load_links() -> dict:
-    """Load Discord ID → Seerr user mapping from JSON file."""
-    try:
-        with open(LINKED_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_links(links: dict):
-    """Save links dictionary to JSON file."""
-    with open(LINKED_FILE, "w") as f:
-        json.dump(links, f, indent=2)
-
-def get_seerr_user(discord_id: int) -> dict | None:
-    """Return the linked Seerr user data for a Discord user, or None."""
-    links = load_links()
-    return links.get(str(discord_id))
-
-# Status mapping for display
-STATUS_MAP = {
-    1: "Pending",
-    2: "Approved",
-    3: "Declined",
-    5: "Available",
-    6: "Partial"
-}
-
-# Login Modal
-class JellyfinLoginModal(discord.ui.Modal, title="Link your Jellyfin Account"):
-    username = discord.ui.TextInput(
-        label="Jellyfin Username",
-        placeholder="Enter your Jellyfin username",
-        required=True,
-        max_length=100
-    )
-    password = discord.ui.TextInput(
-        label="Jellyfin Password",
-        placeholder="Enter your Jellyfin password",
-        required=True,
-        style=discord.TextStyle.short,
-        max_length=128
-    )
-
-    def __init__(self, seerr_url: str):
-        super().__init__()
-        self.api_url = seerr_url
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Verify with Seerr using a temporary client
-        temp_api = SeerrAPI(self.api_url)
-        try:
-            temp_api.login_with_jellyfin(
-                username=self.username.value,
-                password=self.password.value,
-                server_type=0  # 0 = Jellyfin, 1 = Emby
-            )
-            user = temp_api.get_current_user()
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Invalid Jellyfin credentials. Please try again.",
-                ephemeral=True
-            )
-            return
-
-        # confirm the username matches
-        if user["displayName"].lower() != self.username.value.lower():
-            await interaction.response.send_message(
-                "❌ Authenticated user does not match the provided username.",
-                ephemeral=True
-            )
-            return
-
-        # Save the link
-        links = load_links()
-        links[str(interaction.user.id)] = {
-            "seerr_id": user["id"],
-            "username": user["displayName"]
-        }
-        save_links(links)
-
-        await interaction.response.send_message(
-            f"✅ Your Jellyfin account **{user['displayName']}** has been linked!",
-            ephemeral=True
-        )
-
-# Paginated Requests View with Remove Buttons
-class RequestsView(discord.ui.View):
-    def __init__(self, user_id: int, requests_data: list, page_size: int = 5):
-        super().__init__(timeout=300)
-        self.user_id = user_id
-        self.requests = requests_data
-        self.page_size = page_size
-        self.current_page = 0
-        self.total_pages = max(1, -(-len(requests_data) // page_size))
-        self._update_buttons()
-
-    def _get_page_requests(self):
-        start = self.current_page * self.page_size
-        end = start + self.page_size
-        return self.requests[start:end]
-
-    def _build_embed(self):
-        page_reqs = self._get_page_requests()
-        embed = discord.Embed(
-            title="Your Requests",
-            color=0x00ff00,
-            description=f"Page {self.current_page + 1}/{self.total_pages}"
-        )
-        for req in page_reqs:
-            status = STATUS_MAP.get(req["status"], "Unknown")
-            embed.add_field(
-                name=f"{req['title']} ({req['type']})",
-                value=f"Status: **{status}** | ID: {req['id']}",
-                inline=False
-            )
-        if not page_reqs:
-            embed.description = "No requests found."
-        return embed
-
-    def _update_buttons(self):
-        self.clear_items()
-
-        # Remove buttons for each request on this page
-        for req in self._get_page_requests():
-            btn = discord.ui.Button(
-                label=f"Remove {req['title'][:20]}",
-                style=discord.ButtonStyle.danger,
-                custom_id=f"remove_{req['id']}"
-            )
-            # Pass media_id to the callback to delete the whole media
-            btn.callback = self._make_remove_callback(req["id"], req["media_id"])
-            self.add_item(btn)
-
-        # Pagination buttons
-        if self.total_pages > 1:
-            prev_btn = discord.ui.Button(
-                label="◀ Previous",
-                style=discord.ButtonStyle.primary,
-                custom_id="prev",
-                disabled=(self.current_page == 0)
-            )
-            next_btn = discord.ui.Button(
-                label="Next ▶",
-                style=discord.ButtonStyle.primary,
-                custom_id="next",
-                disabled=(self.current_page == self.total_pages - 1)
-            )
-            prev_btn.callback = self.prev_page
-            next_btn.callback = self.next_page
-            self.add_item(prev_btn)
-            self.add_item(next_btn)
-
-    def _make_remove_callback(self, request_id: int, media_id: int):
-        async def callback(interaction: discord.Interaction):
-            try:
-                api._request('DELETE', f'/media/{media_id}/file')
-            except Exception:
-                pass  # Continue even if file deletion fails
-
-            # Delete the media entry (which removes all requests and triggers *arr deletion)
-            try:
-                api._request('DELETE', f'/media/{media_id}')
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"❌ Failed to delete media: {e}",
-                    ephemeral=True
-                )
-                return
-
-            # Remove all requests with this media_id from the local cache
-            self.requests = [r for r in self.requests if r["media_id"] != media_id]
-            self.total_pages = max(1, -(-len(self.requests) // self.page_size))
-            if self.current_page >= self.total_pages:
-                self.current_page = self.total_pages - 1
-            self._update_buttons()
-            await interaction.response.edit_message(embed=self._build_embed(), view=self)
-        return callback
-
-    async def prev_page(self, interaction: discord.Interaction):
-        self.current_page -= 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        self.current_page += 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
-
-# Bot Setup
 class SeerrBot(commands.Bot):
-    def __init__(self):
+    def __init__(self, config):
+        # Privileged intents are opt-in; DMs and direct mentions work without message content.
         intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+        intents.members = config.members_intent
+        intents.message_content = config.inbox_message_content
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents,
+                         allowed_mentions=discord.AllowedMentions.none())
+        self.config = config
+        self.service = MediaService(config)
+        self.limiter = RateLimiter(config.rate_limit, config.rate_window)
+        self.link_limiter = RateLimiter(config.login_limit, config.login_window)
+        self.refresh_event = asyncio.Event()
+        self.linking = QuickConnect(self.service)
+        self.admin = AdminMessaging(self)
+        self.activity = ActivityAPI(self) if config.activity_enabled else None
+        self.webhooks = WebhookServer(self.service, self.refresh_event, self.activity)
+        self.worker = None
+        self.message_worker = None
+        self.tree.on_error = self.command_error
+        register_commands(self)
 
-    async def on_ready(self):
-        print(f"Bot logged in as {self.user}")
-        # Set the status with the Seerr URL
-        activity = discord.Activity(
-            type=discord.ActivityType.streaming,
-            name=f"Do /seerr for a clickable link!"
-        )
-        await self.change_presence(activity=activity)
+    def guard(self, interaction):
+        if self.config.guild_ids and interaction.guild_id not in self.config.guild_ids:
+            raise UserError('This bot is restricted to configured Discord servers.')
+        self.limiter.check(interaction.user.id)
+
+    async def command_error(self, interaction, error):
+        original = getattr(error, 'original', error)
+        await error_message(interaction, str(original) if isinstance(original, UserError) else 'Operation not confirmed. Check /status and refresh before retrying.')
+        if not isinstance(original, UserError):
+            log.warning('Slash command failed (%s)', type(original).__name__)
 
     async def setup_hook(self):
-        await self.tree.sync()   # sync slash commands globally
+        if self.config.activity_enabled and self.application_id != int(self.config.application_id):
+            raise ValueError('DISCORD_APPLICATION_ID must match the bot token application')
+        await self.webhooks.start()
+        # Interrupted writes must not be automatically replayed on restart.
+        with self.service.store.connect() as db:
+            db.execute("UPDATE actions SET status='uncertain',error='Process stopped during execution; verify upstream' WHERE status='processing'")
+        if self.config.guild_ids:
+            for guild_id in self.config.guild_ids:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+        self.worker = asyncio.create_task(self.sync_worker())
+        self.message_worker = asyncio.create_task(self.admin.deliver())
 
-bot = SeerrBot()
+    async def on_ready(self):
+        log.info('Media Hub connected to Discord')
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='/dashboard · your media hub'))
 
-# Slash Commands
-@bot.tree.command(name="link", description="Link your Jellyfin account to the bot")
-async def link_cmd(interaction: discord.Interaction):
-    # Already linked check
-    linked = get_seerr_user(interaction.user.id)
-    if linked:
-        await interaction.response.send_message(
-            f"Your account is already linked as **{linked['username']}**. Use `/requests` to view your requests.",
-            ephemeral=True
-        )
-        return
+    async def on_message(self, message):
+        await self.admin.receive(message)
 
-    # Show the login modal
-    modal = JellyfinLoginModal(SEERR_URL)
-    await interaction.response.send_modal(modal)
+    async def sync_worker(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            self.refresh_event.clear()
+            try:
+                await self.linking.expire()
+                await self.service.refresh()
+                await self.service.process_due_deletions()
+                await self.deliver_notifications()
+            except UserError:
+                log.warning('Live sync failed; stale-data operations and notifications blocked')
+            except Exception as exc:
+                log.warning('Background cycle failed (%s)', type(exc).__name__)
+            try:
+                await asyncio.wait_for(self.refresh_event.wait(), timeout=self.config.sync_interval)
+            except asyncio.TimeoutError:
+                pass
 
-@bot.tree.command(name="requests", description="View and manage your Seerr requests")
-async def requests_cmd(interaction: discord.Interaction):
-    linked = get_seerr_user(interaction.user.id)
-    if not linked:
-        await interaction.response.send_message(
-            "You haven't linked your Jellyfin account yet. Use `/link` to get started.",
-            ephemeral=True
-        )
-        return
+    def notification_eligible(self, discord_id):
+        account = self.service.account(discord_id)
+        if not account['opted_in']:
+            return False
+        with self.service.as_user(account):
+            return True
 
-    # Fetch requests from local SQLite cache
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        rows = conn.execute("""
-            SELECT id, title, type, status, poster_path, media_id
-            FROM requests
-            WHERE requested_by_id = ?
-            ORDER BY updated_at DESC
-        """, (linked["seerr_id"],)).fetchall()
+    async def deliver_notifications(self):
+        with self.service.store.connect() as db:
+            rows = [dict(r) for r in db.execute('SELECT * FROM outbox WHERE sent=0 AND next_attempt<=? ORDER BY id LIMIT 25', (time.time(),))]
+        for row in rows:
+            try:
+                # Revalidate opt-in and live Seerr account immediately before every delivery.
+                async with self.service.lock:
+                    if self.service.store.meta().get('error'):
+                        return
+                    if not await asyncio.to_thread(self.notification_eligible, row['discord_id']):
+                        with self.service.store.connect() as db:
+                            db.execute('UPDATE outbox SET sent=1 WHERE id=?', (row['id'],))
+                        continue
+                    user = self.get_user(int(row['discord_id'])) or await self.fetch_user(int(row['discord_id']))
+                    await user.send(embed=embed(f"✨ {clean(row['title'], 180)}", clean(row['body'], 1400) + '\n\nManage your watchlist and opt-in with /dashboard.'), allowed_mentions=discord.AllowedMentions.none())
+                    with self.service.store.connect() as db:
+                        db.execute('UPDATE outbox SET sent=1 WHERE id=?', (row['id'],))
+            except (discord.Forbidden, UserError):
+                # Closed DMs or revoked links: pause safely; user can explicitly opt in again.
+                self.service.store.preference(row['discord_id'], opted_in=False)
+            except Exception:
+                attempts = row['attempts'] + 1
+                with self.service.store.connect() as db:
+                    db.execute('UPDATE outbox SET attempts=?,next_attempt=? WHERE id=?',
+                               (attempts, time.time() + min(3600, 30 * 2 ** min(attempts, 7)), row['id']))
 
-    requests_list = []
-    for row in rows:
-        requests_list.append({
-            "id": row[0],
-            "title": row[1],
-            "type": row[2],
-            "status": row[3],
-            "poster_path": row[4],
-            "media_id": row[5]
-        })
+    async def close(self):
+        if self.message_worker:
+            self.message_worker.cancel()
+            try:
+                await self.message_worker
+            except asyncio.CancelledError:
+                pass
+        if self.worker:
+            self.worker.cancel()
+            try:
+                await self.worker
+            except asyncio.CancelledError:
+                pass
+        await self.linking.close()
+        await self.webhooks.close()
+        # Let outstanding to_thread API calls finish before closing their shared session.
+        async with self.service.lock:
+            self.service.api.close()
+        await super().close()
 
-    if not requests_list:
-        await interaction.response.send_message("You have no requests.", ephemeral=True)
-        return
 
-    view = RequestsView(interaction.user.id, requests_list)
-    embed = view._build_embed()
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+def register_commands(bot):
+    @bot.tree.command(name='announce', description='Operators: message this server, a chosen user/server, or an explicit broadcast')
+    async def announce(interaction: discord.Interaction, message: str, server_id: str = None,
+                       recipient: discord.User = None, all_servers: bool = False, all_users: bool = False,
+                       server_ids: str = None, channel_id: str = None):
+        bot.guard(interaction)
+        bot.admin.require_admin(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        if all_servers and (server_id or server_ids or recipient):
+            raise UserError('Choose all servers or one explicit server/user.')
+        if recipient and all_users:
+            raise UserError('Choose one user or all members.')
+        if server_id and not server_id.isdigit():
+            raise UserError('Invalid server ID.')
+        if server_ids and server_id:
+            raise UserError('Use server_id or server_ids, not both.')
+        from media_bot.activity import snowflake
+        selected = [snowflake(g.strip()) for g in server_ids.split(',')] if server_ids else None
+        guild_ids = selected if selected is not None else [g.id for g in bot.guilds] if all_servers else ([int(server_id)] if server_id else
+                      [interaction.guild_id] if interaction.guild_id and not recipient else [])
+        preferred = snowflake(channel_id) if channel_id else interaction.channel_id if guild_ids == [interaction.guild_id] and not recipient and not all_servers else None
+        plan = await bot.admin.prepare(interaction.user.id, message, guild_ids,
+             user_id=recipient.id if recipient else None, all_users=all_users, channel_id=preferred)
+        from media_bot.ui import AnnouncementConfirmView
+        view = AnnouncementConfirmView(bot, interaction.user.id, plan)
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
-@bot.tree.command(name="seerr", description="Get a clickable Seerr server URL")
-async def seerr_cmd(interaction: discord.Interaction):
-    linked = get_seerr_user(interaction.user.id)
-    if not linked:
-        await interaction.response.send_message(
-            "You haven't linked your Jellyfin account yet. Use `/link` to get started.",
-            ephemeral=True
-        )
-        return
-    await interaction.response.send_message(f"🌐 Seerr: {SEERR_URL}", ephemeral=True)
+    @bot.tree.command(name='inbox', description='Operators: private DMs, bot mentions and replies with filters')
+    @app_commands.choices(kind=[app_commands.Choice(name=n, value=v) for n, v in [('All', 'all'), ('DMs', 'dm'), ('Servers', 'guild')]],
+                          order=[app_commands.Choice(name=n, value=v) for n, v in [('Newest', 'newest'), ('Oldest', 'oldest')]])
+    async def inbox(interaction: discord.Interaction, kind: str = 'all', server_id: str = None,
+                    user_id: str = None, channel_id: str = None, query: str = '', order: str = 'newest',
+                    page: app_commands.Range[int, 1, 10000] = 1):
+        bot.guard(interaction)
+        bot.admin.require_admin(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        from media_bot.admin_ui import AdminListView
+        view = AdminListView(bot, interaction.user.id, 'inbox', {'kind': kind, 'guild_id': server_id,
+            'user_id': user_id, 'channel_id': channel_id, 'query': query, 'order': order}, page)
+        view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
-# Run
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    @bot.tree.command(name='servers', description='Operators: joined servers and announcement destinations')
+    async def servers(interaction: discord.Interaction, page: app_commands.Range[int, 1, 10000] = 1):
+        bot.guard(interaction)
+        bot.admin.require_admin(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        from media_bot.admin_ui import AdminListView
+        view = AdminListView(bot, interaction.user.id, 'servers', page=page)
+        view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='deliveries', description='Operators: announcement results; select a job for individual destinations')
+    async def deliveries(interaction: discord.Interaction, job: app_commands.Range[int, 1] = None,
+                         page: app_commands.Range[int, 1, 10000] = 1):
+        bot.guard(interaction)
+        bot.admin.require_admin(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        from media_bot.admin_ui import AdminListView
+        view = AdminListView(bot, interaction.user.id, 'deliveries', page=page, job=job)
+        view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='activity', description='Launch the Media Hub dashboard inside Discord')
+    async def activity(interaction: discord.Interaction):
+        bot.guard(interaction)
+        if not bot.config.activity_enabled:
+            raise UserError('Activity mode is not configured yet. Use /dashboard, or enable it in the Discord Developer Portal and bot environment.')
+        await interaction.response.launch_activity()
+
+    @bot.tree.command(name='link', description='Passwordless Jellyfin Quick Connect in Discord; save your verified Discord ID in Seerr')
+    async def link(interaction: discord.Interaction):
+        bot.guard(interaction)
+        bot.link_limiter.check(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        session = await bot.linking.begin(interaction.user.id)
+        from media_bot.ui import QuickConnectView
+        view = QuickConnectView(bot, interaction.user.id, session)
+        await interaction.edit_original_response(embed=embed('🔐 Connect with Jellyfin',
+            f'# `{session.code}`\n'
+            '**Jellyfin → Settings → Quick Connect**\n'
+            f'Approve this code. Verified automatically.\n**{bot.config.link_ttl}s** · Keep private'), view=view)
+        bot.linking.attach(session, interaction)
+
+    @bot.tree.command(name='dashboard', description='Your private media hub: library, requests, storage and notifications')
+    async def dashboard(interaction: discord.Interaction):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        data = await bot.service.run(interaction.user.id, 'dashboard')
+        await interaction.followup.send(embed=dashboard_embed(data), view=DashboardView(bot, interaction.user.id), ephemeral=True)
+
+    @bot.tree.command(name='requests', description='Browse your requests, or all requests with Seerr management permission')
+    async def requests(interaction: discord.Interaction, all_requests: bool = False, query: str = ''):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'requests', (all_requests,), 'All requests' if all_requests else 'My requests', query=query)
+        await view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='search', description='Discover movies, series, music albums or books and request them')
+    @app_commands.choices(kind=[app_commands.Choice(name=label, value=value) for label, value in [('Movies', 'movie'), ('Series', 'tv'), ('Music albums', 'music'), ('Books', 'book')]])
+    async def search(interaction: discord.Interaction, kind: app_commands.Choice[str], query: str, page: app_commands.Range[int, 1, 500] = 1):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'search', (kind.value, query, page), 'Discover')
+        await view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='library', description='Browse available movies, shows, albums and books')
+    @app_commands.choices(kind=[app_commands.Choice(name=label, value=value) for label, value in [('Everything', 'all'), ('Movies', 'movie'), ('Series', 'tv'), ('Music', 'music'), ('Books', 'book')]])
+    async def library(interaction: discord.Interaction, kind: str = 'all', query: str = ''):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'library', (kind,), 'Available library', query=query)
+        await view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='storage', description='See verified live storage space across configured media services')
+    async def storage(interaction: discord.Interaction):
+        bot.guard(interaction)
+        await DashboardView(bot, interaction.user.id).storage(interaction)
+
+    @bot.tree.command(name='notifications', description='Opt in/out of personal updates and choose your Jellyfin device link')
+    async def notifications(interaction: discord.Interaction, enabled: bool = None):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        bot.service.account(interaction.user.id)
+        if enabled is True:
+            await bot.service.run(interaction.user.id, 'preferences', True)
+        elif enabled is False:
+            bot.service.mute_notifications(interaction.user.id)
+        view = PreferencesView(bot, interaction.user.id)
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='watchlist', description='Browse and remove followed items for personal state-change notifications')
+    async def watchlist(interaction: discord.Interaction, query: str = ''):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'watches', (), 'My watchlist', query=query)
+        await view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='deletions', description='View scheduled file deletions and undo them during the 24-hour delay')
+    async def deletions(interaction: discord.Interaction, query: str = ''):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'deletions', (), 'My file deletions · 24-hour undo window', query=query)
+        await view.load()
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='status', description='Inspect the database health and last verified refresh (diagnostic only)')
+    async def status(interaction: discord.Interaction):
+        bot.guard(interaction)
+        bot.service.account(interaction.user.id)
+        meta = bot.service.store.meta()
+        healthy = (not meta.get('error') and bool(meta.get('last_success')) and
+                   time.time() - float(meta['last_success']) <= bot.config.sync_interval * 2)
+        result = embed('Database health', '🟢 Last refresh succeeded' if healthy else '🔴 Not verified · data operations blocked until a successful live refresh')
+        if meta.get('last_success'):
+            result.add_field(name='Last complete refresh', value=f"<t:{int(float(meta['last_success']))}:F>")
+        result.add_field(name='Background interval', value=f'{bot.config.sync_interval} seconds')
+        result.add_field(name='Freshness policy', value='Every data-backed command and action refreshes first. Failed refreshes never fall back to cached data.', inline=False)
+        result.add_field(name='Services', value=', '.join(['Seerr'] + [s.title() for s in bot.config.arr]))
+        await interaction.response.send_message(embed=result, ephemeral=True)
+
+    @bot.tree.command(name='seerr', description='Open your Seerr server')
+    async def seerr(interaction: discord.Interaction):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        await bot.service.run(interaction.user.id, 'dashboard')
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label='Open Seerr', url=bot.config.seerr_url))
+        await interaction.followup.send('Your media requests, on the web.', view=view, ephemeral=True)
+
+
+def main():
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    config = Config.from_env()
+    SeerrBot(config).run(config.discord_token, log_handler=None)
+
+
+if __name__ == '__main__':
+    main()

@@ -181,3 +181,8 @@ cython_debug/
 .cursorindexingignore
 seerr_cache*
 linked_users.json
+data/
+*.db-shm
+*.db-wal
+node_modules/
+activity/dist/

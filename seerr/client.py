@@ -1,9 +1,10 @@
 import requests
 from typing import Optional, Dict, Any, List
+from urllib.parse import unquote, urlsplit
 from .exceptions import SeerrAPIError
 
 class SeerrAPI:
-    def __init__(self, base_url: str, api_key: Optional[str] = None, timeout: int = 30):
+    def __init__(self, base_url: str, api_key: Optional[str] = None, timeout: int = 30, user_id: Optional[int] = None):
         """
         Initialize the Seerr API client.
         
@@ -16,8 +17,16 @@ class SeerrAPI:
         self.api_key = api_key
         self.timeout = timeout
         self.session = requests.Session()
+        # Cookie-authenticated registration remains compatible with Seerr origin checks.
+        origin = urlsplit(base_url)
+        self.session.headers.update({'Origin': f'{origin.scheme}://{origin.netloc}'})
+        self._csrf_initialized = False
         if api_key:
             self.session.headers.update({'X-Api-Key': api_key})
+        if user_id is not None:
+            if not api_key:
+                raise ValueError("User impersonation requires an API key")
+            self.session.headers.update({'X-API-User': str(user_id)})
 
     def _request(
         self,
@@ -29,19 +38,45 @@ class SeerrAPI:
         """Internal method to make API requests and handle errors."""
         url = f"{self.base_url}{endpoint}"
         try:
+            # Seerr's optional csurf middleware applies even to API-key writes.
+            # A safe GET obtains the double-submit cookie before the first POST/DELETE.
+            if method.upper() not in ('GET', 'HEAD', 'OPTIONS') and not self._csrf_initialized:
+                self._request('GET', '/settings/public')
+            token = self.session.cookies.get('XSRF-TOKEN')
+            headers = {'X-XSRF-Token': unquote(token)} if token else {}
             response = self.session.request(
                 method=method,
                 url=url,
                 json=json,
                 params=params,
-                timeout=self.timeout
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=False
             )
+            if 300 <= response.status_code < 400:
+                raise SeerrAPIError("Unexpected API redirect")
             response.raise_for_status()
+            self._csrf_initialized = True
             return response.json() if response.text else None
         except requests.exceptions.HTTPError as e:
-            raise SeerrAPIError(f"HTTP Error {e.response.status_code}: {e.response.text}") from e
+            raise SeerrAPIError(f"Seerr returned HTTP {e.response.status_code}") from e
         except requests.exceptions.RequestException as e:
-            raise SeerrAPIError(f"Request failed: {e}") from e
+            raise SeerrAPIError("Seerr is unreachable or returned invalid data") from e
+
+    def close(self):
+        self.session.close()
+
+    def get_notification_settings(self, user_id: int) -> Dict[str, Any]:
+        return self._request('GET', f'/user/{user_id}/settings/notifications')
+
+    def update_notification_settings(self, user_id: int, settings: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request('POST', f'/user/{user_id}/settings/notifications', json=settings)
+
+    def delete_media_files(self, media_id: int, is4k: bool = False) -> None:
+        if isinstance(media_id, bool) or not str(media_id).isdigit() or int(media_id) <= 0:
+            raise ValueError('Invalid media ID')
+        media_id = int(media_id)
+        self._request('DELETE', f'/media/{media_id}/file', params={'is4k': str(is4k).lower()})
 
     # Authentication
     def get_current_user(self) -> Dict[str, Any]:
@@ -54,14 +89,15 @@ class SeerrAPI:
         return self._request('POST', '/auth/plex', json={"authToken": auth_token})
 
     def login_with_jellyfin(
-        self, username: str, password: str, hostname: Optional[str] = None, server_type: int = 0
+        self, username: str, password: str, hostname: Optional[str] = None, server_type: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Authenticate with Jellyfin/Emby credentials. server_type: 0=Jellyfin, 1=Emby."""
+        """Authenticate against Seerr's already configured Jellyfin/Emby server."""
         body = {
             "username": username,
-            "password": password,
-            "serverType": server_type
+            "password": password
         }
+        if server_type is not None:
+            body['serverType'] = server_type
         if hostname is not None:
             body["hostname"] = hostname
         return self._request('POST', '/auth/jellyfin', json=body)
@@ -96,11 +132,14 @@ class SeerrAPI:
             params['requestedBy'] = requested_by
         return self._request('GET', '/request', params=params)
 
-    def create_request(self, media_type: str, media_id: int) -> Dict[str, Any]:
-        return self._request('POST', '/request', json={
+    def create_request(self, media_type: str, media_id: int, seasons=None) -> Dict[str, Any]:
+        body = {
             "mediaType": media_type,
             "mediaId": media_id
-        })
+        }
+        if media_type == 'tv':
+            body['seasons'] = seasons if seasons is not None else 'all'
+        return self._request('POST', '/request', json=body)
 
     def get_request(self, request_id: int) -> Dict[str, Any]:
         return self._request('GET', f'/request/{request_id}')

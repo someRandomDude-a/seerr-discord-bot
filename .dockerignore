@@ -1,0 +1,12 @@
+.git
+.env
+.venv
+venv
+data
+**/node_modules
+**/__pycache__
+*.db
+*.db-shm
+*.db-wal
+linked_users.json
+activity/dist
