@@ -200,9 +200,29 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
     async def test_verification_expires_and_changes_do_not_change_environment(self):
         await self.login(); await self.verify_required()
         session = next(iter(self.panel.sessions.values()))
-        digest, _when = session['verified']['discord']; session['verified']['discord'] = (digest, 0)
+        digest, verified_at = session['verified']['discord']
+        session['verified']['discord'] = (digest, verified_at - 601)
         self.assertEqual((await self.post('/api/action', {'operation': 'save'})).status, 400)
         self.assertNotIn('DISCORD_TOKEN', os.environ)
+
+    async def test_verification_expiry_boundary_on_a_freshly_started_clock(self):
+        # Monotonic clocks have arbitrary origins; a new runner may be below 600.
+        # Patch only the panel's module reference, not asyncio's own clock.
+        with patch('media_bot.panel.time') as clock:
+            clock.monotonic.return_value = 10.0
+            await self.login(); await self.verify_required()
+            clock.monotonic.return_value = 609.999
+            state = await (await self.client.get('/api/state')).json()
+            self.assertEqual(set(state['verified']), {'discord', 'seerr'})
+            self.assertEqual((await self.post('/api/action', {'operation': 'save'})).status, 200)
+            saved = self.panel.path.read_bytes()
+            self.panel.changed.clear()
+            clock.monotonic.return_value = 610.0
+            state = await (await self.client.get('/api/state')).json()
+            self.assertEqual(state['verified'], [])
+            self.assertEqual((await self.post('/api/action', {'operation': 'save'})).status, 400)
+            self.assertFalse(self.panel.changed.is_set())
+            self.assertEqual(self.panel.path.read_bytes(), saved)
 
     async def test_locked_environment_and_unknown_fields_rejected(self):
         await self.login()

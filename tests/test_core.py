@@ -151,6 +151,16 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual([r[1] for r in db.execute('PRAGMA table_info(requests)')], ['id'])
         db.close()
 
+    def test_readonly_error_supports_python_without_named_sqlite_codes(self):
+        connection = MagicMock()
+        connection.execute.side_effect = sqlite3.OperationalError('attempt to write a readonly database')
+        with patch('seerr.sync.sqlite3.connect', return_value=connection), \
+                patch.dict(sqlite3.__dict__):
+            sqlite3.__dict__.pop('SQLITE_READONLY', None)
+            with self.assertRaisesRegex(PermissionError, 'UID 10001'):
+                SyncManager(self.api, self.path)
+        connection.close.assert_called_once()
+
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
