@@ -107,16 +107,18 @@ class ActivityAPI:
         session = await self.session(request, polling=operation == 'link_status', admin_read=operation in ('admin_state', 'admin_inbox'))
         uid = session['discord_id']
         if operation == 'profile':
+            admin = await self.service.verify_admin(uid)
             return web.json_response({'account': self.service.store.account(uid), 'devices': list(self.config.devices),
-                                      'is_admin': self.bot.admin.is_admin(uid)})
+                                      'is_admin': admin})
         if isinstance(operation, str) and operation.startswith('admin_'):
-            self.bot.admin.require_admin(uid)
+            await self.service.offload(self.bot.admin.require_admin, uid)
             if operation == 'admin_state':
-                result = self.bot.admin.state(uid)
+                result = await self.service.offload(self.bot.admin.state, uid)
             elif operation == 'admin_inbox':
-                result = self.bot.admin.inbox(uid, kind=data.get('kind', 'all'), guild_id=data.get('guild_id'),
-                    user_id=data.get('user_id'), channel_id=data.get('channel_id'), query=data.get('query', ''),
-                    page=positive_id(data.get('page', 1)), order=data.get('order', 'newest'))
+                from functools import partial
+                result = await self.service.offload(partial(self.bot.admin.inbox, uid, kind=data.get('kind', 'all'),
+                    guild_id=data.get('guild_id'), user_id=data.get('user_id'), channel_id=data.get('channel_id'),
+                    query=data.get('query', ''), page=positive_id(data.get('page', 1)), order=data.get('order', 'newest')))
             elif operation == 'admin_prepare':
                 guild_ids = data.get('guild_ids', [])
                 if not isinstance(guild_ids, list) or len(guild_ids) > 1000:
@@ -128,7 +130,7 @@ class ActivityAPI:
             elif operation == 'admin_send':
                 if data.get('confirmed') is not True:
                     raise UserError('Confirm the recipients before sending.')
-                result = {'job': self.bot.admin.confirm(uid, data.get('plan'))}
+                result = {'job': await self.service.offload(self.bot.admin.confirm, uid, data.get('plan'))}
             else:
                 raise web.HTTPBadRequest()
             return web.json_response({'result': result})
@@ -268,7 +270,7 @@ def item_reference(value):
         raise UserError('Invalid item reference. Search again.')
     if kind in ('movie', 'tv'):
         positive_id(eid)
-    if source not in (None, 'seerr', 'radarr', 'sonarr', 'lidarr', 'readarr'):
+    if source not in (None, 'seerr', 'radarr', 'sonarr', 'lidarr', 'readarr') and (not isinstance(source, str) or not re.fullmatch(r'(radarr|sonarr):[0-9]+', source)):
         raise UserError('Invalid item source.')
     return {'kind': kind, 'external_id': eid, 'title': title, 'source': source}
 

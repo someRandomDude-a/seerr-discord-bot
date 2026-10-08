@@ -1,6 +1,6 @@
 # End-to-end setup
 
-Start with **slash-only mode**. Add the Activity after commands work. No public IP or incoming port is needed for slash-only operation; the bot still needs outbound access to Discord and your media services.
+Start with **slash-only mode** using the [integrated onboarding/admin panel](onboarding.md). Add the Activity after commands work. No public IP or public incoming port is needed for slash-only operation; the separate private setup port is printed at startup. The bot needs outbound access to Discord and your media services. This guide retains the detailed installation checklist and advanced environment reference.
 
 ## 1. Prepare media services
 
@@ -17,7 +17,7 @@ Use URLs reachable **from the machine/container running the bot**. `localhost` i
 
 1. Open [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
 2. Under **General Information**, copy the **Application ID**. Use this same application for the bot and optional Activity.
-3. Under **Bot**, create/configure its bot user. **Reset Token** if necessary and copy its token into `DISCORD_TOKEN`. Never use the OAuth client secret as a bot token or publish either secret.
+3. Under **Bot**, create/configure its bot user. **Reset Token** if necessary and copy its token into the panel's **Bot token** field (`DISCORD_TOKEN` for headless deployments). Never use the OAuth client secret as a bot token or publish either secret.
 4. Leave **Requires OAuth2 Code Grant** disabled for the normal bot install. Choose **Public Bot** according to who may invite it; it does not control operator privileges.
 
 ## 3. Installation scopes and permissions
@@ -37,25 +37,27 @@ Use the **Discord Provided Link** from Installation to invite the bot to your se
 
 Check channel permission overrides: the bot must be able to view/send in announcement and reply channels. Human users need **Use Application Commands**. For the optional dashboard, allow **Use Activities / Use Embedded Activities** for the **users** launching it; no additional bot gateway intent is required for Activities.
 
-For additional command restrictions, use the server's **Settings → Integrations → application → Commands**. This supplements, but does not replace, the bot's operator ID checks.
+For additional command restrictions, use the server's **Settings → Integrations → application → Commands**. This supplements, but does not replace, the bot's live Seerr-admin/bot-only exception checks.
 
 ## 4. Privileged intents
 
 Go to **Bot → Privileged Gateway Intents**:
 
-| Intent | Developer Portal | Matching `.env` |
+| Intent | Developer Portal | Matching panel/advanced setting |
 | --- | --- | --- |
 | Presence | Off | Not used |
 | Server Members | On only for all-member announcement DMs | `ENABLE_MEMBERS_INTENT=true` |
 | Message Content | On for full non-mention reply text or selected inbox-channel content | `INBOX_MESSAGE_CONTENT=true` |
 
-Keep both environment flags `false` if you do not need those features. DMs and direct bot mentions can be collected without Message Content Intent. Enable an intent **both in the portal and `.env`**, then restart; otherwise Discord may reject the connection or omit data. Larger/verified applications may need Discord's approval for privileged intents.
+Keep both flags `false` if you do not need those features. DMs and direct bot mentions can be collected without Message Content Intent. Enable an intent **both in the portal and panel**, then Save & apply; otherwise Discord may reject the connection or omit data. Larger/verified applications may need Discord's approval for privileged intents.
 
-## 5. Collect IDs and configure `.env`
+## 5. Collect IDs and configure the service
 
 In your Discord client, enable **User Settings → Advanced → Developer Mode**. Right-click a server, channel or user → **Copy ID**. Use numeric IDs, not names, invite URLs or tokens.
 
-Copy [`.env.example`](../.env.example) to `.env`; each option has inline documentation. At minimum set:
+Normally start `python bot.py`, open the printed private setup URL, and complete [the wizard](onboarding.md#wizard-verified-steps). It verifies Discord/Seerr, imports Seerr's Radarr/Sonarr settings and saves credentials in `DATA_DIR/settings.json`. [`.env.example`](../.env.example) now contains only optional bootstrap settings.
+
+For a legacy/headless install, [`.env.advanced.example`](../.env.advanced.example) documents every setting. Environment entries override saved settings. At minimum configure:
 
 ```dotenv
 SEERR_URL=http://your-seerr-host:5055
@@ -64,9 +66,10 @@ DISCORD_TOKEN=your-bot-token
 ALLOWED_GUILD_IDS=your-server-id
 ACTIVITY_ENABLED=false
 WEBHOOK_SECRET=
+PANEL_ENABLED=false
 ```
 
-Replace placeholders with real values. `ALLOWED_GUILD_IDS` can list multiple comma-separated servers; empty allows all guilds and DM commands. A nonempty allowlist registers guild-scoped commands for those servers. After changing it, restart; Discord may retain previously registered commands in old servers, but runtime access checks still deny them.
+Replace placeholders with real values. `ALLOWED_GUILD_IDS` can list multiple comma-separated servers; empty allows all guilds and DM commands. A nonempty allowlist registers guild-scoped commands for those servers. Save & apply (or restart headless installs) after changing it; Discord may retain previously registered commands in old servers, but runtime access checks still deny them.
 
 Optional operator configuration:
 
@@ -75,9 +78,9 @@ ADMIN_DISCORD_IDS=123456789012345678
 ADMIN_ANNOUNCEMENT_CHANNELS={"234567890123456789":"345678901234567890"}
 ```
 
-Only explicitly trusted user IDs receive **global** admin messaging/inbox access. Discord Administrator roles and Seerr admins do not grant this. Mapping values are existing channel IDs in those guilds. Without a mapping, cross-server/Activity announcements use the guild's system channel; `/announce` in a server defaults to its current channel. Tell users that operators can read DMs sent to the bot; secure database backups.
+Verified linked Seerr owners/Administrators receive **global** bot messaging/inbox access by default. `ADMIN_DISCORD_IDS` adds trusted **bot-only exceptions** without changing Seerr roles; Discord Administrator roles alone do not grant access. Inferred authority is rechecked against live Seerr for every admin operation/delivery. Mapping values are existing channel IDs in those guilds. Without a mapping, cross-server/Activity/panel announcements use the guild's system channel; `/announce` in a server defaults to its current channel. Tell users that operators can read bot DMs; secure database backups.
 
-Set `JELLYFIN_DEVICE_URLS` to your real server URL(s), or `{}` to disable links. Add optional service URL/key pairs together. Keep root/profile IDs unset until you have verified their values in Lidarr/Readarr. All intervals use seconds except `INBOX_RETENTION_DAYS`.
+Set `JELLYFIN_DEVICE_URLS` to your real server URL(s), or `{}` to disable links. Radarr/Sonarr are imported from Seerr, including all 4K/default/nondefault instances; unused legacy variables are ignored unless `SEERR_DISCOVERY=false`. Lidarr/Readarr remain direct URL/key pairs. Keep root/profile IDs unset until verified in those services (the panel provides dropdowns). All intervals use seconds except `INBOX_RETENTION_DAYS`.
 
 ## 6. Run the bot
 
@@ -88,11 +91,11 @@ python -m pip install -r requirements.txt
 python bot.py
 ```
 
-On Windows, `py` can replace `python`, and `Copy-Item .env.example .env` copies the example. On Linux/macOS use `cp .env.example .env`; a Python virtual environment is recommended.
+On Windows, `py` can replace `python`; a Python virtual environment is recommended. No `.env` is required for panel onboarding. Existing environment configurations still work; their fields are read-only in the panel until the overrides are removed.
 
 For Docker, follow the [README's Docker section](../README.md#docker). Mount `/data` persistently, ensure UID `10001` can write it, and run one instance per database. The Docker build includes the Activity frontend, even if the runtime toggle is off. Native slash-only installation does not need Node.
 
-Wait for the connection log and command sync. Guild-scoped commands usually appear quickly; global registration can take time. If commands are missing, check the install scopes, allowlist, channel permission and correct bot/application token. Reload Discord if needed.
+If configuration is incomplete, the bot waits while the separate panel is available. Complete verification and Save & apply, then wait for the connection log/command sync. Guild-scoped commands usually appear quickly; global registration can take time. If commands are missing, check install scopes, allowlist, channel permissions and the correct bot/application token. Reload Discord if needed.
 
 ## 7. First-run checks (slash-only)
 
@@ -111,11 +114,11 @@ Slash commands and their private buttons/modals cover the hub without any hosted
 Skip this section for slash-only use.
 
 1. Install Node 22+; run `npm ci` and `npm run build` inside `activity/` (Docker does this automatically).
-2. Set `ACTIVITY_ENABLED=true`, `DISCORD_APPLICATION_ID` to this application's ID and `DISCORD_CLIENT_SECRET` to its **OAuth2** client secret.
-3. Serve the backend at a **public HTTPS hostname** through a reverse proxy or a tunnel such as Cloudflare Tunnel. Route it to `http://127.0.0.1:8080`, or your configured private listener. `BOT_HOST=127.0.0.1` works for a tunnel/proxy on the same machine; use `0.0.0.0` inside Docker with appropriate private networking. Never expose API keys or logs containing OAuth request bodies.
+2. Choose the panel's Activity preset; set `ACTIVITY_ENABLED=true`, `DISCORD_APPLICATION_ID` to this application's ID and `DISCORD_CLIENT_SECRET` to its **OAuth2** client secret.
+3. Serve the bot backend at a **public HTTPS hostname** through a reverse proxy or tunnel such as Cloudflare Tunnel. Route it to `http://127.0.0.1:8080`, or your configured private backend listener—**never the setup/admin port**. `BOT_HOST=127.0.0.1` works for a tunnel/proxy on the same machine; use `0.0.0.0` inside Docker with private networking. Never expose API keys or logs containing OAuth bodies.
 4. Under **Developer Portal → Activities**, enable Activities and add **URL Mapping prefix `/`** pointing to the HTTPS backend hostname (use the hostname/target format requested by the portal).
 5. Under **OAuth2 → Redirects**, add **`https://127.0.0.1`**, the embedded SDK's placeholder redirect. You do not need a separate browser registration page or public redirect handler.
-6. Restart the bot. Enable client Developer Mode and use `/activity`. Test as an application owner/team member first; broader Activity distribution may require Discord's testing/distribution/verification settings.
+6. Save & apply (or restart headless installs). Enter the backend hostname as **Public backend URL** and test it in the panel. Enable client Developer Mode and use `/activity` to verify SDK/OAuth; test as an application owner/team member first. Broader distribution may require Discord's testing/distribution/verification settings.
 7. Approve the SDK's requested OAuth scopes: `identify`, plus `guilds` when `ALLOWED_GUILD_IDS` is set. These are viewer-authentication scopes, **not** extra bot-install scopes. The backend verifies the viewer, not client-supplied identity claims.
 
 Users still need access to the launch channel and its Use Activities permission. Sessions expire; reopen the Activity to sign in again. If hosting is unavailable, use slash commands; set `ACTIVITY_ENABLED=false` and restart to disable Activity mode completely.
@@ -124,15 +127,38 @@ For a temporary local test, install `cloudflared` and run `cloudflared tunnel --
 
 ## 9. Optional service webhooks
 
-Skip for polling-only use. Set a random `WEBHOOK_SECRET` of at least 32 characters, then restart. This starts the HTTP listener even if Activity is disabled. Local services can reach its private network address; remote services need a reachable HTTPS receiver.
+Skip for polling-only use. Generate the webhook credential in the panel (or set a random `WEBHOOK_SECRET` of at least 32 characters), then Save & apply. This starts the **bot backend** listener even if Activity is disabled; it remains separate from the local admin port. Local services can reach its private network address; remote services need a reachable HTTPS receiver.
 
 Use the [README's notification instructions](../README.md#notifications) to configure Seerr/Servarr Connect webhooks. Send each integration's Test event and confirm it is accepted. Webhook payloads only wake a verified API refresh; they do not supply trusted messages or authorize actions. No Discord **Interactions Endpoint URL** is needed: slash commands arrive through the bot's gateway connection.
 
 ## Troubleshooting
 
+### SQLite storage permissions
+
+`sqlite3.OperationalError: attempt to write a readonly database` means SQLite cannot write to its file, directory or WAL/shared-memory sidecars. The schema migration is legitimate; do not delete the database to bypass it. PyNaCl/davey warnings only concern voice, which this bot does not use.
+
+For Docker, explicitly configure:
+
+```dotenv
+DATA_DIR=/data
+DATABASE_PATH=seerr_cache.db
+```
+
+Mount the **whole directory** read-write, for example `./data:/data` (not `:ro`), or a named volume. `.env` values override image defaults; `DATA_DIR=./data` means `/app/data` inside this image, not `/data`. SQLite needs to create/update `seerr_cache.db-wal` and `seerr_cache.db-shm` in the same directory.
+
+For an existing bind mount or volume with mismatched ownership, stop the bot and back up its data directory including any sidecars. On a Linux Docker host, use a one-off root container to repair only the mounted directory and the three database files. Replace `discord-bot` with your **Compose service name** (not the `...-1` container name), and adapt paths if you configured a different database:
+
+```sh
+docker compose stop discord-bot
+docker compose run --rm --no-deps --user 0 --entrypoint sh discord-bot -c 'chown 10001 /data && chmod u+rwx /data && for file in /data/seerr_cache.db /data/seerr_cache.db-wal /data/seerr_cache.db-shm; do if [ -e "$file" ]; then chown 10001 "$file" && chmod u+rw "$file" || exit 1; fi; done'
+docker compose up -d --build discord-bot
+```
+
+This does not delete files or run the bot as root permanently. If ownership changes are disallowed by your filesystem (Windows/network shares/rootless Docker), correct host ACLs or migrate a stopped, backed-up database into a writable named volume. SELinux hosts may need an appropriate bind-mount label (`:Z` for a private mount). Do not use `chmod 777`, remove the volume, or discard the SQLite sidecars. A read-only mount must be corrected in Compose before permission repair can work.
+
 | Symptom | Check |
 | --- | --- |
-| Bot cannot connect / disallowed intents | Correct bot token; both portal and `.env` intent settings |
+| Bot cannot connect / disallowed intents | Correct bot token; both portal and panel intent settings |
 | Commands absent or denied | Guild install, scopes, command sync, allowed guild ID, channel/Integration permissions |
 | Quick Connect fails | Current Seerr endpoints, enabled Jellyfin Quick Connect, Seerr's Jellyfin URL, network reachability |
 | Media operations blocked | `/status`; every enabled service must respond; remove unused integration URL/key pairs |

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -130,6 +131,26 @@ class SnapshotTests(unittest.TestCase):
             self.sync.sync()
         self.assertEqual(len(self.rows()), 1)
 
+    def test_readonly_migration_explains_storage_permissions_and_preserves_data(self):
+        path = Path(self.tmp.name) / 'legacy.db'
+        with sqlite3.connect(path) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.executescript('''CREATE TABLE requests(id INTEGER PRIMARY KEY);
+                CREATE TABLE media_details(media_id INTEGER PRIMARY KEY);
+                CREATE TABLE sync_meta(key TEXT PRIMARY KEY,value TEXT);
+                INSERT INTO requests VALUES (123);''')
+        db.close()
+        readonly = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+        with patch('seerr.sync.sqlite3.connect', return_value=readonly):
+            with self.assertRaisesRegex(PermissionError, 'UID 10001') as caught:
+                SyncManager(self.api, str(path))
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn('-wal/-shm', str(caught.exception))
+        with sqlite3.connect(path) as db:
+            self.assertEqual(db.execute('SELECT id FROM requests').fetchone()[0], 123)
+            self.assertEqual([r[1] for r in db.execute('PRAGMA table_info(requests)')], ['id'])
+        db.close()
+
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -137,6 +158,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.config = Config('http://seerr', 'secret', 'token', str(Path(self.tmp.name) / 'cache.db'), 'https://bot.example',
                              devices={'Home': 'https://jellyfin.example'})
         self.service = MediaService(self.config)
+        self.config.seerr_discovery = False  # Core fixtures supply snapshots directly; discovery has dedicated tests.
         self.service.api.close()
         self.service.api = MagicMock()
         self.service.sync.api = self.service.api
@@ -195,6 +217,34 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.user_api.get_notification_settings.return_value = {'discordIds': []}
         with self.assertRaises(UserError):
             await self.service.run(42, 'requests', False)
+
+    async def test_seerr_admin_inference_requires_verified_link_and_live_admin_role(self):
+        self.assertFalse(self.service.is_admin(999))
+        self.assertFalse(self.service.is_admin(42))
+        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 2}
+        self.assertTrue(self.service.is_admin(42))
+        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 32}
+        self.assertFalse(self.service.is_admin(42))
+        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 2}
+        self.user_api.get_notification_settings.return_value = {'discordIds': []}
+        self.assertFalse(self.service.is_admin(42))
+
+    async def test_bot_only_exception_does_not_need_seerr_or_promote_permissions(self):
+        self.config.admin_ids = frozenset([999])
+        self.assertTrue(self.service.is_admin(999))
+        self.user_api.get_current_user.assert_not_called()
+        self.user_api.update_user.assert_not_called()
+
+    async def test_profile_does_not_grant_admin_on_seerr_outage(self):
+        self.user_api.get_current_user.side_effect = RuntimeError('offline')
+        self.assertFalse(await self.service.verify_admin(42))
+
+    async def test_discovery_refresh_failure_blocks_actions_instead_of_using_old_connections(self):
+        self.config.seerr_discovery = True
+        self.service.api._request.return_value = {'bad': 'not a settings list'}
+        with self.assertRaises(UserError):
+            await self.service.run(42, 'requests', False)
+        self.user_api.get_current_user.assert_not_called()
 
     async def test_all_requests_require_seerr_permission(self):
         with self.assertRaises(UserError):

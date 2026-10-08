@@ -1,6 +1,7 @@
 """Optional authenticated service notification receiver. No browser UI/routes."""
 import base64
 import secrets
+import time
 
 from aiohttp import web
 from .security import RateLimiter, UserError
@@ -12,6 +13,7 @@ class WebhookServer:
         self.limiter = RateLimiter(self.config.webhook_limit, 60)
         self.runner = None
         self.activity = activity
+        self.last_tests = {}
 
     @web.middleware
     async def errors(self, request, handler):
@@ -48,7 +50,7 @@ class WebhookServer:
         if not self.authenticate(request.headers.get('Authorization', '')):
             raise web.HTTPUnauthorized(headers={'WWW-Authenticate': 'Basic realm="Media Hub"'})
         source = request.match_info['source']
-        if source != 'seerr' and source not in self.service.arr:
+        if source != 'seerr' and source not in {key.split(':')[0] for key in self.service.arr}:
             raise web.HTTPNotFound()
         self.limiter.check(('source', source))
         payload = await request.json()
@@ -60,7 +62,13 @@ class WebhookServer:
         if event.lower() != 'test':
             # Payloads only wake a sync; messages/actions come from verified API state.
             self.refresh_event.set()
-        return web.json_response({'accepted': True})
+        result = {'accepted': True}
+        if event.lower() == 'test':
+            self.last_tests[source] = time.time()
+        marker = payload.get('verification')
+        if event.lower() == 'test' and isinstance(marker, str) and len(marker) <= 100:
+            result['verification'] = marker
+        return web.json_response(result)
 
     def application(self):
         app = web.Application(middlewares=[self.errors], client_max_size=32 * 1024)

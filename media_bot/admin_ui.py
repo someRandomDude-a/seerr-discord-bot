@@ -7,15 +7,11 @@ from .ui import OwnedView, AnnouncementConfirmView, clean, embed
 
 
 class AdminView(OwnedView):
-    async def interaction_check(self, interaction):
-        if not await super().interaction_check(interaction):
-            return False
-        try:
-            self.bot.admin.require_admin(self.owner)
-            return True
-        except UserError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return False
+    # OwnedView checks identity/entry limits immediately. Each data load/send rechecks
+    # live authority after deferring. Reply may open a modal without an upstream call;
+    # submission verifies authority before creating any preview. This avoids missing
+    # Discord's 3-second acknowledgement deadline during a slow Seerr request.
+    pass
 
 
 class AdminListView(AdminView):
@@ -24,23 +20,23 @@ class AdminListView(AdminView):
         self.mode, self.filters, self.page, self.job = mode, filters or {}, page, job
         self.rows, self.total = [], 0
 
-    def load(self):
-        self.bot.admin.require_admin(self.owner)
+    async def load(self):
         if self.mode == 'inbox':
-            data = self.bot.admin.inbox(self.owner, **self.filters, page=self.page, page_size=5)
+            from functools import partial
+            data = await self.bot.service.offload(partial(self.bot.admin.inbox, self.owner, **self.filters, page=self.page, page_size=5))
             self.rows, self.total = data['messages'], data['total']
         elif self.mode == 'deliveries' and self.job:
-            data = self.bot.admin.deliveries(self.owner, self.job, self.page)
+            data = await self.bot.service.offload(self.bot.admin.deliveries, self.owner, self.job, self.page)
             self.rows, self.total = data['rows'], data['total']
         else:
-            state = self.bot.admin.state(self.owner)
+            state = await self.bot.service.offload(self.bot.admin.state, self.owner)
             rows = state['guilds'] if self.mode == 'servers' else state['jobs']
             self.total = len(rows)
             self.rows = rows[(self.page - 1) * 5:self.page * 5]
         last_page = max(1, math.ceil(self.total / 5))
         if self.page > last_page:
             self.page = last_page
-            return self.load()
+            return await self.load()
         self.clear_items()
         if self.mode == 'inbox' and self.rows:
             choice = discord.ui.Select(placeholder='Read / reply…', options=[
@@ -49,7 +45,7 @@ class AdminListView(AdminView):
             async def detail(interaction):
                 await interaction.response.defer(ephemeral=True)
                 # Re-read retained messages with the same filters, not a stale UI snapshot.
-                self.load()
+                await self.load()
                 row = next((r for r in self.rows if r['message_id'] == choice.values[0]), None)
                 if not row:
                     raise UserError('Message moved or expired. Refresh the inbox.')
@@ -84,7 +80,7 @@ class AdminListView(AdminView):
 
     async def refresh(self, interaction):
         await interaction.response.defer(ephemeral=True)
-        self.load()
+        await self.load()
         await interaction.edit_original_response(embed=self.render(), view=self)
 
     async def previous(self, interaction):
@@ -130,8 +126,8 @@ class InboxReplyModal(discord.ui.Modal, title='Reply'):
         if interaction.user.id != self.owner:
             raise UserError('This reply belongs to another operator.')
         self.bot.guard(interaction)
-        self.bot.admin.require_admin(self.owner)
         await interaction.response.defer(ephemeral=True)
+        await self.bot.service.offload(self.bot.admin.require_admin, self.owner)
         r = self.source
         plan = await self.bot.admin.prepare(self.owner, self.message.value,
             [int(r['guild_id'])] if r['guild_id'] else [],

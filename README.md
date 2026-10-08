@@ -2,12 +2,14 @@
 
 Browse media, requests, storage and watchlists inside Discord. A minimal **liquid-glass Activity** is available through `/activity`; private slash commands remain a fallback.
 
-**New installation:** follow the [end-to-end setup guide](docs/setup.md) for Discord scopes, permissions, intents, services, environment values and first-run checks. Activity hosting is optional.
+**New installation:** use the [integrated onboarding/admin panel](docs/onboarding.md). It runs on a separate private HTTP port, verifies connections, and saves configuration. The [detailed setup guide](docs/setup.md) covers Discord permissions and first-run checks. Activity hosting is optional.
 
 ## Features
 
 - Passwordless Jellyfin **Quick Connect**, in Discord or the Activity. Verified Discord IDs are saved in Seerr’s `discordIds` notification settings.
 - Movies/TV through Seerr; albums through Lidarr; books through compatible Readarr v1 installations.
+- Seerr-derived admins after verified linking, optional bot-only exceptions, and automatic import of all Seerr Radarr/Sonarr instances, including 4K.
+- Local liquid-glass setup/admin panel, persisted settings, verified steps and deployment presets.
 - Live refresh before upstream-data reads/actions. Failures block operations instead of falling back to old state.
 - **24-hour file deletion delay**, with owner-only Undo. No approval queue, and no Seerr request/media-record deletion.
 - Device-specific Jellyfin item links, opt-in DMs, watchlists and authenticated service webhooks.
@@ -19,12 +21,12 @@ Requires Python 3.10+, current Seerr supporting Jellyfin Quick Connect, and Quic
 
 ```sh
 python -m pip install -r requirements.txt
-cp .env.example .env
-# Fill in SEERR_URL, SEERR_ADMIN_KEY, DISCORD_TOKEN and ALLOWED_GUILD_IDS.
 python bot.py
 ```
 
-`/link` displays a private code. Approve it in an already signed-in Jellyfin client under **Settings → Quick Connect**. The bot verifies the authenticated account, saves the Discord ID, and discards its temporary session. **There is no browser registration page.**
+Open the private panel URL printed at startup and enter its one-time console code. Choose a preset, verify Discord/Seerr, then **Save & apply**. No `.env` is required; [`.env.example`](.env.example) contains optional panel/data bootstrap settings only.
+
+`/link` displays a private code. Approve it in an already signed-in Jellyfin client under **Settings → Quick Connect**. The bot verifies the authenticated account, saves the Discord ID, and discards its temporary session. The panel configures the service; it does **not** replace verified user registration.
 
 ## Enable the Discord Activity
 
@@ -35,7 +37,7 @@ ACTIVITY_ENABLED=false
 WEBHOOK_SECRET=
 ```
 
-This disables the embedded dashboard and HTTP listener. No public hostname, tunnel, OAuth client secret, frontend build or incoming port is needed. Discord and configured media APIs must still be reachable outbound. Keep `WEBHOOK_SECRET` configured only if you want the optional webhook listener; periodic media refresh works without it. Restart after changing the toggle. If Activity hosting fails, all slash commands remain available; `/activity` itself cannot launch a dashboard without its HTTPS backend.
+Choose **Slash only** in the panel, or use the settings above. This disables the embedded dashboard and bot backend HTTP listener. The separate **private admin panel** stays available unless `PANEL_ENABLED=false`. No public hostname, tunnel, OAuth client secret, frontend build or public incoming port is needed. Discord and configured media APIs must still be reachable outbound. Keep `WEBHOOK_SECRET` only for optional webhook reception; polling works without it. Save & apply changes. If Activity hosting fails, all slash commands remain available; `/activity` cannot launch without its HTTPS backend.
 
 | Feature | Slash-command access (private components included) |
 | --- | --- |
@@ -52,13 +54,13 @@ This disables the embedded dashboard and HTTP listener. No public hostname, tunn
 | Admin inbox/filter/read/reply | `/inbox` → select message → Reply → confirmation |
 | Admin announcement results | `/deliveries`, `/deliveries job:ID` |
 
-`/inbox` supports `kind`, `server_id`, `channel_id`, `user_id`, `query`, `order` and `page`. It shows five messages per page, with Next/Previous/Refresh. `/servers` lists joined guild IDs for targeting; `/announce channel_id:...` optionally overrides a channel within one selected server. Admin tools require `ADMIN_DISCORD_IDS`, not a Seerr account. Liquid-glass CSS is Activity-only; Discord controls native component appearance.
+`/inbox` supports `kind`, `server_id`, `channel_id`, `user_id`, `query`, `order` and `page`. It shows five messages per page, with Next/Previous/Refresh. `/servers` lists joined guild IDs for targeting; `/announce channel_id:...` optionally overrides a channel within one selected server. Admin tools require a verified linked Seerr admin or a bot-only exception. Liquid-glass CSS applies to Activity/local panel; Discord controls native component appearance.
 
 `/library`, `/requests`, `/watchlist` and `/deletions` accept an optional `query` title filter. Media-backed lists still refresh before filtering; local watchlist/history/Undo stay usable during upstream outages.
 
 Activities are embedded web views **inside Discord**, not ordinary bot embeds. They require an HTTPS backend and Discord Developer Portal configuration.
 
-1. Use the **same application** as the bot. Set:
+1. Use the **same application** as the bot. Choose **Activity** in the panel and configure these fields (environment overrides remain supported):
 
    ```dotenv
    ACTIVITY_ENABLED=true
@@ -82,40 +84,36 @@ Activities are embedded web views **inside Discord**, not ordinary bot embeds. T
 
 Discord OAuth uses `identify`, and also `guilds` when a guild allowlist is configured. The backend verifies identity and guild membership with Discord’s API, never a frontend-provided user ID. Every viewer has private data and independent preferences, even in a shared Activity. Session/OAuth tokens are memory-only and expire; reopen the Activity to reauthenticate. Keep the OAuth client secret strictly server-side.
 
-The Activity shows a live verification timestamp and refreshes every 60 seconds while visible. Local collection filtering does not contact upstream services; actions always revalidate. Slash commands cannot be CSS-themed—liquid-glass styling applies to the Activity.
+The Activity shows a live verification timestamp and refreshes every 60 seconds while visible. Local collection filtering does not contact upstream services; actions always revalidate. Slash commands cannot be CSS-themed. Never route the private setup/admin panel through the public Activity hostname.
 
 ## Docker
 
 The Dockerfile builds the Activity automatically and runs Python as UID `10001`.
 
-```yaml
-services:
-  media:
-    build: .
-    env_file: .env
-    environment:
-      DATA_DIR: /data
-      BOT_HOST: 0.0.0.0
-    volumes:
-      - media-data:/data
-    ports:
-      - "127.0.0.1:8080:8080"
-    restart: unless-stopped
-volumes:
-  media-data:
+```sh
+docker compose -f templates/compose.slash.yml up -d --build
+docker compose -f templates/compose.slash.yml port media 8787
+docker compose -f templates/compose.slash.yml logs media
 ```
 
-Run `docker compose up -d --build`. Named volumes handle writable permissions; bind mounts must be writable by UID `10001`. Run **one instance per database**. Proxy HTTPS traffic to the private backend port. Do not log Authorization headers, OAuth POST bodies, or Quick Connect secrets. There is no HTTP listener when both Activity mode and webhook reception are disabled.
+Open the reported host-loopback panel port and use the console code in the logs. For Activity/webhooks use [templates/compose.activity.yml](templates/compose.activity.yml), which also publishes the bot backend on host-loopback `8080`. See [presets and secure access](docs/onboarding.md#start-with-a-preset).
+
+Named volumes handle writable permissions; bind mounts must be writable by UID `10001`. Run **one instance per database**. Proxy HTTPS traffic only to the bot backend, never the panel. Do not share access-code logs or log Authorization headers, OAuth POST bodies, or Quick Connect secrets. With Activity/webhooks disabled, only the private admin panel listens; set `PANEL_ENABLED=false` for a listener-free headless install.
+
+For `attempt to write a readonly database`, follow [SQLite storage permissions](docs/setup.md#sqlite-storage-permissions). Existing volumes may retain ownership from an older image; mount `/data` read-write and set `DATA_DIR=/data` explicitly. Do not delete the database or run the bot permanently as root.
 
 ## Configuration
 
-See [`.env.example`](.env.example) for per-option descriptions, units, valid values, dependencies and defaults. Copy it to `.env`; never commit real secrets. Boolean typos and invalid Discord IDs fail startup instead of silently changing security settings.
+Configure routine settings in the panel; they persist in private `DATA_DIR/settings.json`. Environment values override saved settings and appear read-only in the panel. [`.env.example`](.env.example) contains bootstrap options; [`.env.advanced.example`](.env.advanced.example) retains every advanced setting's description, units, dependencies and defaults. Never commit secrets; protect data/backups. Boolean typos and invalid Discord IDs fail validation instead of silently changing security settings.
 
 | Variables | Purpose/default |
 | --- | --- |
 | `SEERR_URL`, `SEERR_ADMIN_KEY`, `DISCORD_TOKEN` | Required backend credentials |
 | `ALLOWED_GUILD_IDS` | Comma-separated allowed guilds; empty allows all guilds/DMs |
 | `DATA_DIR`, `DATABASE_PATH` | Persistent SQLite; `./data/seerr_cache.db` |
+| `PANEL_ENABLED`, `PANEL_HOST`, `PANEL_PORT` | Private panel; `true`, `127.0.0.1`, `0` (random) |
+| `SEERR_DISCOVERY`, `SEERR_ADMINS` | Import Radarr/Sonarr and infer verified admins; both `true` |
+| `ADMIN_DISCORD_IDS` | Explicit bot-only operator exceptions; does not modify Seerr roles |
 | `SYNC_INTERVAL_SECONDS`, `API_TIMEOUT_SECONDS` | `300` background refresh/deletion check; `15` per API call |
 | `LINK_TTL_SECONDS`, `LINK_POLL_INTERVAL_SECONDS` | Quick Connect lifetime, at most `300`; poll every `5` seconds |
 | `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS` | `15` user interactions per `60` seconds, shared by commands/Activity |
@@ -124,13 +122,14 @@ See [`.env.example`](.env.example) for per-option descriptions, units, valid val
 | `ACTIVITY_SESSION_TTL_SECONDS`, `ACTIVITY_REFRESH_INTERVAL_SECONDS` | `900` session lifetime; `60` UI refresh (minimum `30`) |
 | `BOT_HOST`, `BOT_PORT` | HTTP backend bind, `127.0.0.1:8080` |
 | `JELLYFIN_DEVICE_URLS` | JSON device labels → Jellyfin server base URLs |
-| `{RADARR,SONARR,LIDARR,READARR}_URL`, `*_API_KEY` | Enable an integration with both values |
+| `{LIDARR,READARR}_URL`, `*_API_KEY` | Enable a direct music/book integration with both values |
+| `{RADARR,SONARR}_URL`, `*_API_KEY` | Legacy overrides only when `SEERR_DISCOVERY=false` |
 | `{LIDARR,READARR}_ROOT_FOLDER`, `*_QUALITY_PROFILE_ID`, `*_METADATA_PROFILE_ID` | Defaults for direct album/book additions |
 | `ARR_REQUEST_LIMIT_PER_DAY` | `10` album/book requests per user per rolling 24 hours |
 | `WEBHOOK_SECRET`, `WEBHOOK_RATE_LIMIT_COUNT` | Optional 32+ character secret; `60` notifications/minute per source/client |
 | `WEBHOOK_PUBLIC_URL` | Optional receiver hostname for deployment configuration |
 
-Service URLs omit `/api/v1` and `/api/v3`. Seerr routes movies/TV and file deletion through its own configured Radarr/Sonarr instances; optional direct instances should match. Seerr CSRF protection is supported with its XSRF cookie/header; use an **HTTPS `SEERR_URL`** when secure cookies are enabled.
+Service URLs omit `/api/v1` and `/api/v3`. Seerr routes movies/TV and file deletion through its own configured Radarr/Sonarr instances; the bot imports every instance before each refresh. Lidarr/Readarr remain direct. Seerr CSRF protection is supported with its XSRF cookie/header; use an **HTTPS `SEERR_URL`** when secure cookies are enabled.
 
 ```dotenv
 JELLYFIN_DEVICE_URLS={"Browser":"https://jellyfin.example.com","Home":"http://192.168.1.10:8096"}
@@ -148,7 +147,7 @@ All command responses are private. `/requests all_requests:true` requires Seerr 
 
 ## Admin messages & inbox
 
-Set `ADMIN_DISCORD_IDS` to trusted operators' Discord user IDs. This grants **global** messaging/inbox access; Seerr admin permissions and Discord server roles do not grant it. Operators need no linked Seerr account. Leave it empty to disable sending and message collection. With `ALLOWED_GUILD_IDS`, launch commands/Activity from an allowed server; operators may explicitly target any server the bot has joined.
+Verified linked Seerr owners/Administrators receive **global** bot messaging/inbox access by default, rechecked against live Seerr on each admin operation and queued delivery. `ADMIN_DISCORD_IDS` adds explicit **bot-only exceptions**, without modifying Seerr roles; these need no linked account. Discord server roles alone do not grant bot-admin access. Disable `SEERR_ADMINS` and clear exceptions to disable Discord/Activity operator access and collection; authenticated local-panel operators can still manage the service. With `ALLOWED_GUILD_IDS`, launch commands/Activity from an allowed server; operators may explicitly target any joined server.
 
 ```dotenv
 ADMIN_DISCORD_IDS=123456789012345678,234567890123456789
@@ -157,10 +156,10 @@ ADMIN_ANNOUNCEMENT_CHANNELS={"345678901234567890":"456789012345678901"}
 
 `/announce message:...` defaults to the invoking server/channel. Optional `server_id` targets another server's configured announcement channel (or system channel); `recipient` targets one user by DM. `all_servers:true` explicitly selects every joined server, and `all_users:true` additionally DMs their non-bot members, deduplicated across servers. No target in DMs means **no send**, not a global broadcast. Every send requires a private, two-minute recipient preview/confirmation.
 
-Activity → **Messages** offers server checkboxes, a user-ID target, broadcast preview, delivery counts, and an inbox grouped into **user DMs / servers**. Filter by server, channel, sender, text and newest/oldest; browse 50 messages per page. **Reply** selects the original DM sender or server channel in the composer, without sending immediately. **Open** jumps to server messages in Discord, subject to the operator's own channel permissions. All operators can see the shared inbox and job counts.
+Activity and local panel → **Messages** offer server checkboxes, a user-ID target, broadcast preview, delivery counts, and an inbox grouped into **user DMs / servers**. Filter by server, channel, sender, text and newest/oldest; browse 50 messages per page. **Reply** selects the original DM sender or server channel in the composer, without sending immediately. Activity **Open** jumps to server messages in Discord, subject to the operator's own channel permissions. All operators can see the shared inbox and job counts. Local-panel sends are audited as `local-panel`.
 
 - Captures new DMs, direct bot mentions, resolved replies to the bot, and explicitly configured `INBOX_CHANNEL_IDS` while running. It does **not** backfill Discord history, read unrelated channels by default, or record its own outgoing messages. Only attachment counts are stored; attachments are not downloaded.
-- DMs/direct mentions do not require Message Content intent. Full non-mention reply/selected-channel content requires `INBOX_MESSAGE_CONTENT=true` **and** Message Content Intent in Developer Portal. Without it, Discord may provide no text. Inbox reads work during media-service outages.
+- DMs/direct mentions do not require Message Content intent. Full non-mention reply/selected-channel content requires `INBOX_MESSAGE_CONTENT=true` **and** Message Content Intent in Developer Portal. Without it, Discord may provide no text. Inferred admin access needs reachable Seerr; explicit exceptions/local-panel inbox access work during media-service outages.
 - Retention defaults to **7 days / 10,000 messages**, whichever limit is reached first (`INBOX_RETENTION_DAYS`, `INBOX_MAX_MESSAGES`). Stored content is private operator data; protect database/backups and tell users who can read bot DMs. Pruning runs on receipt/inbox access.
 - All-member DMs require `ENABLE_MEMBERS_INTENT=true` **and** Server Members Intent in Developer Portal. Discord can deny DMs; use broad sends only for expected, relevant announcements, never unsolicited promotion.
 - Sends are paced (`ADMIN_SEND_INTERVAL_SECONDS=1`), limited to `ADMIN_MAX_RECIPIENTS=1000`, and rate-limited to five previews per five minutes per operator. Mentions cannot ping users/roles/everyone. Audit records persist sender, content, destination and confirmed/failed/uncertain delivery. Unconfirmed sends are **never automatically replayed**; pending sends resume after restart.

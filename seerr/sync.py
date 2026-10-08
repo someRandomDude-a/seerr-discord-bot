@@ -37,10 +37,21 @@ class SyncManager:
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute('PRAGMA journal_mode=WAL')
         try:
+            conn.execute('PRAGMA journal_mode=WAL')
             with conn:
                 yield conn
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, 'sqlite_errorcode', 0)
+            if (code & 0xff) == sqlite3.SQLITE_READONLY or 'readonly' in str(exc).lower():
+                raise PermissionError(
+                    f'SQLite database is not writable: {self.db_path}. The bot needs write access '
+                    'to the database, its parent directory, and existing -wal/-shm files. '
+                    'Check DATA_DIR/DATABASE_PATH and read-only mounts. The Docker image runs as '
+                    'UID 10001; fix ownership/permissions on the mounted storage while the bot '
+                    'is stopped. Do not delete the database. See docs/setup.md#sqlite-storage-permissions.'
+                ) from exc
+            raise
         finally:
             conn.close()
 

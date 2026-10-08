@@ -15,6 +15,7 @@ from media_bot.activity import snowflake
 from media_bot.config import Config
 from media_bot.security import UserError
 from media_bot.store import Store
+from media_bot.service import MediaService
 
 
 class AdminTests(unittest.IsolatedAsyncioTestCase):
@@ -37,6 +38,9 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.user.send = AsyncMock(return_value=SimpleNamespace(id=999))
         self.bot = MagicMock()
         self.bot.config, self.bot.service.store = self.config, self.store
+        self.bot.service.is_admin.side_effect = lambda uid: int(uid) in self.config.admin_ids
+        self.bot.service.offload = MediaService.offload
+        self.bot.service.arr = {}
         self.bot.guilds, self.bot.user = [self.guild], SimpleNamespace(id=123)
         self.bot.get_guild.side_effect = lambda uid: self.guild if uid == 555 else None
         self.bot.get_user.return_value = self.user

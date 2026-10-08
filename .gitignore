@@ -186,3 +186,5 @@ data/
 *.db-wal
 node_modules/
 activity/dist/
+settings.json
+.settings-*

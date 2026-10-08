@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import sqlite3
 import time
 
 import discord
@@ -154,8 +156,8 @@ def register_commands(bot):
                        recipient: discord.User = None, all_servers: bool = False, all_users: bool = False,
                        server_ids: str = None, channel_id: str = None):
         bot.guard(interaction)
-        bot.admin.require_admin(interaction.user.id)
         await interaction.response.defer(ephemeral=True)
+        await bot.service.offload(bot.admin.require_admin, interaction.user.id)
         if all_servers and (server_id or server_ids or recipient):
             raise UserError('Choose all servers or one explicit server/user.')
         if recipient and all_users:
@@ -182,33 +184,33 @@ def register_commands(bot):
                     user_id: str = None, channel_id: str = None, query: str = '', order: str = 'newest',
                     page: app_commands.Range[int, 1, 10000] = 1):
         bot.guard(interaction)
-        bot.admin.require_admin(interaction.user.id)
         await interaction.response.defer(ephemeral=True)
+        await bot.service.offload(bot.admin.require_admin, interaction.user.id)
         from media_bot.admin_ui import AdminListView
         view = AdminListView(bot, interaction.user.id, 'inbox', {'kind': kind, 'guild_id': server_id,
             'user_id': user_id, 'channel_id': channel_id, 'query': query, 'order': order}, page)
-        view.load()
+        await view.load()
         await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     @bot.tree.command(name='servers', description='Operators: joined servers and announcement destinations')
     async def servers(interaction: discord.Interaction, page: app_commands.Range[int, 1, 10000] = 1):
         bot.guard(interaction)
-        bot.admin.require_admin(interaction.user.id)
         await interaction.response.defer(ephemeral=True)
+        await bot.service.offload(bot.admin.require_admin, interaction.user.id)
         from media_bot.admin_ui import AdminListView
         view = AdminListView(bot, interaction.user.id, 'servers', page=page)
-        view.load()
+        await view.load()
         await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     @bot.tree.command(name='deliveries', description='Operators: announcement results; select a job for individual destinations')
     async def deliveries(interaction: discord.Interaction, job: app_commands.Range[int, 1] = None,
                          page: app_commands.Range[int, 1, 10000] = 1):
         bot.guard(interaction)
-        bot.admin.require_admin(interaction.user.id)
         await interaction.response.defer(ephemeral=True)
+        await bot.service.offload(bot.admin.require_admin, interaction.user.id)
         from media_bot.admin_ui import AdminListView
         view = AdminListView(bot, interaction.user.id, 'deliveries', page=page, job=job)
-        view.load()
+        await view.load()
         await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     @bot.tree.command(name='activity', description='Launch the Media Hub dashboard inside Discord')
@@ -326,8 +328,68 @@ def register_commands(bot):
 def main():
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-    config = Config.from_env()
-    SeerrBot(config).run(config.discord_token, log_handler=None)
+    asyncio.run(run_application())
+
+
+async def run_application():
+    from media_bot.config import boolean, integer
+    from media_bot.panel import ControlPanel
+    panel = None
+    bot = None
+    bot_task = None
+    if boolean('PANEL_ENABLED', True):
+        port = integer('PANEL_PORT', 0, 0)
+        if port > 65535:
+            raise ValueError('PANEL_PORT must be between 0 and 65535')
+        panel = ControlPanel(os.getenv('PANEL_HOST', '127.0.0.1'), port)
+        await panel.start()
+        address = '127.0.0.1' if panel.host in ('0.0.0.0', '::') else panel.host
+        print(f'Local admin panel: http://{address}:{panel.port}\nOne-time access code: {panel.code}\n'
+              'Keep this code/private port out of public proxies and shared logs.', flush=True)
+    try:
+        while True:
+            try:
+                config = Config.from_env()
+                bot = SeerrBot(config)
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                if not panel:
+                    raise
+                panel.runtime_error = ('Configuration/storage is not ready. Complete setup or correct '
+                    'writable DATA_DIR and environment overrides. ' + type(exc).__name__)
+                await panel.changed.wait()
+                panel.changed.clear()
+                continue
+            if panel:
+                panel.bot = bot
+                panel.runtime_error = ''
+            bot_task = asyncio.create_task(bot.start(config.discord_token))
+            if not panel:
+                await bot_task
+                return
+            change_task = asyncio.create_task(panel.changed.wait())
+            try:
+                done, _pending = await asyncio.wait((bot_task, change_task), return_when=asyncio.FIRST_COMPLETED)
+                if bot_task in done:
+                    error = bot_task.exception()
+                    panel.runtime_error = 'Bot stopped' + (f' ({type(error).__name__}). Check credentials, intents, backend port and storage.' if error else '.')
+                    log.warning('%s', panel.runtime_error)
+                await bot.close()
+                await asyncio.gather(bot_task, return_exceptions=True)
+                panel.bot = None
+                if not change_task.done():
+                    await change_task
+                panel.changed.clear()
+            finally:
+                change_task.cancel()
+                await asyncio.gather(change_task, return_exceptions=True)
+    finally:
+        if bot:
+            await bot.close()
+        if bot_task:
+            bot_task.cancel()
+            await asyncio.gather(bot_task, return_exceptions=True)
+        if panel:
+            await panel.close()
 
 
 if __name__ == '__main__':

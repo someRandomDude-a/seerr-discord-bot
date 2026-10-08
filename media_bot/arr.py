@@ -50,10 +50,13 @@ class ArrClient:
 
 
 def external_id(name, item):
+    name = name.split(':')[0]
     return str(item.get({'radarr': 'tmdbId', 'sonarr': 'tvdbId', 'lidarr': 'foreignAlbumId', 'readarr': 'foreignBookId'}[name]) or '')
 
 
 def arr_item(name, item):
+    source = name
+    name = name.split(':')[0]
     kind = {'radarr': 'movie', 'sonarr': 'tv', 'lidarr': 'music', 'readarr': 'book'}[name]
     stats = item.get('statistics') or {}
     size = stats.get('sizeOnDisk', item.get('sizeOnDisk', 0)) or 0
@@ -68,5 +71,5 @@ def arr_item(name, item):
     return {'kind': kind, 'external_id': external_id(name, item), 'title': item.get('title') or 'Untitled',
             'overview': item.get('overview') or '', 'available': available, 'size': size,
             'requestable': not bool(item.get('id')),
-            'subtitle': subtitle.strip(' ·'), 'source': name,
+            'subtitle': subtitle.strip(' ·'), 'source': source,
             'raw': item, 'jellyfin_id': None}

@@ -22,6 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY ./seerr /app/seerr
 COPY ./media_bot /app/media_bot
 COPY bot.py /app
+COPY .env.advanced.example /app/.env.advanced.example
+COPY activity/src/style.css /app/activity/src/style.css
 COPY --from=activity-build /activity/dist /app/activity/dist
 
 RUN useradd --create-home --uid 10001 mediahub && mkdir -p /data && chown mediahub:mediahub /data

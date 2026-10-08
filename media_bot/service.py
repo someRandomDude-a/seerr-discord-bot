@@ -9,6 +9,7 @@ from seerr import SeerrAPI, SyncManager
 from .arr import ArrClient, arr_item
 from .security import UserError
 from .store import Store
+from .discovery import discover_arr
 
 log = logging.getLogger(__name__)
 REQUEST_STATUS = {1: 'Pending approval', 2: 'Approved', 3: 'Declined', 4: 'Failed', 5: 'Completed'}
@@ -19,8 +20,12 @@ class MediaService:
     def __init__(self, config):
         self.config = config
         self.api = SeerrAPI(config.seerr_url, config.seerr_key, config.timeout)
-        self.sync = SyncManager(self.api, config.database)
-        self.store = Store(config.database)
+        try:
+            self.sync = SyncManager(self.api, config.database)
+            self.store = Store(config.database)
+        except Exception:
+            self.api.close()
+            raise
         self.arr = {k: ArrClient(v, config.timeout) for k, v in config.arr.items()}
         # All refresh/read/mutate operations share this lock. No overlapping cache writers.
         self.lock = asyncio.Lock()
@@ -43,12 +48,35 @@ class MediaService:
             raise UserError('Link your Jellyfin account first with /link.')
         return account
 
+    def is_admin(self, discord_id):
+        if int(discord_id) in self.config.admin_ids:
+            return True  # Explicit bot-only exceptions, managed by the local operator.
+        if not self.config.seerr_admins:
+            return False
+        try:
+            account = self.account(discord_id)
+            with self.as_user(account) as (_api, user):
+                return user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)
+        except UserError:
+            return False
+
+    async def verify_admin(self, discord_id):
+        try:
+            return await self.offload(self.is_admin, discord_id)
+        except Exception:
+            return False  # Profile may still expose local Undo/mute; admin actions always revalidate separately.
+
     def _refresh(self):
         with self.store.connect() as db:
             db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('last_attempt', ?)", (str(time.time()),))
             db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error', 'Live refresh in progress')")
         try:
             self.sync.sync()
+            if self.config.seerr_discovery:
+                discovered = discover_arr(self.api)
+                direct = {k: v for k, v in self.config.arr.items() if k not in ('radarr', 'sonarr')}
+                configs = {**direct, **discovered}
+                self.arr = {k: ArrClient(v, self.config.timeout) for k, v in configs.items()}
             snapshots = {name: api.snapshot() for name, api in self.arr.items()}
             snapshots['seerr'] = self._seerr_catalog()
             watched = self._watched_states()
@@ -215,10 +243,11 @@ class MediaService:
             for row in db.execute("SELECT * FROM snapshots WHERE source!='seerr'"):
                 for raw in json.loads(row['payload'])['items']:
                     item = arr_item(row['source'], raw)
+                    source_type = row['source'].split(':')[0]
                     # Sonarr identifiers are TVDB rather than TMDB; keep its separate source.
-                    if row['source'] == 'sonarr' and item['external_id'] in seen_tvdb:
+                    if source_type == 'sonarr' and item['external_id'] in seen_tvdb:
                         continue
-                    namespace = 'tvdb' if row['source'] == 'sonarr' else 'tmdb' if row['source'] == 'radarr' else row['source']
+                    namespace = 'tvdb' if source_type == 'sonarr' else 'tmdb' if source_type == 'radarr' else row['source']
                     identity = (item['kind'], item['external_id'], namespace)
                     if item['available'] and identity not in seen:
                         items.append(item)
@@ -297,7 +326,7 @@ class MediaService:
             return 'Your library request was submitted, but follow-up sync failed. Do not resubmit; check /status.'
 
     def _op_watch(self, account, api, user, item, remove=False):
-        if item['kind'] == 'tv' and item.get('source') == 'sonarr':
+        if item['kind'] == 'tv' and (item.get('source') or '').split(':')[0] == 'sonarr':
             raise UserError('Search this series through Seerr to follow its TMDB identity.')
         if not remove:
             kind, eid = item['kind'], item['external_id']
@@ -313,7 +342,7 @@ class MediaService:
         return 'Removed from watchlist.' if remove else 'Added to your watchlist. Enable notifications to receive DMs.'
 
     def _op_open(self, account, api, user, item):
-        if item['kind'] not in ('movie', 'tv') or item.get('source') == 'sonarr':
+        if item['kind'] not in ('movie', 'tv') or (item.get('source') or '').split(':')[0] == 'sonarr':
             raise UserError('This item does not have a Seerr/Jellyfin link.')
         details = api.get_movie_details(int(item['external_id'])) if item['kind'] == 'movie' else api.get_tv_details(int(item['external_id']))
         info = details.get('mediaInfo') or {}
@@ -480,14 +509,17 @@ class MediaService:
         # even if Seerr has not yet run its own availability scan.
         tv_ids = snapshots.get('seerr', {}).get('tv_identities', {})
         for source in ('radarr', 'sonarr'):
-            if source not in snapshots:
+            sources = [key for key in snapshots if key.split(':')[0] == source]
+            if not sources:
                 continue
             service_items = {}
-            for raw in snapshots[source]['items']:
+            for raw in [item for key in sources for item in snapshots[key]['items']]:
                 item = arr_item(source, raw)
                 eid = tv_ids.get(item['external_id']) if source == 'sonarr' else item['external_id']
                 if eid:
-                    service_items[(item['kind'], eid)] = item
+                    previous = service_items.get((item['kind'], eid))
+                    if not previous or item['available']:
+                        service_items[(item['kind'], eid)] = item
             kind = 'movie' if source == 'radarr' else 'tv'
             for key, entry in states.items():
                 if key[0] != kind:

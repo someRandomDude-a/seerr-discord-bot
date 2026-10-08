@@ -1,0 +1,17 @@
+# docker compose -f templates/compose.slash.yml up -d --build
+# Find the random LOCAL panel port: docker compose -f templates/compose.slash.yml port media 8787
+# Fetch its one-time code: docker compose -f templates/compose.slash.yml logs media
+services:
+  media:
+    build: ..
+    environment:
+      DATA_DIR: /data
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 8787
+    volumes:
+      - media-data:/data
+    ports:
+      - "127.0.0.1::8787"
+    restart: unless-stopped
+volumes:
+  media-data:

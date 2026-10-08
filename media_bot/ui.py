@@ -99,8 +99,9 @@ class AnnouncementConfirmView(OwnedView):
         if self.used:
             raise UserError('This preview was already used.')
         self.used = True
-        job = self.bot.admin.confirm(self.owner, self.plan['plan'])
-        await interaction.response.edit_message(embed=embed('Announcement started', f'#{job} · /deliveries job:{job}'), view=None)
+        await interaction.response.defer(ephemeral=True)
+        job = await self.bot.service.offload(self.bot.admin.confirm, self.owner, self.plan['plan'])
+        await interaction.edit_original_response(embed=embed('Announcement started', f'#{job} · /deliveries job:{job}'), view=None)
         self.stop()
 
     async def cancel(self, interaction):

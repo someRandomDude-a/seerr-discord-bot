@@ -1,7 +1,8 @@
-"""Explicit operator-only announcements and a bounded, private received-message inbox."""
+"""Verified operator announcements and a bounded, private received-message inbox."""
 import asyncio
 import secrets
 import time
+import threading
 from dataclasses import dataclass, field
 
 import discord
@@ -10,7 +11,7 @@ from .security import RateLimiter, UserError
 
 @dataclass
 class SendPlan:
-    actor: int
+    actor: int | str
     content: str
     destinations: list
     expires: float
@@ -22,11 +23,15 @@ class AdminMessaging:
         self.bot, self.config, self.store = bot, bot.config, bot.service.store
         self.plans = {}
         self.plan_lock = asyncio.Lock()
+        self.plans_lock = threading.Lock()
+        self.loop = asyncio.get_running_loop()
         self.limiter = RateLimiter(self.config.admin_send_limit, self.config.admin_send_window)
         self.wake = asyncio.Event()
 
     def is_admin(self, user_id):
-        return int(user_id) in self.config.admin_ids
+        if user_id == 'local-panel':
+            return True  # Internal actor only; authenticated local panel, never accepted from Discord.
+        return self.bot.service.is_admin(user_id)
 
     def require_admin(self, user_id):
         if not self.is_admin(user_id):
@@ -42,12 +47,13 @@ class AdminMessaging:
         return channel if permissions.view_channel and allowed else None
 
     async def prepare(self, actor, content, guild_ids=(), user_id=None, all_users=False, channel_id=None):
-        self.require_admin(actor)
+        await self.bot.service.offload(self.require_admin, actor)
         if not isinstance(content, str) or not 1 <= len(content.strip()) <= 2000:
             raise UserError('Message must contain 1–2000 characters.')
         sensitive = [self.config.discord_token, self.config.seerr_key, self.config.client_secret, self.config.webhook_secret]
         sensitive.extend(c.key for c in self.config.arr.values())
-        if any(len(value) >= 8 and value in content for value in sensitive):
+        sensitive.extend(c.config.key for c in list(self.bot.service.arr.values()))
+        if any(isinstance(value, str) and len(value) >= 8 and value in content for value in sensitive):
             raise UserError('The message appears to contain a configured secret. Remove it first.')
         self.limiter.check(actor)
         async with self.plan_lock:
@@ -97,9 +103,10 @@ class AdminMessaging:
                 raise UserError('No sendable channels. Configure ADMIN_ANNOUNCEMENT_CHANNELS or a server system channel.')
             if len(destinations) > self.config.admin_max_recipients:
                 raise UserError('Recipient limit exceeded.')
-            self.plans = {key: plan for key, plan in self.plans.items() if plan.expires > time.monotonic()}
             token = secrets.token_urlsafe(24)
-            self.plans[token] = SendPlan(actor, content, destinations, time.monotonic() + 120, skipped)
+            with self.plans_lock:
+                self.plans = {key: plan for key, plan in self.plans.items() if plan.expires > time.monotonic()}
+                self.plans[token] = SendPlan(actor, content, destinations, time.monotonic() + 120, skipped)
             return {'plan': token, 'channels': sum(d['kind'] == 'channel' for d in destinations),
                     'users': sum(d['kind'] == 'user' for d in destinations), 'skipped': skipped,
                     'destinations': [d['label'] for d in destinations[:20]], 'message': content}
@@ -108,16 +115,17 @@ class AdminMessaging:
         self.require_admin(actor)
         if not isinstance(token, str):
             raise UserError('Invalid send preview.')
-        plan = self.plans.get(token)
-        if not plan or plan.actor != actor or plan.expires <= time.monotonic():
-            raise UserError('Send preview expired or belongs to another operator. Preview again.')
-        self.plans.pop(token)
+        with self.plans_lock:
+            plan = self.plans.get(token)
+            if not plan or plan.actor != actor or plan.expires <= time.monotonic():
+                raise UserError('Send preview expired or belongs to another operator. Preview again.')
+            self.plans.pop(token)
         with self.store.connect() as db:
             job = db.execute('INSERT INTO announcements(actor_id,content,created_at) VALUES (?,?,?)',
                              (str(actor), plan.content, time.time())).lastrowid
             db.executemany('INSERT INTO announcement_deliveries(announcement_id,kind,target_id,label) VALUES (?,?,?,?)',
                            [(job, d['kind'], d['id'], d['label']) for d in plan.destinations])
-        self.wake.set()
+        self.loop.call_soon_threadsafe(self.wake.set)
         return job
 
     def state(self, actor):
@@ -187,7 +195,7 @@ class AdminMessaging:
             db.execute('DELETE FROM inbox WHERE id NOT IN (SELECT id FROM inbox ORDER BY id DESC LIMIT ?)', (self.config.inbox_max_messages,))
 
     async def receive(self, message):
-        if not self.config.admin_ids or not self.bot.user or message.author.id == self.bot.user.id:
+        if not (self.config.admin_ids or self.config.seerr_admins) or not self.bot.user or message.author.id == self.bot.user.id:
             return
         direct = message.guild is None
         mentioned = any(user.id == self.bot.user.id for user in message.mentions)
@@ -216,10 +224,15 @@ class AdminMessaging:
                 rows = [dict(r) for r in db.execute('''SELECT d.*,a.content,a.actor_id FROM announcement_deliveries d
                     JOIN announcements a ON a.id=d.announcement_id WHERE d.status='pending' ORDER BY d.id LIMIT 50''')]
             for row in rows:
+                try:
+                    allowed = await self.bot.service.offload(self.is_admin, row['actor_id'])
+                except Exception:
+                    await asyncio.sleep(30)  # No send occurred: leave pending until authority can be verified.
+                    break
                 with self.store.connect() as db:
                     db.execute("UPDATE announcement_deliveries SET status='sending' WHERE id=?", (row['id'],))
                 try:
-                    if not self.is_admin(row['actor_id']):
+                    if not allowed:
                         raise UserError('Operator access was revoked')
                     if row['kind'] == 'user':
                         target = self.bot.get_user(int(row['target_id'])) or await self.bot.fetch_user(int(row['target_id']))

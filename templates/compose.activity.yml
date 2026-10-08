@@ -1,0 +1,18 @@
+# Choose Activity preset in the panel. Proxy/tunnel localhost:8080, NEVER the panel port.
+# docker compose -f templates/compose.activity.yml up -d --build
+services:
+  media:
+    build: ..
+    environment:
+      DATA_DIR: /data
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 8787
+      BOT_HOST: 0.0.0.0
+    volumes:
+      - media-data:/data
+    ports:
+      - "127.0.0.1::8787"
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+volumes:
+  media-data:

@@ -56,7 +56,12 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await view.interaction_check(self.interaction))
         self.interaction.user.id = 42
         self.bot.config.admin_ids = frozenset()
-        self.assertFalse(await view.interaction_check(self.interaction))
+        # Slow live authorization belongs after defer, not in the 3-second
+        # interaction check (which must also permit opening a reply modal).
+        with self.assertRaises(UserError):
+            await view.refresh(self.interaction)
+        self.interaction.response.defer.assert_awaited_once()
+        self.interaction.edit_original_response.assert_not_awaited()
 
     async def test_multiserver_announcement_preserves_selected_targets(self):
         self.bot.admin.prepare = AsyncMock(return_value={'plan': 'p', 'channels': 2, 'users': 0, 'destinations': [], 'skipped': []})
@@ -88,7 +93,7 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
             'guild_id': '555', 'guild_name': 'y' * 100, 'channel_id': '111', 'channel_name': 'z' * 100,
             'content': '@everyone <script>' * 300, 'attachment_count': 1, 'created_at': 1,
         } for i in range(5)], 'total': 100})
-        view = AdminListView(self.bot, 42, 'inbox'); view.load()
+        view = AdminListView(self.bot, 42, 'inbox'); await view.load()
         self.assertLessEqual(len(view.render()), 6000)
         detail = InboxDetailView(self.bot, 42, view.rows[0], view)
         self.assertLessEqual(len(detail.render().description), 4096)
@@ -127,8 +132,8 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_every_example_option_has_inline_documentation_and_is_consumed(self):
         root = Path(__file__).resolve().parent.parent
-        example = (root / '.env.example').read_text().splitlines()
-        config = (root / 'media_bot/config.py').read_text()
+        example = (root / '.env.example').read_text(encoding='utf-8').splitlines() + (root / '.env.advanced.example').read_text(encoding='utf-8').splitlines()
+        config = (root / 'media_bot/config.py').read_text(encoding='utf-8') + (root / 'bot.py').read_text(encoding='utf-8')
         for index, line in enumerate(example):
             if not line or line.startswith('#'):
                 continue
