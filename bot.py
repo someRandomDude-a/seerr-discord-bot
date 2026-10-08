@@ -10,7 +10,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from media_bot.config import Config
-from media_bot.security import RateLimiter, UserError
+from media_bot.security import RateLimiter, UserError, VerificationUnavailable
 from media_bot.service import MediaService
 from media_bot.linking import QuickConnect
 from media_bot.activity import ActivityAPI
@@ -39,6 +39,7 @@ class SeerrBot(commands.Bot):
         self.activity = ActivityAPI(self) if config.activity_enabled else None
         self.webhooks = WebhookServer(self.service, self.refresh_event, self.activity)
         self.worker = None
+        self.watchlist_worker = None
         self.message_worker = None
         self.tree.on_error = self.command_error
         register_commands(self)
@@ -69,6 +70,7 @@ class SeerrBot(commands.Bot):
         else:
             await self.tree.sync()
         self.worker = asyncio.create_task(self.sync_worker())
+        self.watchlist_worker = asyncio.create_task(self.watchlist_sync_worker())
         self.message_worker = asyncio.create_task(self.admin.deliver())
 
     async def on_ready(self):
@@ -96,6 +98,15 @@ class SeerrBot(commands.Bot):
             except asyncio.TimeoutError:
                 pass
 
+    async def watchlist_sync_worker(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self.service.sync_watchlists()
+            except Exception:
+                log.warning('Watchlist cycle failed; saved entries and pending changes preserved')
+            await asyncio.sleep(self.config.sync_interval)
+
     def notification_eligible(self, discord_id):
         account = self.service.account(discord_id)
         if not account['opted_in']:
@@ -120,6 +131,9 @@ class SeerrBot(commands.Bot):
                     await user.send(embed=embed(f"✨ {clean(row['title'], 180)}", clean(row['body'], 1400) + '\n\nManage your watchlist and opt-in with /dashboard.'), allowed_mentions=discord.AllowedMentions.none())
                     with self.service.store.connect() as db:
                         db.execute('UPDATE outbox SET sent=1 WHERE id=?', (row['id'],))
+            except VerificationUnavailable:
+                with self.service.store.connect() as db:
+                    db.execute('UPDATE outbox SET next_attempt=? WHERE id=?', (time.time() + 60, row['id']))
             except (discord.Forbidden, UserError):
                 # Closed DMs or revoked links: pause safely; user can explicitly opt in again.
                 self.service.store.preference(row['discord_id'], opted_in=False)
@@ -130,6 +144,12 @@ class SeerrBot(commands.Bot):
                                (attempts, time.time() + min(3600, 30 * 2 ** min(attempts, 7)), row['id']))
 
     async def close(self):
+        if self.watchlist_worker:
+            self.watchlist_worker.cancel()
+            try:
+                await self.watchlist_worker
+            except asyncio.CancelledError:
+                pass
         if self.message_worker:
             self.message_worker.cancel()
             try:
@@ -217,7 +237,7 @@ def register_commands(bot):
     async def activity(interaction: discord.Interaction):
         bot.guard(interaction)
         if not bot.config.activity_enabled:
-            raise UserError('Activity mode is not configured yet. Use /dashboard, or enable it in the Discord Developer Portal and bot environment.')
+            raise UserError('Use /link to verify your identity, then /dashboard.')
         await interaction.response.launch_activity()
 
     @bot.tree.command(name='link', description='Passwordless Jellyfin Quick Connect in Discord; save your verified Discord ID in Seerr')
@@ -247,7 +267,7 @@ def register_commands(bot):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(bot, interaction.user.id, 'requests', (all_requests,), 'All requests' if all_requests else 'My requests', query=query)
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     @bot.tree.command(name='search', description='Discover movies, series, music albums or books and request them')
     @app_commands.choices(kind=[app_commands.Choice(name=label, value=value) for label, value in [('Movies', 'movie'), ('Series', 'tv'), ('Music albums', 'music'), ('Books', 'book')]])
@@ -256,7 +276,16 @@ def register_commands(bot):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(bot, interaction.user.id, 'search', (kind.value, query, page), 'Discover')
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='discover', description='Browse popular movies and series with posters, then request or watch')
+    @app_commands.choices(kind=[app_commands.Choice(name=label, value=value) for label, value in [('Movies', 'movie'), ('Series', 'tv')]])
+    async def discover(interaction: discord.Interaction, kind: str = 'movie', page: app_commands.Range[int, 1, 500] = 1):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        view = ItemsView(bot, interaction.user.id, 'discover', (kind, page), 'Discover · Popular titles')
+        await view.load()
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     @bot.tree.command(name='library', description='Browse available movies, shows, albums and books')
     @app_commands.choices(kind=[app_commands.Choice(name=label, value=value) for label, value in [('Everything', 'all'), ('Movies', 'movie'), ('Series', 'tv'), ('Music', 'music'), ('Books', 'book')]])
@@ -265,7 +294,7 @@ def register_commands(bot):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(bot, interaction.user.id, 'library', (kind,), 'Available library', query=query)
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     @bot.tree.command(name='storage', description='See verified live storage space across configured media services')
     async def storage(interaction: discord.Interaction):
@@ -276,12 +305,15 @@ def register_commands(bot):
     async def notifications(interaction: discord.Interaction, enabled: bool = None):
         bot.guard(interaction)
         await interaction.response.defer(ephemeral=True)
-        bot.service.account(interaction.user.id)
+        if enabled is False:
+            bot.service.mute_notifications(interaction.user.id)
+            await interaction.followup.send('All personal updates muted.', ephemeral=True)
+            return  # Safety action: no account fields or device labels are disclosed.
+        await bot.service.verified_account(interaction.user.id)
         if enabled is True:
             await bot.service.run(interaction.user.id, 'preferences', True)
-        elif enabled is False:
-            bot.service.mute_notifications(interaction.user.id)
-        view = PreferencesView(bot, interaction.user.id)
+        devices = await bot.service.offload(bot.service.devices)
+        view = PreferencesView(bot, interaction.user.id, devices)
         await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     @bot.tree.command(name='watchlist', description='Browse and remove followed items for personal state-change notifications')
@@ -290,7 +322,7 @@ def register_commands(bot):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(bot, interaction.user.id, 'watches', (), 'My watchlist', query=query)
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     @bot.tree.command(name='deletions', description='View scheduled file deletions and undo them during the 24-hour delay')
     async def deletions(interaction: discord.Interaction, query: str = ''):
@@ -298,31 +330,31 @@ def register_commands(bot):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(bot, interaction.user.id, 'deletions', (), 'My file deletions · 24-hour undo window', query=query)
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     @bot.tree.command(name='status', description='Inspect the database health and last verified refresh (diagnostic only)')
     async def status(interaction: discord.Interaction):
         bot.guard(interaction)
-        bot.service.account(interaction.user.id)
-        meta = bot.service.store.meta()
+        await interaction.response.defer(ephemeral=True)
+        meta = await bot.service.offload(bot.service.status, interaction.user.id)
         healthy = (not meta.get('error') and bool(meta.get('last_success')) and
                    time.time() - float(meta['last_success']) <= bot.config.sync_interval * 2)
         result = embed('Database health', '🟢 Last refresh succeeded' if healthy else '🔴 Not verified · data operations blocked until a successful live refresh')
         if meta.get('last_success'):
             result.add_field(name='Last complete refresh', value=f"<t:{int(float(meta['last_success']))}:F>")
         result.add_field(name='Background interval', value=f'{bot.config.sync_interval} seconds')
-        result.add_field(name='Freshness policy', value='Every data-backed command and action refreshes first. Failed refreshes never fall back to cached data.', inline=False)
+        result.add_field(name='Freshness policy', value='Library/request/storage reads refresh their snapshots. Discovery/details read their dependencies live. Gallery paging reuses its labelled snapshot; actions recheck live access. Failed refreshes never fall back to stale data.', inline=False)
         result.add_field(name='Services', value=', '.join(['Seerr'] + [s.title() for s in bot.config.arr]))
-        await interaction.response.send_message(embed=result, ephemeral=True)
+        await interaction.followup.send(embed=result, ephemeral=True)
 
     @bot.tree.command(name='seerr', description='Open your Seerr server')
     async def seerr(interaction: discord.Interaction):
         bot.guard(interaction)
         await interaction.response.defer(ephemeral=True)
-        await bot.service.run(interaction.user.id, 'dashboard')
+        url = await bot.service.run(interaction.user.id, 'seerr_link')
         view = discord.ui.View()
-        view.add_item(discord.ui.Button(label='Open Seerr', url=bot.config.seerr_url))
-        await interaction.followup.send('Your media requests, on the web.', view=view, ephemeral=True)
+        view.add_item(discord.ui.Button(label='Open Seerr', url=url))
+        await interaction.followup.send('Open Seerr in your browser and sign in with your own account. Your permissions apply there; no bot credentials are shared.', view=view, ephemeral=True)
 
 
 def main():

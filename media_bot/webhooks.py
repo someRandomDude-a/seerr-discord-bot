@@ -4,7 +4,7 @@ import secrets
 import time
 
 from aiohttp import web
-from .security import RateLimiter, UserError
+from .security import RateLimiter, UserError, VerificationRequired, VerificationUnavailable
 
 
 class WebhookServer:
@@ -21,7 +21,9 @@ class WebhookServer:
             response = await handler(request)
         except UserError as exc:
             limited = str(exc).startswith('Too many')
-            response = web.json_response({'error': str(exc)}, status=429 if limited else 400)
+            response = web.json_response({'error': str(exc), 'verification_required': isinstance(exc, VerificationRequired),
+                'private_data_blocked': isinstance(exc, (VerificationRequired, VerificationUnavailable))},
+                status=429 if limited else 400)
         except web.HTTPException as exc:
             headers = {key: value for key, value in exc.headers.items() if key.lower() != 'content-type'}
             response = web.json_response({'error': exc.reason}, status=exc.status, headers=headers)

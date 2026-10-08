@@ -7,6 +7,20 @@ const icons = { movie: '🎬', tv: '📺', music: '🎵', book: '📚' };
 let sdk, token, config, profile, content, health, page = 'home', category = 'all', allRequests = false;
 let searchQuery = '', searchKind = 'movie', searchPage = 1, linkGeneration, refreshTimer, linkTimer, loading = false;
 let inboxKind = 'all', inboxGuild = null, inboxUser = null, inboxChannel = null, inboxQuery = '', inboxPage = 1, inboxOrder = 'newest';
+let privacyGeneration = 0;
+let queuedDestination = null;
+const galleryState = new Map();
+const posterObservers = new Map();
+const posterUrls = new Map();
+
+function releasePoster(url) { URL.revokeObjectURL(url); posterUrls.delete(url); }
+
+function cleanupPosters() {
+  for (const [observer, image] of posterObservers) {
+    if (!image.isConnected) { observer.disconnect(); posterObservers.delete(observer); }
+  }
+  for (const [url, image] of posterUrls) if (!image.isConnected) releasePoster(url);
+}
 const compose = { initialized: false, message: '', guilds: new Set(), user: '', allUsers: false, channel: null };
 
 async function request(path, body) {
@@ -16,12 +30,18 @@ async function request(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Unable to complete the action. Reopen the Activity if your session expired.');
+  if (!response.ok) {
+    const error = new Error(data.error || 'Unable to complete the action. Reopen the Activity if your session expired.');
+    error.privateDataBlocked = data.private_data_blocked || response.status === 401;
+    if (error.privateDataBlocked) hidePrivateData(data.verification_required);
+    throw error;
+  }
   return data;
 }
 
 async function api(operation, args = {}) {
   const data = await request('/api/activity/action', { operation, ...args });
+  if (operation === 'browse') return data;
   return Object.hasOwn(data, 'result') ? data.result : data;
 }
 
@@ -47,6 +67,19 @@ function showError(error) {
   if (health) { health.textContent = '● Live verification needed'; health.className = 'health error'; }
 }
 
+function hidePrivateData(relink = false) {
+  privacyGeneration += 1;
+  clearInterval(refreshTimer);
+  profile = { account: null, devices: [], is_admin: false };
+  compose.initialized = false; compose.guilds.clear(); compose.message = ''; compose.user = '';
+  page = 'home';
+  galleryState.clear(); queuedDestination = null;
+  buildShell();
+  cleanupPosters();
+  if (relink) renderLink();
+  else content.append(button('Retry verification', loadPage));
+}
+
 function toast(message) {
   const target = document.querySelector('#notice');
   target.textContent = message.replace(/<t:(\d+):[FR]>/g, (_, seconds) => new Date(Number(seconds) * 1000).toLocaleString());
@@ -60,10 +93,10 @@ function buildShell() {
   const sidebar = node('aside', 'sidebar');
   sidebar.append(node('div', 'brand', '◈ Media'));
   const navigation = node('nav');
-  const tabs = [['home', '◈ Overview'], ['library', '▦ Library'], ['requests', '☷ Requests'], ['search', '⌕ Discover'], ['watches', '☆ Watchlist'], ['storage', '◉ Storage'], ['deletions', '◷ Deletions'], ['settings', '⚙ Preferences']];
+  const tabs = profile.account ? [['home', '◈ Home'], ['search', '⌕ Discover'], ['library', '▦ Library'], ['requests', '☷ Requests'], ['watches', '☆ Watchlist'], ['storage', '◉ Storage'], ['deletions', '◷ Deletions'], ['settings', '⚙ Preferences']] : [];
   if (profile.is_admin) tabs.push(['admin', '↗ Messages']);
   for (const [key, label] of tabs) {
-    const tab = button(label, async () => { if (loading) return; page = key; await loadPage(); }, 'nav-button');
+    const tab = button(label, () => navigate(key), 'nav-button');
     tab.dataset.page = key;
     navigation.append(tab);
   }
@@ -71,12 +104,19 @@ function buildShell() {
   const main = node('main', 'main');
   const header = node('header', 'topbar');
   health = node('span', 'health', '● Verifying live data');
+  health.setAttribute('aria-live', 'polite');
   header.append(health, button('↻ Refresh', loadPage, 'button subtle'));
   const notice = node('div', 'notice'); notice.id = 'notice'; notice.hidden = true;
   content = node('section', 'content');
   main.append(header, notice, content);
   shell.append(sidebar, main);
   root.append(shell);
+}
+
+async function navigate(destination) {
+  if (loading) { queuedDestination = destination; return; }
+  page = destination;
+  await loadPage();
 }
 
 function heading(title, subtitle) {
@@ -96,40 +136,65 @@ function updateHealth(meta) {
 async function loadPage() {
   if (loading) return;
   loading = true;
+  const generation = privacyGeneration;
   try {
     for (const tab of document.querySelectorAll('.nav-button')) tab.classList.toggle('selected', tab.dataset.page === page);
     content.replaceChildren(node('div', 'loading', 'Refreshing live state…'));
+    cleanupPosters();
     const notice = document.querySelector('#notice'); notice.hidden = true;
+    const wasLinked = Boolean(profile.account);
+    if (!wasLinked || page === 'admin') {
+      const freshProfile = await api('profile');
+      if (generation !== privacyGeneration) return;
+      profile = freshProfile;
+    }
+    if (!profile.account) { hidePrivateData(true); return; }
+    if (page === 'admin' && !profile.is_admin) { page = 'home'; buildShell(); cleanupPosters(); }
+    if (!wasLinked) buildShell();
+    Object.assign(config, { refresh_interval: profile.refresh_interval, sync_interval: profile.sync_interval });
     if (page === 'admin' && profile.is_admin) {
       const [state, inbox] = await Promise.all([api('admin_state'), api('admin_inbox', {
         kind: inboxKind, guild_id: inboxGuild, user_id: inboxUser, channel_id: inboxChannel, query: inboxQuery, page: inboxPage, order: inboxOrder,
       })]);
+      if (generation !== privacyGeneration) return;
       content.replaceChildren(); renderAdmin(state, inbox); health.textContent = '● Operator'; health.className = 'health'; return;
     }
     if (!profile.account) { content.replaceChildren(); renderLink(); return; }
-    let result;
-    if (page === 'home') result = await api('dashboard');
-    else if (page === 'settings') result = await api('profile');
-    else if (page === 'search') result = searchQuery ? await api('search', { kind: searchKind, query: searchQuery, page: searchPage }) : [];
-    else if (page === 'library') result = await api('library', { kind: category });
-    else if (page === 'requests') result = await api('requests', { all_requests: allRequests });
-    else result = await api(page);
+    const bundle = await api('browse', { page, kind: page === 'search' ? searchKind : 'all',
+      query: searchQuery, result_page: searchPage, all_requests: allRequests });
+    if (generation !== privacyGeneration) return;
+    const wasAdmin = profile.is_admin;
+    profile = bundle.viewer;
+    if (wasAdmin !== profile.is_admin) { buildShell(); cleanupPosters(); }
+    Object.assign(config, { refresh_interval: profile.refresh_interval, sync_interval: profile.sync_interval });
+    const result = bundle.result;
     content.replaceChildren();
     if (page === 'home') renderHome(result);
-    else if (page === 'settings') renderSettings(result);
+    else if (page === 'settings') renderSettings(profile);
     else if (page === 'storage') renderStorage(result);
-    else if (page === 'search') renderSearch(result);
+    else if (page === 'search') renderSearch(result || []);
     else renderItems(result);
-    updateHealth(await api('status'));
+    if (['home', 'library', 'requests', 'storage'].includes(page)) updateHealth(bundle.meta);
+    else { health.textContent = '● Account verified · Live access'; health.className = 'health'; }
   } catch (error) {
-    content.replaceChildren(node('div', 'empty', page === 'admin' ? 'Messages unavailable' : 'Live data unavailable · Try refreshing'));
+    if (!error.privateDataBlocked) content.replaceChildren(node('div', 'empty', page === 'admin' ? 'Messages unavailable' : 'Live data unavailable · Try refreshing'));
     showError(error);
-  } finally { loading = false; }
+  } finally {
+    loading = false;
+    if (queuedDestination !== null) {
+      const destination = queuedDestination; queuedDestination = null;
+      if (destination !== page) void navigate(destination);
+    }
+  }
 }
 
 function renderHome(data) {
   profile.account = data.account;
   heading(`Hi, ${data.account.name}`);
+  const welcome = node('div', 'discovery-banner');
+  welcome.append(node('h2', '', 'What would you like to watch?'), node('p', '', 'Discover something new, or jump straight into your library.'),
+    button('✨ Find something new', () => navigate('search'), 'button primary'), button('▶ Browse library', () => navigate('library'), 'button subtle'));
+  content.append(welcome);
   const stats = node('div', 'stats');
   for (const [label, value] of [['Your requests', data.requests], ['Available items', data.library], ['Personal updates', data.account.opted_in ? 'On' : 'Off']]) {
     const card = node('div', 'stat'); card.append(node('p', '', label), node('strong', '', value)); stats.append(card);
@@ -137,7 +202,7 @@ function renderHome(data) {
   content.append(stats);
   const shortcuts = node('div', 'shortcuts');
   for (const [kind, label] of [['movie', 'Movies'], ['tv', 'Series'], ['music', 'Music'], ['book', 'Books']]) {
-    shortcuts.append(button(`${icons[kind]} ${label}`, async () => { category = kind; page = 'library'; await loadPage(); }, 'shortcut'));
+    shortcuts.append(button(`${icons[kind]} ${label}`, async () => { category = kind; await navigate('library'); }, 'shortcut'));
   }
   content.append(shortcuts);
 }
@@ -156,61 +221,150 @@ function renderItems(items) {
   const titles = { library: ['Library'], requests: ['Requests'], watches: ['Watchlist'], deletions: ['Deletions', '24-hour delay · Undo until execution'] };
   heading(...titles[page]);
   const tools = node('div', 'toolbar');
-  if (page === 'library') tools.append(select([['all', 'Everything'], ['movie', 'Movies'], ['tv', 'Series'], ['music', 'Music'], ['book', 'Books']], category, async (value) => { category = value; await loadPage(); }));
+  let redraw = () => {};
+  if (page === 'library') tools.append(select([['all', 'Everything'], ['movie', 'Movies'], ['tv', 'Series'], ['music', 'Music'], ['book', 'Books']], category, async (value) => { category = value; redraw(); }));
   if (page === 'requests') tools.append(select([['mine', 'Mine'], ['all', 'All']], allRequests ? 'all' : 'mine', async (value) => { allRequests = value === 'all'; await loadPage(); }));
-  const filter = node('input'); filter.type = 'search'; filter.placeholder = 'Filter…'; filter.setAttribute('aria-label', 'Filter collection'); tools.append(filter);
+  const stateKey = `${page}:${allRequests}`;
+  if (!galleryState.has(stateKey)) galleryState.set(stateKey, { query: '', sort: 'default', page: 0 });
+  const state = galleryState.get(stateKey);
+  const filter = node('input'); filter.type = 'search'; filter.placeholder = 'Filter titles…'; filter.value = state.query; filter.setAttribute('aria-label', 'Filter collection'); tools.append(filter);
+  tools.append(select([['default', 'Default order'], ['title', 'Title A–Z'], ['available', 'Available first']], state.sort, async value => { state.sort = value; state.page = 0; redraw(); }));
   const count = node('span', 'count', `${items.length} items`); tools.append(count); content.append(tools);
   const grid = node('div', 'grid'); content.append(grid);
+  const paging = node('div', 'toolbar gallery-paging'); content.append(paging);
   const draw = () => {
-    const shown = items.filter(item => item.title.toLowerCase().includes(filter.value.toLowerCase()));
+    const shown = items.filter(item => item.title.toLowerCase().includes(state.query.toLowerCase()) && (page !== 'library' || category === 'all' || item.kind === category));
+    if (state.sort === 'title') shown.sort((a, b) => a.title.localeCompare(b.title));
+    if (state.sort === 'available') shown.sort((a, b) => Number(Boolean(b.available)) - Number(Boolean(a.available)));
+    const pages = Math.max(1, Math.ceil(shown.length / 12)); state.page = Math.min(state.page, pages - 1);
+    count.textContent = `${shown.length} titles · Page ${state.page + 1}/${pages}`;
     grid.replaceChildren();
-    for (const item of shown) grid.append(itemCard(item));
-    if (!shown.length) grid.append(node('div', 'empty', 'No items'));
+    cleanupPosters();
+    for (const item of shown.slice(state.page * 12, state.page * 12 + 12)) grid.append(itemCard(item));
+    if (!shown.length) grid.append(node('div', 'empty', 'No matches. Change your filter or try Discover.'));
+    const previous = button('← Previous', () => { state.page -= 1; draw(); }); previous.disabled = state.page === 0;
+    const next = button('Next →', () => { state.page += 1; draw(); }); next.disabled = state.page + 1 >= pages;
+    paging.replaceChildren(previous, node('span', 'fine', `${state.page + 1} / ${pages} · Open gallery snapshot`), next);
   };
-  filter.addEventListener('input', draw); draw();
+  redraw = () => { state.page = 0; draw(); };
+  filter.addEventListener('input', () => { state.query = filter.value; state.page = 0; draw(); }); draw();
+}
+
+function attachPoster(cover, item) {
+  if (item.poster_path && /^\/[A-Za-z0-9_-]+\.(jpg|png|webp)$/.test(item.poster_path)) {
+    const image = node('img'); image.alt = ''; image.width = 342; image.height = 513; image.decoding = 'async'; cover.append(image);
+    // Image fetches carry the bearer session in headers, never in URLs or cookies.
+    const load = () => fetch('/api/activity/poster' + item.poster_path, { headers: { Authorization: `Bearer ${token}` } }).then(async response => {
+      if (!response.ok) {
+        const data = await response.json();
+        if (data.private_data_blocked || response.status === 401) hidePrivateData(data.verification_required);
+        throw new Error('Image unavailable');
+      }
+      const blob = await response.blob();
+      if (!image.isConnected) return;
+      const url = URL.createObjectURL(blob);
+      posterUrls.set(url, image);
+      image.addEventListener('load', () => releasePoster(url), { once: true });
+      image.addEventListener('error', () => { releasePoster(url); image.remove(); }, { once: true });
+      image.src = url;
+    }).catch(() => image.remove());
+    if (typeof IntersectionObserver === 'function') {
+      const observer = new IntersectionObserver(entries => {
+        if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); posterObservers.delete(observer); void load(); }
+        else if (!image.isConnected) { observer.disconnect(); posterObservers.delete(observer); }
+      }, { rootMargin: '240px' }); posterObservers.set(observer, image); observer.observe(image);
+    } else void load();
+  }
 }
 
 function itemCard(item) {
   const card = node('article', 'media-card');
-  const cover = node('div', `cover ${item.kind}`, icons[item.kind] || '◈');
-  if (item.poster_path && /^\/[A-Za-z0-9_-]+\.(jpg|png|webp)$/.test(item.poster_path)) {
-    const image = node('img'); image.loading = 'lazy'; image.alt = ''; image.src = '/api/activity/poster' + item.poster_path;
-    image.addEventListener('error', () => image.remove()); cover.append(image);
-  }
+  const cover = button(icons[item.kind] || '◈', () => showDetails(item), `cover ${item.kind}`);
+  cover.setAttribute('aria-label', `Details for ${item.title}`);
+  attachPoster(cover, item);
   cover.append(node('span', 'cover-category', item.kind));
   const body = node('div', 'card-body');
-  body.append(node('h3', '', item.title), node('p', 'item-status', item.subtitle || (item.available ? 'Available' : 'Not yet available')));
+  body.append(button(item.title, () => showDetails(item), 'card-title'), node('p', 'item-status', item.subtitle || (item.available ? 'Available' : 'Not yet available')));
   if (page === 'requests') body.append(node('p', 'fine', `#${item.id}${item.is4k ? ' · 4K' : ''}`));
   if (item.size) body.append(node('p', 'fine', formatBytes(item.size)));
   if (page === 'deletions') {
     if (item.execute_after) body.append(node('p', 'fine', `Scheduled ${new Date(item.execute_after * 1000).toLocaleString()}`));
     if (item.error) body.append(node('p', 'fine', item.error));
-    if (item.status === 'pending') body.append(button('Undo', async () => { const result = await api('undo', { id: item.id }); await loadPage(); toast(result); }, 'button primary full'));
+    body.append(itemActions(item));
   } else {
-    const actions = node('div', 'card-actions');
-    if (page === 'search' && item.requestable !== false) actions.append(button('＋ Request', () => confirm('Request this item?', `${item.title}. TV: all seasons. Music/books: configured profiles.`, async () => { const result = await api('request', { item: reference(item), confirmed: true }); await loadPage(); toast(result); }), 'button primary'));
-    actions.append(button(page === 'watches' ? '☆ Unfollow' : '☆ Follow', async () => { const result = await api('watch', { item: reference(item), remove: page === 'watches' }); toast(result); if (page === 'watches') await loadPage(); }, 'button subtle'));
-    if (item.jellyfin_id) actions.append(button('▶ Jellyfin', async () => { const url = await api('open', { item: reference(item) }); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
-    body.append(actions);
-    if (page === 'requests' && item.available && item.deletable) body.append(button('Delete files…', () => confirm('Delete files in 24 hours?', `${item.title}${item.is4k ? ' (4K)' : ''}. Removes the entire movie/series, including shared files. Request history stays. Undo in Deletions until execution begins.`, async () => { const result = await api('delete', { id: item.id, confirmed: true }); await loadPage(); toast(result); }), 'button danger full'));
+    body.append(itemActions(item));
   }
   card.append(cover, body); return card;
 }
 
+function itemActions(item, destination = page, close = () => {}) {
+  const actions = node('div', 'card-actions');
+  if (destination === 'deletions') {
+    if (item.status === 'pending') actions.append(button('Undo', async () => { const result = await api('undo', { id: item.id }); close(); await loadPage(); toast(result); }, 'button primary'));
+    return actions;
+  }
+  if (destination === 'search' && item.requestable !== false) actions.append(button('＋ Request', () => {
+    close(); confirm('Request this item?', `${item.title}. TV: all seasons. Music/books: configured profiles.`, async () => { const result = await api('request', { item: reference(item), confirmed: true }); await loadPage(); toast(result); });
+  }, 'button primary'));
+  actions.append(button(destination === 'watches' ? '☆ Unfollow' : '☆ Follow', async () => {
+    const result = await api('watch', { item: reference(item), remove: destination === 'watches' });
+    if (destination === 'watches') { close(); await loadPage(); } toast(result);
+  }, 'button subtle'));
+  if (['movie', 'tv'].includes(item.kind) && item.available) actions.append(button('▶ Jellyfin', async () => { const url = await api('open', { item: reference(item) }); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
+  if (destination === 'requests' && item.available && item.deletable) actions.append(button('Delete files…', () => {
+    close(); confirm('Delete files in 24 hours?', `${item.title}${item.is4k ? ' (4K)' : ''}. Removes the entire movie/series, including shared files. Request history stays. Undo in Deletions until execution begins.`, async () => { const result = await api('delete', { id: item.id, confirmed: true }); await loadPage(); toast(result); });
+  }, 'button danger'));
+  return actions;
+}
+
+async function showDetails(item) {
+  clearInterval(refreshTimer);
+  const generation = privacyGeneration;
+  const destination = page;
+  const trigger = document.activeElement;
+  const dialog = node('dialog', 'media-detail');
+  const close = () => { dialog.close(); dialog.remove(); cleanupPosters(); startRefresh(); if (trigger?.isConnected) trigger.focus(); };
+  dialog.append(button('← Back to browsing', close, 'button subtle'), node('div', 'loading', 'Loading title details…'));
+  dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
+  root.append(dialog); dialog.showModal();
+  try {
+    const fresh = destination === 'deletions' ? (await api('deletions')).find(row => row.id === item.id) : await api('details', { item: reference(item) });
+    if (generation !== privacyGeneration || !dialog.isConnected) return;
+    if (!fresh) throw new Error('This item is no longer available. Refresh the gallery.');
+    const detail = { ...item, ...fresh };
+    const layout = node('div', 'detail-layout');
+    const cover = node('div', `cover detail-cover ${detail.kind}`, icons[detail.kind]); attachPoster(cover, detail);
+    const information = node('div', 'detail-information');
+    information.append(node('p', 'fine', detail.kind.toUpperCase()), node('h2', '', detail.title), node('p', 'detail-overview', detail.overview || 'No synopsis available.'),
+      node('p', 'pill', detail.available ? 'Available to watch' : 'Not yet available'));
+    information.append(itemActions(detail, destination, close));
+    layout.append(cover, information);
+    dialog.replaceChildren(button('← Back to browsing', close, 'button subtle'), layout);
+  } catch (error) {
+    if (dialog.isConnected) { close(); showError(error); }
+    else showError(error);
+  }
+}
+
 function renderSearch(items) {
-  heading('Discover');
+  heading('Discover', searchQuery ? `Results for “${searchQuery}”` : 'Popular now · Powered by your Seerr account');
   const form = node('form', 'search-form');
-  const kind = select([['movie', '🎬 Movies'], ['tv', '📺 Series'], ['music', '🎵 Albums'], ['book', '📚 Books']], searchKind, async (value) => { searchKind = value; searchPage = 1; });
+  const kind = select([['movie', '🎬 Movies'], ['tv', '📺 Series'], ['music', '🎵 Albums'], ['book', '📚 Books']], searchKind, async (value) => { searchKind = value; searchPage = 1; await loadPage(); });
   const query = node('input'); query.type = 'search'; query.maxLength = 100; query.required = true; query.placeholder = 'Title, artist, or author…'; query.value = searchQuery; query.setAttribute('aria-label', 'Search media');
   const submit = node('button', 'button primary', 'Search'); submit.type = 'submit';
   form.append(kind, query, submit);
   form.addEventListener('submit', async (event) => { event.preventDefault(); searchQuery = query.value.trim(); searchKind = kind.value; searchPage = 1; await loadPage(); }); content.append(form);
+  const shortcuts = node('div', 'toolbar');
+  if (searchQuery) shortcuts.append(button('← Popular titles', async () => { searchQuery = ''; searchPage = 1; await loadPage(); }, 'button subtle'));
+  shortcuts.append(button('Open Seerr ↗', async () => { const url = await api('seerr_link'); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
+  content.append(shortcuts);
   const grid = node('div', 'grid'); for (const item of items) grid.append(itemCard(item)); content.append(grid);
-  if (searchQuery && !items.length) content.append(node('div', 'empty', 'No results'));
-  if (searchQuery && ['movie', 'tv'].includes(searchKind)) {
+  if (!items.length) content.append(node('div', 'empty', ['music', 'book'].includes(searchKind) && !searchQuery ? 'Search by title, artist or author to get started.' : 'No results. Try another title or category.'));
+  if (['movie', 'tv'].includes(searchKind)) {
     const controls = node('div', 'toolbar');
     const prev = button('← Previous results', async () => { searchPage = Math.max(1, searchPage - 1); await loadPage(); }); prev.disabled = searchPage === 1;
-    controls.append(prev, node('span', 'fine', `Search page ${searchPage}`), button('Next results →', async () => { searchPage = Math.min(500, searchPage + 1); await loadPage(); })); content.append(controls);
+    const next = button('Next results →', async () => { searchPage = Math.min(500, searchPage + 1); await loadPage(); }); next.disabled = !items.length || searchPage === 500;
+    controls.append(prev, node('span', 'fine', `Result page ${searchPage}`), next); content.append(controls);
   }
 }
 
@@ -243,7 +397,9 @@ function renderSettings(data) {
   if (data.devices.length) devices.append(select(data.devices.map(name => [name, name]), profile.account.device || data.devices[0], async (device) => { toast(await api('preferences', { device })); }));
   else devices.append(node('p', 'fine', 'Configure JELLYFIN_DEVICE_URLS in the bot environment.'));
   const watchlist = node('article', 'setting');
-  watchlist.append(node('h2', '', 'Seerr watchlist'), button('Import', async () => toast(await api('import_watchlist')), 'button subtle'));
+  watchlist.append(node('h2', '', 'Two-way watchlist sync'),
+    node('p', '', 'Movies and series sync with Seerr automatically, including removals. Music/books stay here. Following does not request media.'),
+    button('Sync now', async () => toast(await api('sync_watchlist')), 'button subtle'));
   settings.append(notifications, devices, watchlist); content.append(settings);
 }
 
@@ -257,7 +413,7 @@ function renderLink() {
     linkTimer = setInterval(async () => {
       try {
         const status = await api('link_status', { generation: linkGeneration });
-        if (status.state === 'linked') { clearInterval(linkTimer); profile = await api('profile'); await loadPage(); toast('Connected. Your verified Discord ID is saved in Seerr.'); }
+        if (status.state === 'linked') { clearInterval(linkTimer); profile = await api('profile'); buildShell(); await loadPage(); startRefresh(); toast('Connected. Your verified Discord ID is saved in Seerr.'); }
         else if (status.state === 'expired') { clearInterval(linkTimer); await loadPage(); showError(new Error('Code expired. Generate a new one.')); }
       } catch (error) { clearInterval(linkTimer); showError(error); }
     }, 5000);
@@ -392,7 +548,7 @@ function startRefresh() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
     const editing = content?.contains(document.activeElement) && document.activeElement.matches('input,textarea,select');
-    if (!document.hidden && !editing && (profile?.account || profile?.is_admin && page === 'admin') && !loading && page !== 'search') void loadPage();
+    if (!document.hidden && !editing && !document.querySelector('dialog[open]') && (profile?.account || profile?.is_admin && page === 'admin') && !loading && page !== 'search') void loadPage();
   }, config.refresh_interval * 1000);
 }
 
@@ -406,6 +562,7 @@ async function boot() {
   await sdk.commands.authenticate({ access_token: authenticated.access_token });
   token = authenticated.session_token; // Memory only. No localStorage, cookies, URLs, or logs.
   profile = await api('profile');
+  Object.assign(config, { refresh_interval: profile.refresh_interval || 60, sync_interval: profile.sync_interval || 60 });
   buildShell(); await loadPage(); startRefresh();
 }
 

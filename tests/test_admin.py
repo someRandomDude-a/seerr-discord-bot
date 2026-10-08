@@ -86,6 +86,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         await self.admin.deliver()
         self.assertEqual(self.channel.send.await_args.args, ('@everyone Hello',))
         self.assertEqual(self.channel.send.await_args.kwargs['allowed_mentions'].to_dict()['parse'], [])
+        self.assertTrue(self.channel.send.await_args.kwargs['suppress_embeds'])
         self.assertEqual(self.admin.state(42)['jobs'][0]['sent'], 1)
 
     async def test_expired_and_malformed_previews_rejected(self):
@@ -202,6 +203,7 @@ class AnnouncementCommandTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             bot = SeerrBot(Config('http://seerr', 'secret', 'token', str(Path(temp) / 'cache.db'), admin_ids=frozenset([42])))
             try:
+                bot.admin.require_admin = MagicMock()  # Test destination defaults independently of identity.
                 bot.admin.prepare = AsyncMock(return_value={'plan': 'token', 'channels': 1, 'users': 0, 'destinations': ['Cinema'], 'skipped': []})
                 interaction = MagicMock()
                 interaction.user.id, interaction.guild_id, interaction.channel_id = 42, 555, 111

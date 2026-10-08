@@ -1,4 +1,5 @@
 import requests
+import re
 from .security import UserError
 
 
@@ -68,8 +69,15 @@ def arr_item(name, item):
         subtitle += f" · {stats.get('trackFileCount', 0)}/{stats['totalTrackCount']} tracks"
     if name == 'sonarr' and stats.get('episodeCount'):
         subtitle += f" · {stats.get('episodeFileCount', 0)}/{stats['episodeCount']} episodes"
+    poster = None
+    for image in item.get('images') or []:
+        if image.get('coverType') in ('poster', 'cover'):
+            match = re.fullmatch(r'https://image\.tmdb\.org/t/p/(?:original|w[0-9]+)(/[A-Za-z0-9_-]{1,100}\.(?:jpg|png|webp))', image.get('remoteUrl') or '')
+            if match:
+                poster = match.group(1)
+                break
     return {'kind': kind, 'external_id': external_id(name, item), 'title': item.get('title') or 'Untitled',
             'overview': item.get('overview') or '', 'available': available, 'size': size,
             'requestable': not bool(item.get('id')),
             'subtitle': subtitle.strip(' ·'), 'source': source,
-            'raw': item, 'jellyfin_id': None}
+            'raw': item, 'jellyfin_id': None, 'poster_path': poster}

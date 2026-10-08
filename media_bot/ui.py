@@ -1,4 +1,5 @@
 import math
+import re
 import time
 import discord
 
@@ -17,6 +18,13 @@ def embed(title, description=None):
     result.set_author(name='Media')
     result.set_footer(text='Private')
     return result
+
+
+def poster_url(item, size='w185'):
+    path = item.get('poster_path')
+    if isinstance(path, str) and re.fullmatch(r'/[A-Za-z0-9_-]{1,100}\.(?:jpg|png|webp)', path):
+        return f'https://image.tmdb.org/t/p/{size}{path}'
+    return None
 
 
 def bytes_label(value):
@@ -125,7 +133,7 @@ class SearchModal(discord.ui.Modal, title='Discover something great'):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(self.bot, self.owner, 'search', (self.kind, self.query.value, 1), title='Discover')
         await view.load()
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
 
     async def on_error(self, interaction, error):
         await error_message(interaction, str(error) if isinstance(error, UserError) else 'Search failed. Please try again.')
@@ -135,7 +143,7 @@ class DashboardView(OwnedView):
     def __init__(self, bot, owner):
         super().__init__(bot, owner)
         self.button('📋 My requests', self.requests, row=0)
-        self.button('🌐 All requests', self.all_requests, row=0)
+        self.button('✨ Discover', self.discover, discord.ButtonStyle.primary, row=0)
         self.button('💽 Storage', self.storage, row=0)
         self.button('🔔 Notifications', self.notifications, row=1)
         self.button('⭐ Watchlist', self.watchlist, row=1)
@@ -160,7 +168,10 @@ class DashboardView(OwnedView):
         await interaction.response.defer(ephemeral=True)
         view = ItemsView(self.bot, self.owner, operation, args, title)
         await view.load()
-        await interaction.edit_original_response(embed=view.render(), view=view)
+        await interaction.edit_original_response(embeds=view.gallery(), view=view)
+
+    async def discover(self, interaction):
+        await self.show_items(interaction, 'discover', ('movie', 1), 'Discover · Popular movies')
 
     async def requests(self, interaction):
         await self.show_items(interaction, 'requests', (False,), 'My requests')
@@ -195,8 +206,9 @@ class DashboardView(OwnedView):
 
     async def notifications(self, interaction):
         await interaction.response.defer(ephemeral=True)
-        self.bot.service.account(self.owner)  # Local preferences remain usable during outages.
-        view = PreferencesView(self.bot, self.owner)
+        await self.bot.service.verified_account(self.owner)
+        devices = await self.bot.service.offload(self.bot.service.devices)
+        view = PreferencesView(self.bot, self.owner, devices)
         await interaction.edit_original_response(embed=view.render(), view=view)
 
     async def refresh(self, interaction):
@@ -222,6 +234,7 @@ class ItemsView(OwnedView):
         self.operation, self.args, self.title = operation, args, title
         self.query = query
         self.items, self.page = [], 0
+        self.catalog = []
 
     async def load(self):
         if self.operation == 'deletions':
@@ -230,9 +243,13 @@ class ItemsView(OwnedView):
             self.items = await self.bot.service.watches(self.owner)
         else:
             self.items = await self.bot.service.run(self.owner, self.operation, *self.args)
+        self.catalog = self.items
+        self.filter_items()
+
+    def filter_items(self):
         if not isinstance(self.query, str) or len(self.query) > 100:
             raise UserError('Filter must be at most 100 characters.')
-        self.items = [i for i in self.items if self.query.lower() in i['title'].lower()]
+        self.items = [i for i in self.catalog if self.query.lower() in i['title'].lower()]
         self.page = min(self.page, max(0, math.ceil(len(self.items) / 5) - 1))
         self.rebuild()
 
@@ -255,40 +272,120 @@ class ItemsView(OwnedView):
             result.set_footer(text=f'Search result page {self.args[2]} · /search page: lets you browse more results')
         return result
 
+    def gallery(self):
+        """One compact poster card per item, after load/access checks—not a wall of fields."""
+        pages = max(1, math.ceil(len(self.items) / 5))
+        header = embed(self.title, f'**{len(self.items)} titles** · Page {self.page + 1}/{pages}\nSelect a title for details and actions.')
+        header.set_footer(text='Open gallery snapshot · Refresh for latest state · Actions recheck live access')
+        if not self.items:
+            header.description = 'No matching titles. Change the filter or search for something new.'
+        if self.operation in ('search', 'discover'):
+            header.description += f'\nResult batch {self.args[-1]}'
+        cards = [header]
+        for index, item in enumerate(self.visible(), 1):
+            description = clean(item.get('subtitle') or ('Available' if item.get('available') else 'Not yet available'), 180)
+            if item.get('is4k'):
+                description += ' · 4K'
+            if item.get('size'):
+                description += f" · {bytes_label(item['size'])}"
+            card = embed(f"{index}. {ICONS.get(item['kind'], '✨')} {clean(item['title'], 120)}", description)
+            poster = poster_url(item)
+            if poster:
+                card.set_thumbnail(url=poster)
+            if item.get('overview'):
+                card.add_field(name='About', value=clean(item['overview'], 220), inline=False)
+            if self.operation == 'deletions' and item.get('execute_after'):
+                card.add_field(name='Scheduled', value=f"<t:{int(item['execute_after'])}:R>")
+            cards.append(card)
+        return cards
+
+    def remote_page(self):
+        return self.operation in ('search', 'discover') and self.args[0] in ('movie', 'tv')
+
+    async def validate(self):
+        await self.bot.service.offload(self.bot.service.validate_browse, self.owner,
+            self.operation == 'requests' and bool(self.args[0]), self.operation in ('requests', 'library'))
+
     def rebuild(self):
         self.clear_items()
         if self.visible():
             select = discord.ui.Select(placeholder='Choose an item…', options=[
-                discord.SelectOption(label=it['title'][:100], value=str(index), description=(it.get('subtitle') or it['kind'])[:100])
+                 discord.SelectOption(label=f'{index + 1}. {it["title"]}'[:100], value=str(index), description=(it.get('subtitle') or it['kind'])[:100])
                 for index, it in enumerate(self.visible())], row=0)
             async def details(interaction):
                 selected = self.visible()[int(select.values[0])]
                 await interaction.response.defer(ephemeral=True)
-                await self.load()  # Re-fetch this collection; never act on the old view's data.
-                fresh = next((i for i in self.items if identity(i) == identity(selected)), None)
-                if not fresh:
-                    raise UserError('The item changed or disappeared. Refresh the list.')
+                await self.validate()
+                fresh = selected if self.operation == 'deletions' else await self.bot.service.run(self.owner, 'details', selected)
                 view = DetailView(self.bot, self.owner, fresh, self)
                 await interaction.edit_original_response(embed=view.render(), view=view)
             select.callback = details
             self.add_item(select)
-        self.button('← Previous', self.previous, row=1, disabled=self.page == 0)
-        self.button('Next →', self.next, row=1, disabled=(self.page + 1) * 5 >= len(self.items))
+        self.button('← Previous', self.previous, row=1, disabled=self.page == 0 and not (self.remote_page() and self.args[-1] > 1))
+        self.button('Next →', self.next, row=1, disabled=(self.page + 1) * 5 >= len(self.items) and not (self.remote_page() and self.args[-1] < 500 and self.items))
         self.button('↻ Refresh', self.refresh, row=1)
         self.button('⌂ Home', self.home, row=1)
+        self.button('Filter titles', self.filter, row=2)
+        self.button('Search new titles', self.search, row=2)
+        if self.operation == 'requests':
+            self.button('My requests' if self.args[0] else 'All requests', self.toggle_requests, row=2)
+        if self.operation in ('library', 'discover'):
+            kinds = [('movie', 'Movies'), ('tv', 'Series')]
+            if self.operation == 'library':
+                kinds = [('all', 'Everything')] + kinds + [('music', 'Music'), ('book', 'Books')]
+            category = discord.ui.Select(placeholder='Change category…', options=[
+                discord.SelectOption(label=label, value=kind, default=self.args[0] == kind) for kind, label in kinds], row=3)
+            async def change(interaction):
+                self.args = (category.values[0], 1) if self.operation == 'discover' else (category.values[0],)
+                self.page = 0
+                await self.refresh(interaction)
+            category.callback = change
+            self.add_item(category)
 
     async def previous(self, interaction):
+        if self.page == 0 and self.remote_page() and self.args[-1] > 1:
+            self.args = (*self.args[:-1], self.args[-1] - 1)
+            await interaction.response.defer(ephemeral=True)
+            await self.load()
+            self.page = max(0, math.ceil(len(self.items) / 5) - 1)
+            self.rebuild()
+            await interaction.edit_original_response(embeds=self.gallery(), view=self)
+            return
         self.page = max(0, self.page - 1)
-        await self.refresh(interaction)
+        await self.show_page(interaction)
 
     async def next(self, interaction):
+        if (self.page + 1) * 5 >= len(self.items) and self.remote_page() and self.args[-1] < 500:
+            self.args = (*self.args[:-1], self.args[-1] + 1)
+            self.page = 0
+            await self.refresh(interaction)
+            return
         self.page += 1
+        await self.show_page(interaction)
+
+    async def show_page(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.validate()
+        self.page = min(max(0, self.page), max(0, math.ceil(len(self.items) / 5) - 1))
+        self.rebuild()
+        await interaction.edit_original_response(embeds=self.gallery(), view=self)
+
+    async def filter(self, interaction):
+        await interaction.response.send_modal(CollectionFilterModal(self))
+
+    async def search(self, interaction):
+        kind = self.args[0] if self.operation in ('search', 'discover', 'library') and self.args[0] != 'all' else 'movie'
+        await interaction.response.send_modal(SearchModal(self.bot, self.owner, kind))
+
+    async def toggle_requests(self, interaction):
+        self.args, self.page = (not self.args[0],), 0
+        self.title = 'All requests' if self.args[0] else 'My requests'
         await self.refresh(interaction)
 
     async def refresh(self, interaction):
         await interaction.response.defer(ephemeral=True)
         await self.load()
-        await interaction.edit_original_response(embed=self.render(), view=self)
+        await interaction.edit_original_response(embeds=self.gallery(), view=self)
 
     async def home(self, interaction):
         await DashboardView(self.bot, self.owner).refresh(interaction)
@@ -298,29 +395,52 @@ def identity(item):
     return item.get('id'), item['kind'], item['external_id'], item.get('source')
 
 
+class CollectionFilterModal(discord.ui.Modal, title='Filter this gallery'):
+    def __init__(self, parent):
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.query = discord.ui.TextInput(label='Title contains', default=parent.query, required=False, max_length=100)
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.parent.owner:
+            raise UserError('This gallery belongs to another user.')
+        self.parent.bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        await self.parent.validate()
+        self.parent.query, self.parent.page = self.query.value, 0
+        self.parent.filter_items()
+        await interaction.edit_original_response(embeds=self.parent.gallery(), view=self.parent)
+
+    async def on_error(self, interaction, error):
+        await error_message(interaction, str(error) if isinstance(error, UserError) else 'Filter unavailable. Refresh the gallery.')
+
+
 class DetailView(OwnedView):
     def __init__(self, bot, owner, item, parent):
         super().__init__(bot, owner)
         self.item, self.parent = item, parent
-        if parent.operation == 'search':
+        if parent.operation in ('search', 'discover'):
             self.button('＋ Request', self.request, discord.ButtonStyle.primary, row=0, disabled=not item.get('requestable', not item.get('available', False)))
         if parent.operation != 'deletions':
             self.button('☆ Unfollow' if parent.operation == 'watches' else '⭐ Follow', self.follow, row=0)
-            if item.get('jellyfin_id'):
+            if item['kind'] in ('movie', 'tv') and item.get('available'):
                 self.button('▶ Open in Jellyfin', self.open, row=0)
         if parent.operation == 'requests' and item.get('available') and item.get('deletable'):
             self.button('Request file deletion', self.delete, discord.ButtonStyle.danger, row=1)
         if parent.operation == 'deletions' and item['status'] == 'pending':
             self.button('Undo file deletion', self.undo, discord.ButtonStyle.primary, row=0)
         self.button('← Back', self.back, row=1)
+        self.button('⌂ Home', self.home, row=1)
 
     def render(self):
         item = self.item
         result = embed(f"{ICONS.get(item['kind'], '✨')} {clean(item['title'], 180)}", clean(item.get('overview'), 400) if item.get('overview') else None)
         result.add_field(name='Status', value=clean(item.get('subtitle') or ('Available' if item.get('available') else 'Not yet available'), 400))
         result.add_field(name='Category', value=item['kind'].title())
-        if item.get('poster_path') and str(item['poster_path']).startswith('/'):
-            result.set_thumbnail(url='https://image.tmdb.org/t/p/w342' + item['poster_path'])
+        poster = poster_url(item, 'w342')
+        if poster:
+            result.set_image(url=poster)
         if self.parent.operation == 'requests':
             result.add_field(name='Request', value=f"#{item['id']} · {'4K' if item.get('is4k') else 'Standard'}", inline=False)
         if self.parent.operation == 'deletions':
@@ -330,8 +450,10 @@ class DetailView(OwnedView):
         return result
 
     async def request(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.bot.service.verified_account(self.owner)
         view = ConfirmView(self.bot, self.owner, 'request', (self.item,), f"Request {clean(self.item['title'], 100)}?", 'TV requests include all seasons. Music/book requests are sent directly to the configured service using its default profiles.')
-        await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     async def follow(self, interaction):
         await interaction.response.defer(ephemeral=True)
@@ -349,8 +471,10 @@ class DetailView(OwnedView):
         await interaction.followup.send('Open this item on your selected Jellyfin server/device. You may need to sign in there.', view=view, ephemeral=True)
 
     async def delete(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.bot.service.verified_account(self.owner)
         view = ConfirmView(self.bot, self.owner, 'delete', (self.item['id'],), 'Schedule file deletion in 24 hours?', 'No files are deleted now. You can undo with /deletions during the 24-hour delay. After that, the entire movie/series is removed from Radarr/Sonarr, including files shared by other users. Seerr requests will not be deleted.')
-        await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
+        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     async def undo(self, interaction):
         await interaction.response.defer(ephemeral=True)
@@ -358,7 +482,10 @@ class DetailView(OwnedView):
         await interaction.edit_original_response(embed=embed('Deletion undone', message), view=None)
 
     async def back(self, interaction):
-        await self.parent.refresh(interaction)
+        await self.parent.show_page(interaction)
+
+    async def home(self, interaction):
+        await self.parent.home(interaction)
 
 
 class ConfirmView(OwnedView):
@@ -390,15 +517,16 @@ class ConfirmView(OwnedView):
 
 
 class PreferencesView(OwnedView):
-    def __init__(self, bot, owner):
+    def __init__(self, bot, owner, devices=None):
         super().__init__(bot, owner)
+        self.devices = devices or {'Browser': None, **bot.config.devices}
         self.button('🔔 Opt in to DMs', self.enable, discord.ButtonStyle.primary)
         self.button('Mute all updates', self.disable)
-        self.button('Import Seerr watchlist', self.import_watchlist)
+        self.button('Sync watchlists now', self.import_watchlist)
         self.button('⌂ Home', self.home)
-        if bot.config.devices:
+        if self.devices:
             select = discord.ui.Select(placeholder='Choose your Jellyfin device/server link…', options=[
-                discord.SelectOption(label=name, value=name) for name in bot.config.devices], row=1)
+                discord.SelectOption(label=name, value=name) for name in self.devices], row=1)
             async def device(interaction):
                 await interaction.response.defer(ephemeral=True)
                 message = await bot.service.run(owner, 'preferences', None, select.values[0])
@@ -410,7 +538,8 @@ class PreferencesView(OwnedView):
         account = self.bot.service.account(self.owner)
         result = embed('Preferences', 'DMs for requests and watched items. Off by default.')
         result.add_field(name='Personal DMs', value='🟢 Enabled' if account['opted_in'] else '⚪ Muted')
-        result.add_field(name='Jellyfin link', value=clean(account.get('device') or next(iter(self.bot.config.devices), 'Not configured')))
+        result.add_field(name='Jellyfin link', value=clean(account.get('device') or next(iter(self.devices))))
+        result.add_field(name='Watchlists', value='Movies/series sync with Seerr automatically, including removals. Music/books stay hub-only. Watching does not request media.', inline=False)
         return result
 
     async def set_opt_in(self, interaction, enabled):
@@ -419,6 +548,8 @@ class PreferencesView(OwnedView):
             await self.bot.service.run(self.owner, 'preferences', True)
         else:
             self.bot.service.mute_notifications(self.owner)
+            await interaction.edit_original_response(embed=embed('Updates muted', 'All personal updates muted.'), view=None)
+            return  # Generic local safety receipt; never re-render cached account/device details.
         await interaction.edit_original_response(embed=self.render(), view=self)
 
     async def enable(self, interaction):
@@ -429,7 +560,7 @@ class PreferencesView(OwnedView):
 
     async def import_watchlist(self, interaction):
         await interaction.response.defer(ephemeral=True)
-        message = await self.bot.service.run(self.owner, 'import_watchlist')
+        message = await self.bot.service.run(self.owner, 'sync_watchlist')
         await interaction.followup.send(message, ephemeral=True)
 
     async def home(self, interaction):

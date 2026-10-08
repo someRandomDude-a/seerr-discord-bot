@@ -175,9 +175,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.api.list_requests.return_value = {'results': [request()]}
         self.service.api.get_movie_details.return_value = {'id': 10, 'title': 'A film'}
         self.service.api._request.return_value = {'results': []}
-        self.service.store.link(42, 7, 'Viewer')
+        from media_bot.jellyfin import JellyfinConfig
+        self.credential = {'token': 'user-token', 'user_id': 'a' * 32, 'server_id': 'b' * 32,
+            'device_id': 'discord-device', 'url': 'http://jellyfin:8096'}
+        self.service.store.link(42, 7, 'Viewer', self.credential)
+        self.settings_patch = patch('media_bot.service.MediaService.jellyfin_settings',
+            return_value=JellyfinConfig('http://jellyfin:8096', 'https://jellyfin.example', 'b' * 32))
+        self.settings_patch.start()
+        self.jellyfin_patch = patch('media_bot.service.JellyfinClient')
+        self.jellyfin = self.jellyfin_patch.start().return_value
+        self.jellyfin.me.return_value = {'Id': 'a' * 32, 'ServerId': 'b' * 32, 'Policy': {}}
         self.account = self.service.account(42)
-        self.user = {'id': 7, 'permissions': 32}
+        self.user = {'id': 7, 'permissions': 32, 'jellyfinUserId': 'a' * 32}
         self.user_api = MagicMock()
         self.user_api.get_current_user.return_value = self.user
         self.user_api.get_notification_settings.return_value = {'discordIds': ['42']}
@@ -187,6 +196,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.client_patch.stop()
+        self.jellyfin_patch.stop()
+        self.settings_patch.stop()
         self.tmp.cleanup()
 
     def action(self, action_id):
@@ -207,6 +218,80 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.run(42, 'requests', False)
         self.user_api.get_current_user.assert_not_called()
         self.user_api.create_request.assert_not_called()
+
+    async def test_live_search_bypasses_unrelated_refresh_and_snapshot_writer_lock(self):
+        self.service.api.list_requests.side_effect = RuntimeError('unrelated library is offline')
+        self.user_api.search.return_value = {'results': [{'mediaType': 'movie', 'id': 10, 'title': 'Fresh title', 'posterPath': '/a.jpg'}]}
+        with patch.object(self.service, '_refresh') as refresh:
+            async with self.service.lock:
+                result = await asyncio.wait_for(self.service.run(42, 'search', 'movie', 'Fresh', 1), timeout=2)
+        self.assertEqual(result[0]['title'], 'Fresh title')
+        refresh.assert_not_called()
+        self.user_api.search.assert_called_once_with('Fresh', page=1)
+
+    async def test_live_search_failure_never_uses_cached_results(self):
+        self.user_api.search.side_effect = RuntimeError('private URL and credential')
+        with self.assertRaises(UserError) as caught:
+            await self.service.run(42, 'search', 'movie', 'Title', 1)
+        self.assertNotIn('credential', str(caught.exception))
+
+    async def test_discover_uses_authenticated_seerr_user_and_returns_one_browse_bundle(self):
+        self.user_api._request.return_value = {'results': [{'mediaType': 'tv', 'id': 10, 'name': 'Popular series', 'posterPath': '/a.jpg'}]}
+        with patch('media_bot.service.SeerrAPI', return_value=self.user_api) as factory, patch.object(self.service, '_refresh') as refresh:
+            result = await self.service.browse(42, 'discover', 'tv', 2)
+        factory.assert_called_once_with('http://seerr', 'secret', 15, 7)
+        self.user_api._request.assert_called_once_with('GET', '/discover/tv', params={'page': 2, 'sortBy': 'popularity.desc'})
+        self.assertEqual(result['result'][0]['title'], 'Popular series')
+        self.assertEqual(result['viewer']['account']['discord_id'], '42')
+        self.assertFalse(result['viewer']['is_admin'])
+        self.assertNotIn('user-token', str(result))
+        refresh.assert_not_called()
+
+    async def test_gallery_access_rechecks_all_request_permission_and_refresh_errors(self):
+        with self.assertRaises(UserError):
+            self.service.validate_browse(42, True)
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=16)
+        self.service.validate_browse(42, True)
+        with self.service.store.connect() as db:
+            db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error','Live source failed')")
+        with self.assertRaises(UserError):
+            self.service.validate_browse(42, True)
+        self.service.validate_browse(42, False, False)  # Live search has independent dependencies.
+
+    async def test_open_gallery_refills_watchlist_posters_without_claiming_cached_availability(self):
+        from test_watchlists import WatchlistAPI
+        self.user_api._request.side_effect = WatchlistAPI()._request
+        with self.service.store.connect() as db:
+            db.execute('INSERT INTO media_details(media_id,type,tmdb_id,title,poster_path) VALUES (?,?,?,?,?)', (3, 'movie', 10, 'Film', '/a.jpg'))
+        self.service.store.watch(42, 'movie', 10, 'Film')
+        item = (await self.service.watches(42))[0]
+        self.assertEqual(item['poster_path'], '/a.jpg')
+        self.assertFalse(item['available'])
+
+    async def test_sonarr_details_refresh_selected_source_without_using_stale_gallery_metadata(self):
+        self.config.seerr_discovery = True
+        item = {'kind': 'tv', 'external_id': '100', 'title': 'Old title', 'source': 'sonarr:2', 'overview': 'Old synopsis'}
+        configs = {'sonarr:2': ArrConfig('sonarr', 'http://sonarr', 'secret')}
+        with patch('media_bot.service.discover_arr', return_value=configs), patch('media_bot.service.ArrClient') as factory, patch.object(self.service, '_refresh') as refresh:
+            factory.return_value.request.return_value = [{'tvdbId': 100, 'title': 'Live series', 'overview': 'Live synopsis', 'statistics': {'episodeFileCount': 1}}]
+            result = await self.service.run(42, 'details', item)
+        self.assertEqual(result['title'], 'Live series')
+        self.assertEqual(result['overview'], 'Live synopsis')
+        self.assertTrue(result['available'])
+        factory.return_value.request.assert_called_once_with('GET', 'series')
+        refresh.assert_not_called()
+
+    async def test_direct_media_details_lookup_is_live_and_failure_has_no_snapshot_fallback(self):
+        arr = MagicMock()
+        self.service.arr['lidarr'] = arr
+        arr.search.return_value = [{'foreignAlbumId': 'album-id', 'title': 'Live album', 'overview': 'Live synopsis'}]
+        item = {'kind': 'music', 'external_id': 'album-id', 'title': 'Album', 'source': 'lidarr', 'overview': 'Old synopsis'}
+        result = await self.service.run(42, 'details', item)
+        self.assertEqual(result['overview'], 'Live synopsis')
+        arr.search.assert_called_once_with('Album')
+        arr.search.return_value = []
+        with self.assertRaises(UserError):
+            await self.service.run(42, 'details', item)
 
     async def test_disabled_integrations_do_not_leave_stale_library_or_storage(self):
         with self.service.store.connect() as db:
@@ -231,17 +316,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_seerr_admin_inference_requires_verified_link_and_live_admin_role(self):
         self.assertFalse(self.service.is_admin(999))
         self.assertFalse(self.service.is_admin(42))
-        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 2}
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=2)
         self.assertTrue(self.service.is_admin(42))
-        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 32}
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=32)
         self.assertFalse(self.service.is_admin(42))
-        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 2}
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=2)
         self.user_api.get_notification_settings.return_value = {'discordIds': []}
         self.assertFalse(self.service.is_admin(42))
 
-    async def test_bot_only_exception_does_not_need_seerr_or_promote_permissions(self):
+    async def test_bot_only_exception_requires_jellyfin_identity_without_promoting_permissions(self):
         self.config.admin_ids = frozenset([999])
-        self.assertTrue(self.service.is_admin(999))
+        self.assertFalse(self.service.is_admin(999))
+        self.config.admin_ids = frozenset([42])
+        self.assertTrue(self.service.is_admin(42))
         self.user_api.get_current_user.assert_not_called()
         self.user_api.update_user.assert_not_called()
 
@@ -259,7 +346,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_requests_require_seerr_permission(self):
         with self.assertRaises(UserError):
             await self.service.run(42, 'requests', True)
-        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 16}
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=16)
         self.assertEqual(len(await self.service.run(42, 'requests', True)), 1)
 
     async def test_deletion_is_delayed_24_hours(self):
@@ -307,11 +394,65 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service.account(42)['opted_in'])
 
     async def test_unfollow_works_even_if_watched_metadata_fails(self):
+        from test_watchlists import WatchlistAPI
+        self.user_api._request.side_effect = WatchlistAPI()._request
         self.service.store.watch(42, 'movie', 10, 'A film')
         self.service.api.list_requests.side_effect = RuntimeError('offline')
         items = await self.service.watches(42)
         await self.service.unwatch(42, items[0])
         self.assertEqual(await self.service.watches(42), [])
+
+    async def test_two_way_follow_unfollow_uses_live_user_context_without_global_sync(self):
+        from test_watchlists import WatchlistAPI
+        remote = WatchlistAPI(items={('tv', '20'): 'Remote series'})
+        self.user_api._request.side_effect = remote._request
+        self.user_api.get_movie_details.return_value = {'title': 'Fresh film'}
+        item = {'kind': 'movie', 'external_id': '10', 'title': 'Untrusted title'}
+        with patch.object(self.service, '_refresh') as refresh:
+            # Watchlists must not wait on unrelated library/storage refresh writers.
+            async with self.service.lock:
+                await asyncio.wait_for(self.service.run(42, 'watch', item, False), timeout=2)
+        refresh.assert_not_called()
+        self.assertEqual(remote.items[('movie', '10')], 'Fresh film')
+        self.assertEqual(len(self.service.store.watches(42)), 2)
+        await self.service.unwatch(42, item)
+        self.assertNotIn(('movie', '10'), remote.items)
+        self.assertIn(('tv', '20'), remote.items)
+        self.user_api.create_request.assert_not_called()
+        self.service.api.delete_media_files.assert_not_called()
+
+    async def test_follow_write_failure_returns_pending_receipt_and_background_recovers_without_dm_opt_in(self):
+        from test_watchlists import WatchlistAPI
+        remote = WatchlistAPI()
+        remote.fail_write = True
+        self.user_api._request.side_effect = remote._request
+        self.user_api.get_movie_details.return_value = {'title': 'Film'}
+        message = await self.service.run(42, 'watch', {'kind': 'movie', 'external_id': '10', 'title': 'Film'}, False)
+        self.assertIn('pending', message)
+        self.assertFalse(self.service.account(42)['opted_in'])
+        remote.fail_write = False
+        self.service.api.list_requests.side_effect = RuntimeError('Unrelated library offline')
+        await self.service.sync_watchlists()
+        self.assertIn(('movie', '10'), remote.items)
+        with self.service.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM watchlist_intents').fetchone()[0], 0)
+
+    async def test_watchlist_read_failure_never_returns_local_fallback(self):
+        self.service.store.watch(42, 'movie', 10, 'Film')
+        self.user_api._request.side_effect = RuntimeError('private address and key')
+        with self.assertRaises(UserError) as caught:
+            await self.service.watches(42)
+        self.assertNotIn('key', str(caught.exception))
+        self.assertEqual(len(self.service.store.watches(42)), 1)
+
+    async def test_legacy_import_action_now_runs_two_way_reconciliation(self):
+        from test_watchlists import WatchlistAPI
+        remote = WatchlistAPI(items={('tv', '20'): 'Series'})
+        self.user_api._request.side_effect = remote._request
+        self.service.store.watch(42, 'movie', 10, 'Film')
+        result = await self.service.run(42, 'import_watchlist')
+        self.assertIn('both ways', result)
+        self.assertEqual(len(remote.items), 2)
 
     async def test_due_deletion_only_deletes_files_preserves_requests(self):
         action_id = await self.schedule()
@@ -374,7 +515,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_jellyfin_link_encodes_item_and_no_tokens(self):
         url = self.service.jellyfin_link(self.account, {'jellyfin_id': 'item?token=x'})
-        self.assertEqual(url, 'https://jellyfin.example/web/index.html#!/details?id=item%3Ftoken%3Dx')
+        self.assertEqual(url, 'https://jellyfin.example/web/index.html#!/details?id=item%3Ftoken%3Dx&serverId=' + 'b' * 32)
 
     async def test_notifications_opt_in_and_deduplicate(self):
         await self.service.refresh()  # Establish baseline without a notification flood.
@@ -392,18 +533,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_registration_preserves_other_settings(self):
         self.user_api.get_notification_settings.side_effect = [
             {'discordIds': [], 'pgpKey': 'existing', 'notificationTypes': {'email': 8}}, {'discordIds': ['42']}]
-        self.service.link_authenticated(42, self.user_api)
+        self.service.link_authenticated(42, self.user_api, self.credential)
         self.user_api.update_notification_settings.assert_called_once_with(7, {'discordIds': ['42'], 'pgpKey': 'existing', 'notificationTypes': {'email': 8}})
 
     async def test_registration_does_not_match_display_name_to_username(self):
-        self.user_api.get_current_user.return_value = {'id': 7, 'displayName': 'Different Friendly Name'}
+        self.user_api.get_current_user.return_value = dict(self.user, displayName='Different Friendly Name')
         self.user_api.get_notification_settings.return_value = {'discordIds': ['42']}
-        self.assertEqual(self.service.link_authenticated(42, self.user_api), 'Different Friendly Name')
+        self.assertEqual(self.service.link_authenticated(42, self.user_api, self.credential), 'Different Friendly Name')
 
     async def test_registration_rejects_discord_conflict(self):
         self.user_api.get_notification_settings.return_value = {'discordIds': ['999']}
         with self.assertRaises(UserError):
-            self.service.link_authenticated(42, self.user_api)
+            self.service.link_authenticated(42, self.user_api, self.credential)
         self.user_api.update_notification_settings.assert_not_called()
 
     async def test_enabled_arr_failure_blocks_snapshot(self):
@@ -424,7 +565,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.store.actions('add', pending=False)[0]['status'], 'completed')
 
     async def test_music_requests_require_permission(self):
-        self.user_api.get_current_user.return_value = {'id': 7, 'permissions': 0}
+        self.user_api.get_current_user.return_value = dict(self.user, permissions=0)
         with self.assertRaises(UserError):
             await self.service.run(42, 'request', {'kind': 'music', 'external_id': 'album', 'title': 'An album'})
 

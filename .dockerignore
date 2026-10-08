@@ -10,5 +10,6 @@ data
 *.db-wal
 linked_users.json
 settings.json
+jellyfin.key
 .settings-*
 activity/dist

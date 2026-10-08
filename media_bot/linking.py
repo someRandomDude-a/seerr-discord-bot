@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from seerr import SeerrAPI
 from .security import UserError
+from .jellyfin import JellyfinClient, identity
 
 
 @dataclass
@@ -16,6 +17,8 @@ class LinkSession:
     secret: str = field(repr=False)
     code: str = field(repr=False)
     expires: float
+    jellyfin: object = field(default=None, repr=False)
+    settings: object = field(default=None, repr=False)
     generation: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     lock: object = field(default_factory=asyncio.Lock, repr=False)
     task: object = field(default=None, repr=False)
@@ -39,18 +42,21 @@ class QuickConnect:
                 raise UserError('Too many active sign-ins. Try again shortly.')
             client = SeerrAPI(self.config.seerr_url, timeout=self.config.timeout)
             try:
-                data = await self.service.offload(client._request, 'POST', '/auth/jellyfin/quickconnect/initiate')
-                code, secret = str(data['code']), str(data['secret'])
+                settings = await self.service.offload(self.service.jellyfin_settings)
+                jellyfin = JellyfinClient(settings.url, secrets.token_hex(16), self.config.timeout)
+                data = await self.service.offload(jellyfin.request, 'POST', '/QuickConnect/Initiate')
+                code, secret = str(data['Code']), str(data['Secret'])
                 if not code.isdigit() or not 4 <= len(code) <= 12 or not re.fullmatch(r'[A-Fa-f0-9]{8,128}', secret):
                     raise ValueError('Invalid Quick Connect response')
-                session = LinkSession(discord_id, client, secret, code, time.monotonic() + self.config.link_ttl)
+                session = LinkSession(discord_id, client, secret, code, time.monotonic() + self.config.link_ttl,
+                    jellyfin=jellyfin, settings=settings)
                 self.sessions[discord_id] = session
                 return session
             except BaseException as exc:
                 client.close()
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                raise UserError('Quick Connect could not start. Enable Quick Connect in Jellyfin and use a Seerr version supporting Jellyfin Quick Connect authentication.') from None
+                raise UserError('Verification could not start. Try again later or contact an operator.') from None
 
     def attach(self, session, interaction):
         session.interaction = interaction
@@ -65,14 +71,27 @@ class QuickConnect:
             if time.monotonic() >= session.expires:
                 session.state = 'expired'
                 return session.state
-            data = await self.service.offload(session.client._request, 'GET', '/auth/jellyfin/quickconnect/check', None, {'secret': session.secret})
-            if not data.get('authenticated'):
+            from functools import partial
+            data = await self.service.offload(partial(session.jellyfin.request, 'GET', '/QuickConnect/Connect', params={'secret': session.secret}))
+            if not data.get('Authenticated'):
                 return 'pending'
+            authenticated = await self.service.offload(partial(session.jellyfin.request, 'POST', '/Users/AuthenticateWithQuickConnect', json={'Secret': session.secret}))
+            token = authenticated.get('AccessToken')
+            if not isinstance(token, str) or not token or len(token) > 4096:
+                raise UserError('Verification could not be completed. Run /link again.')
+            session.jellyfin.token = token
+            user = await self.service.offload(session.jellyfin.me)
+            if (identity(user.get('Id')) != identity((authenticated.get('User') or {}).get('Id')) or
+                identity(user.get('ServerId')) != session.settings.server_id or (user.get('Policy') or {}).get('IsDisabled')):
+                raise UserError('Verification could not be completed. Run /link again.')
+            credential = {'token': token, 'user_id': identity(user['Id']), 'server_id': session.settings.server_id,
+                'device_id': session.jellyfin.device_id, 'url': session.settings.url}
             # Exchange only the approved secret for a Seerr cookie session; never the admin key.
             await self.service.offload(session.client._request, 'POST', '/auth/jellyfin/quickconnect/authenticate', {'secret': session.secret})
             session.authenticated = True
             async with self.service.lock:
-                name = await self.service.offload(self.service.link_authenticated, session.discord_id, session.client)
+                name = await self.service.offload(self.service.link_authenticated, session.discord_id, session.client, credential)
+                await self.service.offload(self.service.verify_identity, session.discord_id)
             session.state = 'linked'
             return name
 
@@ -106,12 +125,11 @@ class QuickConnect:
         async with session.lock:
             if session.closed:
                 return
-            if session.authenticated:
-                try:
-                    await self.service.offload(session.client.logout_user)
-                except Exception:
-                    pass
+            # Seerr logout deletes Jellyfin devices. Close/discard this private cookie
+            # session without revoking the retained Quick Connect user credential.
             session.client.close()
+            if session.jellyfin:
+                session.jellyfin.token = None
             session.secret = ''
             session.closed = True
 

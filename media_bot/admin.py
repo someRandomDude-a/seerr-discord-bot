@@ -34,6 +34,8 @@ class AdminMessaging:
         return self.bot.service.is_admin(user_id)
 
     def require_admin(self, user_id):
+        if user_id != 'local-panel':
+            self.bot.service.verify_identity(user_id)
         if not self.is_admin(user_id):
             raise UserError('Operator access required.')
 
@@ -238,7 +240,7 @@ class AdminMessaging:
                         target = self.bot.get_user(int(row['target_id'])) or await self.bot.fetch_user(int(row['target_id']))
                     else:
                         target = self.bot.get_channel(int(row['target_id'])) or await self.bot.fetch_channel(int(row['target_id']))
-                    message = await target.send(row['content'], allowed_mentions=discord.AllowedMentions.none())
+                    message = await target.send(row['content'], allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
                     status, error, message_id = 'sent', None, str(message.id)
                 except (discord.Forbidden, discord.NotFound):
                     status, error, message_id = 'failed', 'Recipient unavailable or messages not permitted', None

@@ -187,4 +187,5 @@ data/
 node_modules/
 activity/dist/
 settings.json
+jellyfin.key
 .settings-*

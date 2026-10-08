@@ -72,26 +72,36 @@ class LinkingTests(unittest.IsolatedAsyncioTestCase):
         self.service.link_authenticated.return_value = 'Viewer'
         self.manager = QuickConnect(self.service)
         self.client = MagicMock()
-        self.client._request.return_value = {'code': '123456', 'secret': 'a' * 32}
+        from media_bot.jellyfin import JellyfinConfig
+        self.service.jellyfin_settings.return_value = JellyfinConfig('http://jellyfin:8096', 'https://jellyfin.example', 'b' * 32)
+        self.jellyfin_patcher = patch('media_bot.linking.JellyfinClient')
+        self.jellyfin = self.jellyfin_patcher.start().return_value
+        self.jellyfin.device_id = 'discord-device'
+        self.jellyfin.request.return_value = {'Code': '123456', 'Secret': 'a' * 32}
+        self.jellyfin.me.return_value = {'Id': 'c' * 32, 'ServerId': 'b' * 32}
+        self.credential = {'url': 'http://jellyfin:8096', 'token': 'user-token', 'user_id': 'c' * 32,
+            'device_id': 'discord-device', 'server_id': 'b' * 32}
         self.patcher = patch('media_bot.linking.SeerrAPI', return_value=self.client)
         self.factory = self.patcher.start()
 
     async def asyncTearDown(self):
         await self.manager.close()
         self.patcher.stop()
+        self.jellyfin_patcher.stop()
 
     async def test_linking_requires_approval_and_never_uses_admin_key(self):
         session = await self.manager.begin(42)
         self.factory.assert_called_once_with('http://seerr', timeout=15)
-        self.client._request.return_value = {'authenticated': False}
+        self.jellyfin.request.return_value = {'Authenticated': False}
         self.assertEqual(await self.manager.check(session), 'pending')
         self.service.link_authenticated.assert_not_called()
-        self.client._request.side_effect = [{'authenticated': True}, {}]
+        self.jellyfin.request.side_effect = [{'Authenticated': True}, {'AccessToken': 'user-token', 'User': {'Id': 'c' * 32}}]
         self.assertEqual(await self.manager.check(session), 'Viewer')
-        self.service.link_authenticated.assert_called_once_with(42, self.client)
+        self.service.link_authenticated.assert_called_once_with(42, self.client, self.credential)
         self.assertEqual(session.state, 'linked')
         await self.manager.close_client(session)
-        self.client.logout_user.assert_called_once()
+        self.client.logout_user.assert_not_called()  # Logout must not revoke the retained user token.
+        self.assertIsNone(session.jellyfin.token)
 
     async def test_cancelled_and_replaced_sessions_cannot_link(self):
         old = await self.manager.begin(42)
@@ -108,9 +118,27 @@ class LinkingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.manager.check(session), 'expired')
         self.service.link_authenticated.assert_not_called()
 
+    async def test_wrong_jellyfin_identity_never_creates_seerr_cookie_or_link(self):
+        session = await self.manager.begin(42)
+        self.jellyfin.request.side_effect = [{'Authenticated': True}, {'AccessToken': 'user-token', 'User': {'Id': 'c' * 32}}]
+        self.jellyfin.me.return_value = {'Id': 'd' * 32, 'ServerId': 'b' * 32}
+        with self.assertRaises(UserError):
+            await self.manager.check(session)
+        self.client._request.assert_not_called()
+        self.service.link_authenticated.assert_not_called()
+
+    async def test_retained_identity_is_rechecked_before_link_success_is_disclosed(self):
+        from media_bot.security import VerificationRequired
+        session = await self.manager.begin(42)
+        self.jellyfin.request.side_effect = [{'Authenticated': True}, {'AccessToken': 'user-token', 'User': {'Id': 'c' * 32}}]
+        self.service.verify_identity.side_effect = VerificationRequired('Run /link again.')
+        with self.assertRaises(VerificationRequired):
+            await self.manager.check(session)
+        self.assertNotEqual(session.state, 'linked')
+
     async def test_poll_updates_private_discord_response(self):
         session = await self.manager.begin(42)
-        self.client._request.side_effect = [{'authenticated': True}, {}]
+        self.jellyfin.request.side_effect = [{'Authenticated': True}, {'AccessToken': 'user-token', 'User': {'Id': 'c' * 32}}]
         from unittest.mock import AsyncMock
         interaction = MagicMock()
         interaction.edit_original_response = AsyncMock()
@@ -152,6 +180,8 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         self.bot = MagicMock()
         self.bot.config = Config('http://seerr', 'key', 'token', 'unused.db', activity_enabled=True, application_id='123', client_secret='private', guild_ids=frozenset([555]))
         self.bot.service.offload = MediaService.offload
+        from unittest.mock import AsyncMock
+        self.bot.service.verified_account = AsyncMock(return_value={'discord_id': '42'})
         self.api = ActivityAPI(self.bot)
         self.api.discord_request = MagicMock(side_effect=[{'access_token': 'oauth', 'expires_in': 900}, {'id': '42'}, [{'id': '555'}]])
         server = WebhookServer(self.bot.service, asyncio.Event(), self.api)
@@ -229,13 +259,14 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         self.bot.admin.require_admin.assert_called_once_with(42)
         self.bot.admin.inbox.assert_not_called()
 
-    async def test_admin_inbox_dispatches_filters_without_seerr_link(self):
+    async def test_admin_inbox_dispatches_filters_after_identity_check(self):
         auth = await self.authenticated_session()
         self.bot.admin.inbox.return_value = {'messages': [], 'total': 0}
         response = await self.client.post('/api/activity/action', json={'operation': 'admin_inbox', 'kind': 'dm', 'user_id': '1234567890123456789', 'query': 'film', 'page': 2, 'order': 'oldest'}, headers=auth)
         self.assertEqual(response.status, 200)
         self.bot.admin.inbox.assert_called_once_with(42, kind='dm', guild_id=None, user_id='1234567890123456789', channel_id=None, query='film', page=2, order='oldest')
         self.bot.service.account.assert_not_called()
+        self.bot.service.verified_account.assert_awaited_once_with(42)
 
     async def test_admin_prepare_accepts_full_discord_snowflakes(self):
         from unittest.mock import AsyncMock

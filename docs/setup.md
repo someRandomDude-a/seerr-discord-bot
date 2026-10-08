@@ -101,13 +101,25 @@ If configuration is incomplete, the bot waits while the separate panel is availa
 
 1. Run `/link` in an allowed server. Approve its private code in an already signed-in Jellyfin client's **Settings → Quick Connect**. Do not share the code or approve unexpected codes.
 2. Run `/status` and confirm a successful refresh; then `/dashboard`, `/library`, `/storage` and `/requests`.
-3. Search a movie/series with `/search`, select a result and request it through confirmation. Optional music/books use the same command. Check the resulting upstream request/addition before retrying a failed or ambiguous operation.
-4. In `/notifications`, choose a Jellyfin device URL and enable DMs if wanted. Follow an item from its details, check `/watchlist`, and try Unfollow. Import Seerr follows from Notifications if desired.
+3. Try `/discover` for popular movie/series poster cards, or `/search` for a title. Select a card, inspect its synopsis and request through confirmation. Back should preserve the gallery position; Next should cross search batches without typing a new command. Test Filter titles and category selection too. Optional music/books use `/search`. Check the resulting upstream request/addition before retrying a failed or ambiguous operation.
+4. Open an available movie/show in Jellyfin. Browser is discovered from Seerr's Jellyfin external hostname (or its internal address if unset); no device URL entry is required. The bot resolves items using the verified user's Jellyfin permissions, even when Seerr lacks an item ID. In `/notifications`, optionally choose an extra destination and enable DMs. Follow a movie/series, check that it appears in your Seerr watchlist, then Unfollow and check removal. Add/remove an entry in Seerr and verify the hub converges on its next watchlist open or background sync (default 5 minutes). Preferences has **Sync watchlists now**; no manual import or DM opt-in is required. Music/books remain local.
 5. As an operator, run `/servers`, send a test DM/mention to the bot, then `/inbox`. Select a message, open Reply, and **cancel the preview** to confirm nothing sends without approval.
 6. Test `/announce` with one private test channel/user, then `/deliveries` and `/deliveries job:ID`. Test multi-server broadcasts only after checking destination mappings and privileged intents.
 7. For deletion testing, use **disposable test media**: `/requests` → owned available request → Delete → confirmation; verify it appears in `/deletions`, then select it and Undo. Real deletion runs only after 24 hours and live revalidation. Undo cannot stop an already-started deletion.
 
 Slash commands and their private buttons/modals cover the hub without any hosted interface. Automated tests do not replace these checks against your actual service versions and Discord application.
+
+Discovery/details/links read their own upstream dependencies live rather than refreshing unrelated storage/library integrations. Opening or refreshing snapshot-backed collections still performs a fresh sync. Browsing controls reuse a clearly labelled, already-open gallery snapshot; native controls recheck the viewer's identity/permissions before redisplaying it, and all mutation endpoints perform their own live checks. A failed collection refresh never falls back to the old gallery.
+
+In the Activity, Discover shows popular titles immediately. Test poster details, Back, collection pagination, saved filters and the verified **Open Seerr** shortcut. Seerr opens externally and requires the user's own browser login/session: embedding it with bot/admin credentials is not supported. Its cookie/CSRF rules cannot safely be bypassed just to embed it under Discord's origin.
+
+Watchlist sync requires Seerr's native `/discover/watchlist`, `POST /watchlist` and `DELETE /watchlist/{tmdbId}?mediaType=movie|tv` endpoints. They always run as the verified linked Seerr user. On the first sync both lists are merged; subsequent removals propagate in either direction. Pending hub choices win conflicts, survive restarts, and are retried only after reading fresh membership. Test an upstream outage and a restart while a removal is pending: the entry must not reappear locally and should disappear remotely after recovery. Revoked verification pauses sync without wiping lists. Unsupported/malformed responses stop sync instead of acting like an empty watchlist. Keep the full SQLite database and `jellyfin.key` mounted; do not delete sync tables or the database to resolve a destination change. See [watchlist sync rules](../README.md#automatic-two-way-watchlists) for migration and size-limit behavior.
+
+### Identity and privacy checks
+
+Before `/link`, verify that `/status`, `/notifications`, library/storage commands and Activity posters disclose no server details; even bot-only operators must prove their Jellyfin identity. Existing links from older images need one new approval. After linking, restart the bot and confirm the identity persists. Revoke that Discord Media session in Jellyfin and confirm private reads/images now require `/link` again. A Jellyfin/Seerr outage must block disclosures without deleting a retained token.
+
+Persist/back up the SQLite database and its sibling `jellyfin.key` together, and protect both from other users. Tokens are encrypted in SQLite, but someone who obtains the database **and** key can decrypt them. The key is created with Unix mode `0600`; protect Windows ACLs and backups explicitly. Seerr remains the authority for request permissions/quotas, while Jellyfin's live user token determines identity. Browser links never contain that token.
 
 ## 8. Optional embedded Activity
 
@@ -119,7 +131,7 @@ Skip this section for slash-only use.
 4. Under **Developer Portal → Activities**, enable Activities and add **URL Mapping prefix `/`** pointing to the HTTPS backend hostname (use the hostname/target format requested by the portal).
 5. Under **OAuth2 → Redirects**, add **`https://127.0.0.1`**, the embedded SDK's placeholder redirect. You do not need a separate browser registration page or public redirect handler.
 6. Save & apply (or restart headless installs). Enter the backend hostname as **Public backend URL** and test it in the panel. Enable client Developer Mode and use `/activity` to verify SDK/OAuth; test as an application owner/team member first. Broader distribution may require Discord's testing/distribution/verification settings.
-7. Approve the SDK's requested OAuth scopes: `identify`, plus `guilds` when `ALLOWED_GUILD_IDS` is set. These are viewer-authentication scopes, **not** extra bot-install scopes. The backend verifies the viewer, not client-supplied identity claims.
+7. Approve the SDK's requested OAuth scopes: `identify` and `guilds`. These are viewer-authentication scopes, **not** extra bot-install scopes. The backend verifies the viewer, not client-supplied identity claims. Discord OAuth alone reveals no private server data: a valid retained Jellyfin token is required too.
 
 Users still need access to the launch channel and its Use Activities permission. Sessions expire; reopen the Activity to sign in again. If hosting is unavailable, use slash commands; set `ACTIVITY_ENABLED=false` and restart to disable Activity mode completely.
 

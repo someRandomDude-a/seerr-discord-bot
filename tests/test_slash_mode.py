@@ -8,13 +8,21 @@ from bot import SeerrBot
 from media_bot.admin_ui import AdminListView, InboxDetailView, InboxReplyModal
 from media_bot.config import Config
 from media_bot.security import UserError
-from media_bot.ui import DetailView, ItemsView
+from media_bot.ui import DetailView, ItemsView, PreferencesView
 
 
 class SlashModeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.bot = SeerrBot(Config('http://seerr', 'secret', 'token', str(Path(self.temp.name) / 'cache.db'), admin_ids=frozenset([42])))
+        from media_bot.jellyfin import JellyfinConfig
+        self.bot.service.store.link(42, 7, 'Viewer', {'token': 'user-token', 'user_id': 'a' * 32,
+            'server_id': 'b' * 32, 'device_id': 'discord-device', 'url': 'http://jellyfin:8096'})
+        self.settings_patch = patch('media_bot.service.MediaService.jellyfin_settings',
+            return_value=JellyfinConfig('http://jellyfin:8096', 'https://jellyfin.example', 'b' * 32))
+        self.settings_patch.start()
+        self.jellyfin_patch = patch('media_bot.service.JellyfinClient')
+        self.jellyfin_patch.start().return_value.me.return_value = {'Id': 'a' * 32, 'ServerId': 'b' * 32}
         self.interaction = MagicMock()
         self.interaction.user.id, self.interaction.guild_id, self.interaction.channel_id = 42, 555, 111
         self.interaction.response.defer = AsyncMock()
@@ -25,6 +33,8 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.bot.service.api.close()
+        self.jellyfin_patch.stop()
+        self.settings_patch.stop()
         self.temp.cleanup()
 
     async def test_toggle_requires_no_frontend_oauth_or_http_listener(self):
@@ -35,6 +45,14 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
             'search', 'storage', 'notifications', 'watchlist', 'deletions', 'status'}.issubset(c.name for c in self.bot.tree.get_commands()))
         with self.assertRaises(UserError):
             await self.bot.tree.get_command('activity').callback(self.interaction)
+
+    async def test_native_preferences_offer_full_sync_instead_of_import(self):
+        self.bot.service.run = AsyncMock(return_value='Movie/series watchlists synced both ways.')
+        view = PreferencesView(self.bot, 42)
+        self.assertIn('Sync watchlists now', [item.label for item in view.children if hasattr(item, 'label')])
+        self.assertIn('sync with Seerr automatically', str(view.render().to_dict()))
+        await view.import_watchlist(self.interaction)
+        self.bot.service.run.assert_awaited_once_with(42, 'sync_watchlist')
 
     async def test_inbox_command_local_filtered_paginated_and_private(self):
         self.bot.admin.inbox = MagicMock(return_value={'messages': [], 'total': 0})
@@ -110,6 +128,58 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
         self.bot.service.run.return_value = 'https://jellyfin.example/web/index.html#!/details?id=abc'
         await detail.open(self.interaction)
         self.bot.service.run.assert_awaited_with(42, 'open', view.items[0])
+
+    async def test_native_gallery_has_numbered_posters_and_fast_access_checked_paging(self):
+        self.bot.service.run = AsyncMock(return_value=[{'kind': 'movie', 'external_id': str(i), 'title': f'Film {i}', 'available': True, 'poster_path': '/a.jpg'} for i in range(1, 16)])
+        self.bot.service.validate_browse = MagicMock()
+        view = ItemsView(self.bot, 42, 'library', ('all',))
+        await view.load()
+        cards = view.gallery()
+        self.assertEqual(len(cards), 6)
+        self.assertEqual(cards[1].thumbnail.url, 'https://image.tmdb.org/t/p/w185/a.jpg')
+        self.assertTrue(cards[1].title.startswith('1.'))
+        self.assertLessEqual(sum(len(card) for card in cards), 6000)
+        await view.next(self.interaction)
+        self.assertEqual(view.page, 1)
+        self.bot.service.run.assert_awaited_once()
+        self.bot.service.validate_browse.assert_called_once_with(42, False, True)
+        self.assertIn('embeds', self.interaction.edit_original_response.await_args.kwargs)
+
+    async def test_native_search_next_moves_to_more_upstream_results(self):
+        self.bot.service.run = AsyncMock(return_value=[{'kind': 'movie', 'external_id': '10', 'title': 'A film'}])
+        view = ItemsView(self.bot, 42, 'search', ('movie', 'Title', 1))
+        await view.load()
+        await view.next(self.interaction)
+        self.bot.service.run.assert_awaited_with(42, 'search', 'movie', 'Title', 2)
+        self.assertEqual(view.page, 0)
+
+    async def test_native_filter_keeps_full_gallery_and_back_does_not_resync(self):
+        self.bot.service.run = AsyncMock(return_value=[{'kind': 'movie', 'external_id': str(i), 'title': f'Film {i}'} for i in range(1, 10)])
+        self.bot.service.validate_browse = MagicMock()
+        view = ItemsView(self.bot, 42, 'library', ('all',))
+        await view.load()
+        view.query = 'Film 9'; view.filter_items()
+        self.assertEqual(len(view.items), 1)
+        view.query = ''; view.filter_items()
+        self.assertEqual(len(view.items), 9)
+        detail = DetailView(self.bot, 42, view.items[0], view)
+        await detail.back(self.interaction)
+        self.bot.service.run.assert_awaited_once()
+
+    async def test_native_gallery_does_not_render_posters_after_access_rejection(self):
+        self.bot.service.run = AsyncMock(return_value=[{'kind': 'movie', 'external_id': '10', 'title': 'Private film', 'poster_path': '/a.jpg'}])
+        self.bot.service.validate_browse = MagicMock(side_effect=UserError('Run /link again.'))
+        view = ItemsView(self.bot, 42, 'library', ('all',))
+        await view.load()
+        with self.assertRaises(UserError):
+            await view.show_page(self.interaction)
+        self.interaction.edit_original_response.assert_not_awaited()
+
+    async def test_untrusted_image_paths_are_not_embedded_in_native_gallery(self):
+        self.bot.service.run = AsyncMock(return_value=[{'kind': 'movie', 'external_id': '10', 'title': 'Film', 'poster_path': '/../../private?key=secret'}])
+        view = ItemsView(self.bot, 42, 'library', ('all',))
+        await view.load()
+        self.assertIsNone(view.gallery()[1].thumbnail.url)
 
 
 class EnvironmentTests(unittest.TestCase):

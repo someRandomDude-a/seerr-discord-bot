@@ -1,12 +1,15 @@
 import json
 import sqlite3
 import time
+import hashlib
 from contextlib import contextmanager
+from .credentials import CredentialVault
 
 
 class Store:
     def __init__(self, path):
         self.path = path
+        self.vault = CredentialVault(path)
         with self.connect() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -17,6 +20,23 @@ class Store:
                 CREATE TABLE IF NOT EXISTS watches (
                     discord_id TEXT NOT NULL, kind TEXT NOT NULL, external_id TEXT NOT NULL,
                     title TEXT NOT NULL, PRIMARY KEY(discord_id, kind, external_id)
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_sync (
+                    discord_id TEXT PRIMARY KEY, seerr_id INTEGER NOT NULL, origin TEXT NOT NULL,
+                    initialized INTEGER NOT NULL DEFAULT 0, baseline TEXT NOT NULL DEFAULT '[]',
+                    last_attempt REAL, last_success REAL, error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_intents (
+                    discord_id TEXT NOT NULL, kind TEXT NOT NULL, external_id TEXT NOT NULL,
+                    title TEXT NOT NULL, desired INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(discord_id, kind, external_id)
+                );
+                CREATE TABLE IF NOT EXISTS jellyfin_credentials (
+                    discord_id TEXT PRIMARY KEY, payload TEXT NOT NULL, fingerprint TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS jellyfin_identities (
+                    discord_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, server_id TEXT NOT NULL,
+                    UNIQUE(user_id, server_id)
                 );
                 CREATE TABLE IF NOT EXISTS actions (
                     id INTEGER PRIMARY KEY, discord_id TEXT NOT NULL, action TEXT NOT NULL,
@@ -80,11 +100,38 @@ class Store:
             row = db.execute('SELECT * FROM accounts WHERE discord_id=?', (str(discord_id),)).fetchone()
             return dict(row) if row else None
 
-    def link(self, discord_id, seerr_id, name):
+    def link(self, discord_id, seerr_id, name, credential=None):
+        encrypted = self.vault.encrypt(json.dumps(credential)) if credential else None
         with self.connect() as db:
             db.execute('''INSERT INTO accounts(discord_id,seerr_id,name,linked_at) VALUES (?,?,?,?)
                 ON CONFLICT(discord_id) DO UPDATE SET seerr_id=excluded.seerr_id,
-                name=excluded.name, linked_at=excluded.linked_at''', (str(discord_id), seerr_id, name, time.time()))
+                 name=excluded.name, linked_at=excluded.linked_at''', (str(discord_id), seerr_id, name, time.time()))
+            if encrypted:
+                db.execute('INSERT INTO jellyfin_identities VALUES (?,?,?) ON CONFLICT(discord_id) DO NOTHING',
+                    (str(discord_id), credential['user_id'], credential['server_id']))
+                bound = db.execute('SELECT user_id,server_id FROM jellyfin_identities WHERE discord_id=?',
+                    (str(discord_id),)).fetchone()
+                if (bound['user_id'], bound['server_id']) != (credential['user_id'], credential['server_id']):
+                    from .security import VerificationRequired
+                    raise VerificationRequired('This Discord account is bound to a different identity.')
+                db.execute('INSERT OR REPLACE INTO jellyfin_credentials VALUES (?,?,?)',
+                    (str(discord_id), encrypted, hashlib.sha256(credential['token'].encode()).hexdigest()))
+
+    def credential(self, discord_id):
+        with self.connect() as db:
+            row = db.execute('SELECT payload FROM jellyfin_credentials WHERE discord_id=?', (str(discord_id),)).fetchone()
+        return json.loads(self.vault.decrypt(row['payload'])) if row else None
+
+    def bound_identity(self, discord_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM jellyfin_identities WHERE discord_id=?', (str(discord_id),)).fetchone()
+        return dict(row) if row else None
+
+    def revoke_credential(self, discord_id, token):
+        # An old in-flight validation must not revoke a freshly relinked token.
+        with self.connect() as db:
+            db.execute('DELETE FROM jellyfin_credentials WHERE discord_id=? AND fingerprint=?',
+                (str(discord_id), hashlib.sha256(token.encode()).hexdigest()))
 
     def preference(self, discord_id, *, opted_in=None, device=None):
         with self.connect() as db:
@@ -108,6 +155,13 @@ class Store:
                     from .security import UserError
                     raise UserError('Watchlist limit reached (200 items). Remove an item first.')
                 db.execute('INSERT OR REPLACE INTO watches VALUES (?,?,?,?)', (str(discord_id), kind, str(external_id), title))
+            if kind in ('movie', 'tv'):
+                # Durable desired membership, including removals of absent entries.
+                # The reconciler writes imported watches directly so they do not echo.
+                db.execute('''INSERT INTO watchlist_intents(discord_id,kind,external_id,title,desired)
+                    VALUES (?,?,?,?,?) ON CONFLICT(discord_id,kind,external_id) DO UPDATE SET
+                    title=excluded.title,desired=excluded.desired,revision=watchlist_intents.revision+1''',
+                    (str(discord_id), kind, str(external_id), title, int(not remove)))
 
     def watches(self, discord_id):
         with self.connect() as db:

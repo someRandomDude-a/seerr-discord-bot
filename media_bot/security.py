@@ -6,6 +6,14 @@ class UserError(Exception):
     """A safe, user-facing error; never includes upstream bodies or secrets."""
 
 
+class VerificationRequired(UserError):
+    """No currently valid Jellyfin identity; only linking instructions may be shown."""
+
+
+class VerificationUnavailable(UserError):
+    """Identity cannot currently be checked; retain the credential but hide private data."""
+
+
 class RateLimiter:
     def __init__(self, count, window, clock=time.monotonic):
         self.count, self.window, self.clock = count, window, clock
@@ -21,4 +29,3 @@ class RateLimiter:
         if len(queue) >= self.count:
             raise UserError(f'Too many attempts. Try again in {max(1, int(self.window - (now - queue[0])) + 1)} seconds.')
         queue.append(now)
-

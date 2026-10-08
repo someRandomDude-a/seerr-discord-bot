@@ -18,26 +18,44 @@ const inbox = {
   users: [{ author_id: user, author_name: 'Viewer' }],
 };
 
-async function harness(isAdmin = true, received = inbox) {
+async function harness(isAdmin = true, received = inbox, verified = true, titles = [{ kind: 'movie', external_id: '10', title: 'Private Film', available: true, poster_path: '/a.jpg', requestable: true }]) {
   const dom = new JSDOM('<div id="app"></div>');
   dom.window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
   dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; };
   const calls = [];
+  let isVerified = verified;
+  let unavailable = false;
+  const viewer = () => ({ account: isVerified ? { name: 'Private Viewer', opted_in: false } : null,
+    devices: isVerified ? ['Secret Server'] : [], is_admin: isVerified && isAdmin, refresh_interval: 60, sync_interval: 300 });
   const context = vm.createContext({
     document: dom.window.document, console, crypto: { randomUUID: () => 'state' },
     setInterval: () => 1, clearInterval: () => {},
+    URL: { createObjectURL: () => 'blob:private-image', revokeObjectURL: () => {} },
     DiscordSDK: class {
       guildId = guild;
       ready = async () => {};
-      commands = { authorize: async () => ({ code: 'mock' }), authenticate: async () => {} };
+      commands = { authorize: async () => ({ code: 'mock' }), authenticate: async () => {}, openExternalLink: async ({ url }) => calls.push({ external: url }) };
     },
     fetch: async (path, options) => {
       const args = options.body ? JSON.parse(options.body) : {};
-      calls.push({ path, ...args });
+      calls.push({ path, ...args, headers: options.headers });
       let data;
       if (path.endsWith('/config')) data = { application_id: '123', scopes: ['identify'], refresh_interval: 60 };
       else if (path.endsWith('/auth')) data = { access_token: 'mock', session_token: 'mock' };
-      else if (args.operation === 'profile') data = { account: null, devices: [], is_admin: isAdmin };
+      else if (['profile', 'browse'].includes(args.operation) && unavailable) return { ok: false, status: 400, json: async () => ({ error: 'Verification unavailable', private_data_blocked: true }) };
+      else if (args.operation === 'profile') data = viewer();
+      else if (args.operation === 'browse') {
+        if (!isVerified) return { ok: false, status: 400, json: async () => ({ error: 'Run /link again.', private_data_blocked: true, verification_required: true }) };
+        const result = args.page === 'home' ? { account: viewer().account, requests: 1, library: titles.length } : args.page === 'settings' ? null : titles;
+        data = { viewer: viewer(), meta: { last_success: 1000 }, result };
+      }
+      else if (args.operation === 'details') data = { result: { ...args.item, overview: 'Fresh live synopsis', available: true, poster_path: '/a.jpg' } };
+      else if (args.operation === 'seerr_link') data = { result: 'https://seerr.example' };
+      else if (args.operation === 'sync_watchlist') data = { result: 'Movie/series watchlists synced both ways. Music and books stay hub-only.' };
+      else if (args.operation === 'dashboard') data = { result: { account: { name: 'Private Viewer', opted_in: false }, requests: 1, library: 1 } };
+      else if (args.operation === 'status') data = { last_success: 1000 };
+      else if (args.operation === 'library') data = { result: [{ kind: 'movie', title: 'Private Film', available: true, poster_path: '/a.jpg' }] };
+      else if (path.includes('/poster/')) return { ok: true, blob: async () => ({}) };
       else if (args.operation === 'admin_state') data = { result: state };
       else if (args.operation === 'admin_inbox') data = { result: received };
       else if (args.operation === 'admin_prepare') data = { result: { plan: 'preview', channels: args.user_id ? 0 : 1, users: args.user_id ? 1 : 0, skipped: [], destinations: ['Cinema / #general'] } };
@@ -51,10 +69,11 @@ async function harness(isAdmin = true, received = inbox) {
   const main = (await readFile(new URL('../src/main.js', import.meta.url), 'utf8'))
     .replace(/^import .*;\r?\n/gm, '')
     .replace('boot().catch(error => showError(error));', 'globalThis.ready = boot();');
-  vm.runInContext(domSource + '\n' + main + '\nglobalThis.testUI = { openAdmin: async () => { page = "admin"; await loadPage(); } };', context);
+  vm.runInContext(domSource + '\n' + main + '\nglobalThis.testUI = { openAdmin: async () => { page = "admin"; await loadPage(); }, openLibrary: async () => { page = "library"; await loadPage(); }, reload: loadPage };', context);
   await context.ready;
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
-  return { document: dom.window.document, window: dom.window, calls, context, settle, close: () => dom.window.close() };
+  return { document: dom.window.document, window: dom.window, calls, context, settle,
+    revoke: () => { isVerified = false; }, outage: () => { unavailable = true; }, close: () => dom.window.close() };
 }
 
 function click(document, text) {
@@ -63,7 +82,7 @@ function click(document, text) {
   button.click();
 }
 
-test('operators get a grouped inbox without a Seerr link; content is rendered safely', async () => {
+test('verified operators get a grouped inbox; content is rendered safely', async () => {
   const h = await harness();
   try {
     assert.ok(h.document.querySelector('[data-page="admin"]'));
@@ -83,6 +102,117 @@ test('operators get a grouped inbox without a Seerr link; content is rendered sa
     click(h.document, 'Reply');
     assert.equal(h.document.querySelector('.compose>input').value, user);
     assert.equal(h.document.querySelector('.guild-checklist input').checked, false);
+  } finally { h.close(); }
+});
+
+test('unverified viewers see only verification and never load server data or images', async () => {
+  const h = await harness(true, inbox, false);
+  try {
+    assert.ok(h.document.body.textContent.includes('Connect Jellyfin'));
+    assert.equal(h.document.querySelector('[data-page="admin"]'), null);
+    assert.equal(h.document.querySelector('img,a'), null);
+    assert.equal(h.calls.some(call => ['browse', 'dashboard', 'status', 'library', 'admin_state'].includes(call.operation)), false);
+    assert.equal(h.document.body.textContent.includes('Secret Server'), false);
+  } finally { h.close(); }
+});
+
+test('a page loads through one authenticated browse call, without separate profile and status round trips', async () => {
+  const h = await harness();
+  try {
+    const before = h.calls.length;
+    await h.context.testUI.openLibrary(); await h.settle();
+    const metadata = h.calls.slice(before).filter(call => call.operation);
+    assert.equal(metadata.length, 1);
+    assert.equal(metadata[0].operation, 'browse');
+    assert.equal(metadata[0].page, 'library');
+  } finally { h.close(); }
+});
+
+test('gallery paging is bounded, and filtering and position survive returning to the library', async () => {
+  const titles = Array.from({ length: 30 }, (_, i) => ({ kind: 'movie', external_id: String(i + 1), title: `Film ${String(i).padStart(2, '0')}`, available: true, poster_path: '/a.jpg' }));
+  const h = await harness(true, inbox, true, titles);
+  try {
+    await h.context.testUI.openLibrary(); await h.settle();
+    assert.equal(h.document.querySelectorAll('.media-card').length, 12);
+    const browseCalls = h.calls.filter(call => call.operation === 'browse').length;
+    click(h.document, 'Next →'); await h.settle();
+    assert.ok(h.document.querySelector('.count').textContent.includes('Page 2/3'));
+    assert.equal(h.calls.filter(call => call.operation === 'browse').length, browseCalls);
+    await h.context.testUI.reload();
+    assert.ok(h.document.querySelector('.count').textContent.includes('Page 2/3'));
+    const filter = h.document.querySelector('[aria-label="Filter collection"]');
+    filter.value = 'Film 29'; filter.dispatchEvent(new h.window.Event('input'));
+    assert.equal(h.document.querySelectorAll('.media-card').length, 1);
+    await h.context.testUI.reload();
+    assert.equal(h.document.querySelector('[aria-label="Filter collection"]').value, 'Film 29');
+    assert.equal(h.document.querySelectorAll('.media-card').length, 1);
+  } finally { h.close(); }
+});
+
+test('a poster opens live details and Back preserves the gallery rather than reloading it', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.openLibrary(); await h.settle();
+    h.document.querySelector('button.cover').click(); await h.settle();
+    assert.ok(h.document.querySelector('.media-detail').textContent.includes('Fresh live synopsis'));
+    assert.equal(h.calls.find(call => call.operation === 'details').item.external_id, '10');
+    const count = h.calls.filter(call => call.operation === 'browse').length;
+    click(h.document, '← Back to browsing');
+    assert.equal(h.document.querySelector('.media-detail'), null);
+    assert.equal(h.calls.filter(call => call.operation === 'browse').length, count);
+  } finally { h.close(); }
+});
+
+test('Discover immediately browses popular titles and opens Seerr without embedding credentials', async () => {
+  const h = await harness();
+  try {
+    h.document.querySelector('[data-page="search"]').click(); await h.settle();
+    assert.ok(h.document.body.textContent.includes('Popular now'));
+    assert.ok(h.document.querySelector('.media-card'));
+    click(h.document, 'Open Seerr ↗'); await h.settle();
+    assert.equal(h.calls.find(call => call.external).external, 'https://seerr.example');
+    assert.equal(h.document.querySelector('iframe'), null);
+  } finally { h.close(); }
+});
+
+test('watchlist preferences describe automatic two-way sync and offer a sync-now action instead of import', async () => {
+  const h = await harness();
+  try {
+    h.document.querySelector('[data-page="settings"]').click(); await h.settle();
+    assert.ok(h.document.body.textContent.includes('Two-way watchlist sync'));
+    assert.ok(h.document.body.textContent.includes('including removals'));
+    assert.equal([...h.document.querySelectorAll('button')].some(button => button.textContent === 'Import'), false);
+    click(h.document, 'Sync now'); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'sync_watchlist').length, 1);
+    assert.ok(h.document.querySelector('#notice').textContent.includes('both ways'));
+  } finally { h.close(); }
+});
+
+test('posters use header authentication and revocation clears rendered private content', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.openLibrary(); await h.settle();
+    assert.ok(h.document.body.textContent.includes('Private Film'));
+    const poster = h.calls.find(call => call.path.includes('/poster/'));
+    assert.equal(poster.headers.Authorization, 'Bearer mock');
+    assert.equal(poster.path.includes('mock'), false);
+    assert.equal(h.document.querySelector('img').src, 'blob:private-image');
+    h.revoke(); await h.context.testUI.reload();
+    assert.equal(h.document.body.textContent.includes('Private Film'), false);
+    assert.equal(h.document.querySelector('img,a'), null);
+    assert.equal(h.document.querySelector('[data-page="library"]'), null);
+  } finally { h.close(); }
+});
+
+test('an identity outage clears private UI and preserves a usable retry action', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.openLibrary(); await h.settle();
+    h.outage(); await h.context.testUI.reload();
+    assert.equal(h.document.querySelector('img,a'), null);
+    assert.equal(h.document.body.textContent.includes('Private Film'), false);
+    assert.equal(h.document.querySelector('[data-page="admin"]'), null);
+    assert.ok([...h.document.querySelectorAll('button')].some(button => button.textContent === 'Retry verification'));
   } finally { h.close(); }
 });
 

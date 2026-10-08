@@ -79,7 +79,7 @@ class ActivityAPI:
             result = await self.service.offload(self.exchange, code, guild)
         return web.json_response(result)
 
-    async def session(self, request, polling=False, admin_read=False):
+    async def session(self, request, polling=False, admin_read=False, image=False):
         header = request.headers.get('Authorization', '')
         if not header.startswith('Bearer '):
             raise web.HTTPUnauthorized()
@@ -88,7 +88,7 @@ class ActivityAPI:
         if not session or session['expires'] <= time.monotonic():
             self.sessions.pop(token, None)
             raise web.HTTPUnauthorized()
-        limiter = self.poll_limiter if polling else self.admin_read_limiter if admin_read else self.bot.limiter
+        limiter = self.poster_limiter if image else self.poll_limiter if polling else self.admin_read_limiter if admin_read else self.bot.limiter
         limiter.check(session['discord_id'])
         # Recheck server membership against Discord, not a client-provided guild/user ID.
         await self.service.offload(self.membership, session['oauth_token'], session['guild_id'])
@@ -96,8 +96,7 @@ class ActivityAPI:
 
     async def config_route(self, request):
         return web.json_response({'application_id': self.config.application_id,
-            'scopes': ['identify', 'guilds'] if self.config.guild_ids else ['identify'],
-            'refresh_interval': self.config.activity_refresh_interval, 'sync_interval': self.config.sync_interval})
+            'scopes': ['identify', 'guilds']})
 
     async def action(self, request):
         data = await request.json()
@@ -107,10 +106,31 @@ class ActivityAPI:
         session = await self.session(request, polling=operation == 'link_status', admin_read=operation in ('admin_state', 'admin_inbox'))
         uid = session['discord_id']
         if operation == 'profile':
-            admin = await self.service.verify_admin(uid)
-            return web.json_response({'account': self.service.store.account(uid), 'devices': list(self.config.devices),
-                                      'is_admin': admin})
+            return web.json_response(await self.service.offload(self.service.profile, uid))
+        if operation == 'browse':
+            page = data.get('page')
+            if page in ('home', 'storage', 'watches', 'deletions', 'settings'):
+                target, args = {'home': 'dashboard', 'settings': 'account'}.get(page, page), ()
+            elif page == 'library':
+                target, args = 'library', (media_kind(data.get('kind', 'all'), allow_all=True),)
+            elif page == 'requests':
+                target, args = 'requests', (data.get('all_requests') is True,)
+            elif page == 'search':
+                kind = media_kind(data.get('kind', 'movie'))
+                number = min(500, positive_id(data.get('result_page', 1)))
+                query = data.get('query', '')
+                if not isinstance(query, str) or len(query) > 100:
+                    raise UserError('Enter a search of at most 100 characters.')
+                target, args = ('search', (kind, query.strip(), number)) if query.strip() else ('discover', (kind, number))
+                if not query.strip() and kind in ('music', 'book'):
+                    target, args = 'account', ()
+            else:
+                raise web.HTTPBadRequest()
+            result = await self.service.browse(uid, target, *args)
+            result['result'] = public_result(result['result'])
+            return web.json_response(result)
         if isinstance(operation, str) and operation.startswith('admin_'):
+            await self.service.verified_account(uid)
             await self.service.offload(self.bot.admin.require_admin, uid)
             if operation == 'admin_state':
                 result = await self.service.offload(self.bot.admin.state, uid)
@@ -154,9 +174,11 @@ class ActivityAPI:
             except Exception:
                 await self.bot.linking.cancel(uid, link.generation)
                 raise
-        self.service.account(uid)
+        # Local owner-only safety actions return generic receipts, never server data.
+        if operation not in ('undo', 'mute'):
+            await self.service.verified_account(uid)
         if operation == 'status':
-            return web.json_response(self.service.store.meta())
+            return web.json_response(await self.service.offload(self.service.status, uid))
         if operation == 'deletions':
             result = await self.service.deletions(uid)
         elif operation == 'watches':
@@ -166,7 +188,7 @@ class ActivityAPI:
         elif operation == 'mute':
             self.service.mute_notifications(uid)
             result = 'All personal updates muted.'
-        elif operation in ('dashboard', 'storage', 'import_watchlist'):
+        elif operation in ('dashboard', 'storage', 'import_watchlist', 'sync_watchlist', 'seerr_link'):
             result = await self.service.run(uid, operation)
         elif operation == 'requests':
             result = await self.service.run(uid, operation, data.get('all_requests') is True)
@@ -183,7 +205,7 @@ class ActivityAPI:
             if data.get('confirmed') is not True:
                 raise UserError('Explicit confirmation is required to schedule file deletion.')
             result = await self.service.run(uid, operation, positive_id(data.get('id')))
-        elif operation in ('request', 'watch', 'open'):
+        elif operation in ('request', 'watch', 'open', 'details'):
             item = item_reference(data.get('item'))
             if operation == 'watch' and data.get('remove') is True:
                 result = await self.service.unwatch(uid, item)
@@ -205,13 +227,16 @@ class ActivityAPI:
         path = self.assets / 'index.html'
         if not path.exists():
             raise UserError('Build the Activity frontend with npm ci && npm run build in activity/.')
-        return web.FileResponse(path, headers={'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'", 'Referrer-Policy': 'no-referrer'})
+        return web.FileResponse(path, headers={'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'", 'Referrer-Policy': 'no-referrer'})
 
     async def poster(self, request):
         self.poster_limiter.check(request.remote)
         name = request.match_info['name']
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}\.(?:jpg|png|webp)', name):
             raise web.HTTPBadRequest()
+        session = await self.session(request, image=True)
+        await self.service.verified_account(session['discord_id'])
+        # Authorization must run even for cached images.
         cached = self.posters.get(name)
         if cached and cached[0] > time.monotonic():
             return web.Response(body=cached[1], content_type=cached[2])
@@ -272,12 +297,17 @@ def item_reference(value):
         positive_id(eid)
     if source not in (None, 'seerr', 'radarr', 'sonarr', 'lidarr', 'readarr') and (not isinstance(source, str) or not re.fullmatch(r'(radarr|sonarr):[0-9]+', source)):
         raise UserError('Invalid item source.')
-    return {'kind': kind, 'external_id': eid, 'title': title, 'source': source}
+    if 'is4k' in value and not isinstance(value['is4k'], bool):
+        raise UserError('Invalid item edition.')
+    return {'kind': kind, 'external_id': eid, 'title': title, 'source': source,
+        **({'is4k': value['is4k']} if 'is4k' in value else {})}
 
 
 def public_result(value):
+    fields = ('id', 'kind', 'external_id', 'title', 'subtitle', 'overview', 'available', 'source',
+        'size', 'is4k', 'jellyfin_id', 'poster_path', 'status', 'execute_after', 'error', 'deletable', 'requestable')
     if isinstance(value, list):
-        fields = ('id', 'kind', 'external_id', 'title', 'subtitle', 'overview', 'available', 'source',
-            'size', 'is4k', 'jellyfin_id', 'poster_path', 'status', 'execute_after', 'error', 'deletable', 'requestable')
         return [{key: row[key] for key in fields if key in row} for row in value]
+    if isinstance(value, dict) and 'kind' in value and 'external_id' in value:
+        return {key: value[key] for key in fields if key in value}
     return value

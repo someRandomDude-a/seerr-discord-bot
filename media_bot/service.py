@@ -6,14 +6,21 @@ from contextlib import contextmanager
 from urllib.parse import quote
 
 from seerr import SeerrAPI, SyncManager
-from .arr import ArrClient, arr_item
-from .security import UserError
+from .arr import ArrClient, arr_item, external_id
+from .security import UserError, VerificationRequired, VerificationUnavailable
+from .jellyfin import JellyfinClient, discover_jellyfin, identity
 from .store import Store
 from .discovery import discover_arr
+from .watchlists import WatchlistSync
 
 log = logging.getLogger(__name__)
 REQUEST_STATUS = {1: 'Pending approval', 2: 'Approved', 3: 'Declined', 4: 'Failed', 5: 'Completed'}
 MEDIA_STATUS = {1: 'Unknown', 2: 'Requested', 3: 'Processing', 4: 'Partially available', 5: 'Available', 6: 'Files deleted'}
+# These operations fetch their own live dependencies; refreshing every library,
+# disk and notification watch beforehand adds latency without making them fresher.
+LIVE_OPERATIONS = frozenset(('search', 'discover', 'details', 'open', 'preferences', 'account', 'seerr_link', 'import_watchlist', 'sync_watchlist', 'watch'))
+QUICK_READ_OPERATIONS = LIVE_OPERATIONS - {'preferences', 'import_watchlist', 'sync_watchlist', 'watch'}
+WATCHLIST_OPERATIONS = frozenset(('watches', 'watch', 'import_watchlist', 'sync_watchlist'))
 
 
 class MediaService:
@@ -27,17 +34,23 @@ class MediaService:
             self.api.close()
             raise
         self.arr = {k: ArrClient(v, config.timeout) for k, v in config.arr.items()}
-        # All refresh/read/mutate operations share this lock. No overlapping cache writers.
+        self.watchlists = WatchlistSync(self.store, config.seerr_url)
+        self.watchlist_locks = {}
+        # Snapshot refreshes/mutations share this lock; independent live reads do not write snapshots.
         self.lock = asyncio.Lock()
 
     @contextmanager
     def as_user(self, account):
+        self.verify_identity(account['discord_id'])
         api = SeerrAPI(self.config.seerr_url, self.config.seerr_key, self.config.timeout, account['seerr_id'])
         try:
             user = api.get_current_user()
             settings = api.get_notification_settings(account['seerr_id'])
             if user['id'] != account['seerr_id'] or account['discord_id'] not in (settings.get('discordIds') or []):
-                raise UserError('Your account link was revoked in Seerr. Run /link again.')
+                raise VerificationRequired('Your account link was revoked in Seerr. Run /link again.')
+            credential = self.store.credential(account['discord_id'])
+            if identity(user.get('jellyfinUserId')) != identity(credential['user_id']):
+                raise VerificationRequired('Account verification changed. Run /link again.')
             yield api, user
         finally:
             api.close()
@@ -45,19 +58,80 @@ class MediaService:
     def account(self, discord_id):
         account = self.store.account(discord_id)
         if not account:
-            raise UserError('Link your Jellyfin account first with /link.')
+            raise VerificationRequired('Link your Jellyfin account first with /link.')
         return account
 
-    def is_admin(self, discord_id):
-        if int(discord_id) in self.config.admin_ids:
-            return True  # Explicit bot-only exceptions, managed by the local operator.
-        if not self.config.seerr_admins:
-            return False
+    def jellyfin_settings(self):
+        api = SeerrAPI(self.config.seerr_url, self.config.seerr_key, self.config.timeout)
         try:
+            return discover_jellyfin(api)
+        finally:
+            api.close()
+
+    def verify_identity(self, discord_id):
+        account = self.account(discord_id)
+        try:
+            credential = self.store.credential(discord_id)
+        except Exception:
+            raise VerificationRequired('Verification needs renewal. Run /link again.') from None
+        if not credential:
+            raise VerificationRequired('Verify your identity with /link before accessing the hub.')
+        try:
+            settings = self.jellyfin_settings()
+            if settings.url != credential['url'] or settings.server_id != credential['server_id']:
+                raise VerificationRequired('Verification needs renewal. Run /link again.')
+            client = JellyfinClient(settings.url, credential['device_id'], self.config.timeout, credential['token'])
+            user = client.me()
+            if (identity(user.get('Id')) != identity(credential['user_id']) or
+                identity(user.get('ServerId')) != credential['server_id'] or (user.get('Policy') or {}).get('IsDisabled')):
+                raise VerificationRequired('Verification expired or was revoked. Run /link again.')
+        except VerificationRequired:
+            self.store.revoke_credential(discord_id, credential['token'])
+            raise
+        except Exception:
+            raise VerificationUnavailable('Identity verification is unavailable. No private data can be shown. Try again later.') from None
+        return account
+
+    async def verified_account(self, discord_id):
+        return await self.offload(self.verify_identity, discord_id)
+
+    def devices(self):
+        return {'Browser': self.jellyfin_settings().external_url, **self.config.devices}
+
+    def profile(self, discord_id):
+        try:
+            self.verify_identity(discord_id)
+            devices = list(self.devices())
+            admin = self.is_admin(discord_id)
+            # A second admin check may detect revocation; do not return the earlier
+            # account/device snapshot simply because is_admin safely returned False.
+            account = self.verify_identity(discord_id)
+            return {'account': account, 'devices': devices, 'is_admin': admin,
+                'refresh_interval': self.config.activity_refresh_interval, 'sync_interval': self.config.sync_interval}
+        except VerificationRequired:
+            return {'account': None, 'devices': [], 'is_admin': False, 'verification_required': True}
+        except VerificationUnavailable:
+            raise
+        except Exception:
+            raise VerificationUnavailable('Identity verification is unavailable. No private data can be shown. Try again later.') from None
+
+    def status(self, discord_id):
+        self.verify_identity(discord_id)
+        return self.store.meta()
+
+    def is_admin(self, discord_id):
+        try:
+            self.verify_identity(discord_id)
+            if int(discord_id) in self.config.admin_ids:
+                return True  # Bot-only role exception, not an identity-verification exception.
+            if not self.config.seerr_admins:
+                return False
             account = self.account(discord_id)
             with self.as_user(account) as (_api, user):
                 return user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)
-        except UserError:
+        except VerificationUnavailable:
+            raise
+        except Exception:
             return False
 
     async def verify_admin(self, discord_id):
@@ -123,7 +197,7 @@ class MediaService:
                                    (media['id'], kind, tmdb, title, poster))
                 regular = media.get('status') in (4, 5)
                 items.append({'kind': kind, 'external_id': str(tmdb), 'title': title, 'poster_path': poster,
-                    'available': True, 'source': 'seerr', 'tvdb_id': str(media.get('tvdbId') or ''),
+                    'available': True, 'source': 'seerr', 'is4k': not regular, 'tvdb_id': str(media.get('tvdbId') or ''),
                     'jellyfin_id': media.get('jellyfinMediaId') if regular else media.get('jellyfinMediaId4k'),
                     'subtitle': MEDIA_STATUS.get(media.get('status' if regular else 'status4k'), 'Unknown') + ('' if regular else ' · 4K')})
             if len(batch) < 50:
@@ -166,23 +240,68 @@ class MediaService:
             raise
 
     async def run(self, discord_id, operation, *args):
+        return await self._run(discord_id, operation, args)
+
+    async def browse(self, discord_id, operation, *args):
+        if operation not in ('dashboard', 'library', 'requests', 'search', 'discover', 'storage', 'watches', 'deletions', 'account'):
+            raise UserError('Invalid browsing destination.')
+        return await self._run(discord_id, operation, args, include_viewer=True)
+
+    async def _run(self, discord_id, operation, args, include_viewer=False):
+        if operation in WATCHLIST_OPERATIONS:
+            account = self.account(discord_id)
+            lock = self.watchlist_locks.setdefault(str(discord_id), asyncio.Lock())
+            async with lock:
+                return await self.offload(self._authorized, account, operation, args, include_viewer)
+        if operation in QUICK_READ_OPERATIONS:
+            # Read-only, independently authenticated upstream calls need neither
+            # the snapshot-writer lock nor a refresh of unrelated integrations.
+            account = self.account(discord_id)
+            return await self.offload(self._authorized, account, operation, args, include_viewer)
         async with self.lock:
             account = self.account(discord_id)
-            await self.offload(self._refresh)
-            return await self.offload(self._authorized, account, operation, args)
+            await self.offload(self.verify_identity, discord_id)
+            if operation not in LIVE_OPERATIONS and operation not in ('watches', 'deletions'):
+                await self.offload(self._refresh)
+            return await self.offload(self._authorized, account, operation, args, include_viewer)
 
-    def _authorized(self, account, operation, args):
+    def _authorized(self, account, operation, args, include_viewer=False):
         with self.as_user(account) as (api, user):
             try:
-                return getattr(self, '_op_' + operation)(account, api, user, *args)
+                result = getattr(self, '_op_' + operation)(account, api, user, *args)
+                if include_viewer:
+                    viewer = {'account': self.account(account['discord_id']), 'devices': list(self.devices()),
+                        'is_admin': int(account['discord_id']) in self.config.admin_ids or
+                            self.config.seerr_admins and (user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)),
+                        'refresh_interval': self.config.activity_refresh_interval, 'sync_interval': self.config.sync_interval}
+                    return {'viewer': viewer, 'result': result, 'meta': self.store.meta()}
+                return result
             except UserError:
                 raise
             except Exception:
                 raise UserError('The service rejected the operation or could not be reached. Refresh and try again; contact an administrator if it persists.') from None
 
-    def link_authenticated(self, discord_id, client):
+    def validate_browse(self, discord_id, all_requests=False, snapshot=True):
+        """Revalidate access to an already-open gallery, not its entire upstream catalog."""
+        account = self.account(discord_id)
+        with self.as_user(account) as (_api, user):
+            if all_requests and not int(user.get('permissions', 0)) & (2 | 16 | 16384):
+                raise UserError('Browsing all requests requires Seerr REQUEST_VIEW or MANAGE_REQUESTS permission.')
+        meta = self.store.meta()
+        if snapshot and meta.get('error'):
+            raise UserError('Live refresh failed. Refresh the gallery after services recover.')
+
+    def _op_account(self, account, api, user):
+        return None
+
+    def _op_seerr_link(self, account, api, user):
+        return self.config.seerr_url
+
+    def link_authenticated(self, discord_id, client, credential):
         """Bind Discord only after native Quick Connect authenticated a cookie session."""
         user = client.get_current_user()
+        if identity(user.get('jellyfinUserId')) != identity(credential['user_id']):
+            raise VerificationRequired('The approved identity did not match. Run /link again.')
         uid = int(user['id'])
         with self.store.connect() as db:
             conflict = db.execute('SELECT discord_id FROM accounts WHERE seerr_id=? AND discord_id!=?', (uid, str(discord_id))).fetchone()
@@ -191,6 +310,14 @@ class MediaService:
         previous = self.store.account(discord_id)
         if previous and previous['seerr_id'] != uid:
             raise UserError('This Discord account is already linked to a different Seerr account. Resolve the existing mapping before relinking.')
+        bound = self.store.bound_identity(discord_id)
+        if bound and (identity(bound['user_id']) != identity(credential['user_id']) or bound['server_id'] != credential['server_id']):
+            raise VerificationRequired('This Discord account is bound to a different identity.')
+        with self.store.connect() as db:
+            conflict = db.execute('SELECT discord_id FROM jellyfin_identities WHERE user_id=? AND server_id=? AND discord_id!=?',
+                (credential['user_id'], credential['server_id'], str(discord_id))).fetchone()
+        if conflict:
+            raise VerificationRequired('This identity is already bound to another Discord account.')
         settings = client.get_notification_settings(uid)
         ids = settings.get('discordIds') or []
         if any(str(value) != str(discord_id) for value in ids):
@@ -205,7 +332,7 @@ class MediaService:
         if str(discord_id) not in (verified.get('discordIds') or []):
             raise UserError('Seerr did not save the Discord ID. Upgrade Seerr to a version supporting discordIds.')
         name = user.get('displayName') or user.get('jellyfinUsername') or user.get('username') or f'Seerr user {uid}'
-        self.store.link(discord_id, uid, name)
+        self.store.link(discord_id, uid, name, credential)
         return name
 
     def _op_dashboard(self, account, api, user):
@@ -263,6 +390,10 @@ class MediaService:
                 raise UserError(f'{source.title()} is not configured.')
             return [arr_item(source, row) for row in self.arr[source].search(query)]
         data = api.search(query, page=page)
+        return self._seerr_results(data, kind)
+
+    @staticmethod
+    def _seerr_results(data, kind):
         return [{'kind': row['mediaType'], 'external_id': str(row['id']),
                  'title': row.get('title') or row.get('name') or 'Untitled',
                  'overview': row.get('overview') or '', 'poster_path': row.get('posterPath'),
@@ -271,6 +402,42 @@ class MediaService:
                  'jellyfin_id': (row.get('mediaInfo') or {}).get('jellyfinMediaId'),
                  'subtitle': (row.get('releaseDate') or row.get('firstAirDate') or '')[:4]}
                 for row in data['results'] if row.get('mediaType') == kind]
+
+    def _op_discover(self, account, api, user, kind='movie', page=1):
+        if kind not in ('movie', 'tv') or not 1 <= page <= 500:
+            raise UserError('Choose movies or series to discover popular titles.')
+        data = api._request('GET', '/discover/movies' if kind == 'movie' else '/discover/tv',
+            params={'page': page, 'sortBy': 'popularity.desc'})
+        return self._seerr_results(data, kind)
+
+    def _op_details(self, account, api, user, item):
+        kind, source = item['kind'], (item.get('source') or '').split(':')[0]
+        if kind in ('movie', 'tv') and source != 'sonarr':
+            details = api.get_movie_details(int(item['external_id'])) if kind == 'movie' else api.get_tv_details(int(item['external_id']))
+            info = details.get('mediaInfo') or {}
+            # Request rows keep their own edition/ownership fields; action methods
+            # still recheck permissions, ownership and availability immediately.
+            return {**item, 'title': details.get('title') or details.get('name') or 'Untitled',
+                'overview': details.get('overview') or '', 'poster_path': details.get('posterPath'),
+                'available': info.get('status4k' if item.get('is4k') else 'status') in (4, 5),
+                'requestable': info.get('status') not in (2, 3, 4, 5)}
+        if kind in ('music', 'book'):
+            matches = self._op_search(account, api, user, kind, item['title'])
+            fresh = next((row for row in matches if row['external_id'] == item['external_id']), None)
+        elif kind == 'tv' and source == 'sonarr':
+            # Sonarr uses TVDB identities, not Seerr's TMDB IDs. Refresh only the
+            # selected instance's series metadata, never its disks or other libraries.
+            name = item['source']
+            configs = discover_arr(self.api) if self.config.seerr_discovery else self.config.arr
+            if name not in configs or configs[name].name != 'sonarr':
+                raise UserError('This series source is no longer configured. Refresh the library.')
+            rows = ArrClient(configs[name], self.config.timeout).request('GET', 'series')
+            fresh = next((arr_item(name, row) for row in rows if external_id(name, row) == item['external_id']), None)
+        else:
+            fresh = None
+        if not fresh:
+            raise UserError('This item could not be verified live. Search again or refresh the library.')
+        return {**item, **fresh}
 
     def _op_request(self, account, api, user, item):
         kind, eid = item['kind'], item['external_id']
@@ -328,6 +495,8 @@ class MediaService:
     def _op_watch(self, account, api, user, item, remove=False):
         if item['kind'] == 'tv' and (item.get('source') or '').split(':')[0] == 'sonarr':
             raise UserError('Search this series through Seerr to follow its TMDB identity.')
+        if item['kind'] in ('movie', 'tv'):
+            self.watchlists.bind(account)
         if not remove:
             kind, eid = item['kind'], item['external_id']
             if kind in ('movie', 'tv'):
@@ -339,48 +508,96 @@ class MediaService:
                 if not item:
                     raise UserError('This item could not be verified. Search again.')
         self.store.watch(account['discord_id'], item['kind'], item['external_id'], item['title'], remove)
+        if item['kind'] in ('movie', 'tv'):
+            try:
+                self._op_sync_watchlist(account, api, user)
+            except (VerificationRequired, VerificationUnavailable):
+                raise
+            except Exception:
+                return 'Watchlist change saved. Seerr sync is pending and will retry automatically; no media was requested or deleted.'
         return 'Removed from watchlist.' if remove else 'Added to your watchlist. Enable notifications to receive DMs.'
 
     def _op_open(self, account, api, user, item):
-        if item['kind'] not in ('movie', 'tv') or (item.get('source') or '').split(':')[0] == 'sonarr':
+        if item['kind'] not in ('movie', 'tv'):
             raise UserError('This item does not have a Seerr/Jellyfin link.')
-        details = api.get_movie_details(int(item['external_id'])) if item['kind'] == 'movie' else api.get_tv_details(int(item['external_id']))
-        info = details.get('mediaInfo') or {}
-        regular = info.get('status') in (4, 5)
-        if not regular and info.get('status4k') not in (4, 5):
-            raise UserError('This item is no longer available.')
-        url = self.jellyfin_link(account, {'jellyfin_id': info.get('jellyfinMediaId' if regular else 'jellyfinMediaId4k')})
+        sonarr = (item.get('source') or '').split(':')[0] == 'sonarr'
+        provider = 'Tvdb' if sonarr else 'Tmdb'
+        info = {}
+        if not sonarr:
+            details = api.get_movie_details(int(item['external_id'])) if item['kind'] == 'movie' else api.get_tv_details(int(item['external_id']))
+            info = details.get('mediaInfo') or {}
+        regular = not item.get('is4k') and info.get('status') in (4, 5)
+        candidate = info.get('jellyfinMediaId' if regular else 'jellyfinMediaId4k')
+        credential = self.store.credential(account['discord_id'])
+        jellyfin = JellyfinClient(credential['url'], credential['device_id'], self.config.timeout, credential['token'])
+        try:
+            matches = jellyfin.request('GET', '/Items', params={'UserId': credential['user_id'], 'Recursive': 'true',
+                'IncludeItemTypes': 'Movie' if item['kind'] == 'movie' else 'Series',
+                'AnyProviderIdEquals': provider + '.' + str(item['external_id']), 'Fields': 'ProviderIds', 'Limit': 20})
+        except VerificationRequired:
+            self.store.revoke_credential(account['discord_id'], credential['token'])
+            raise
+        rows = [row for row in matches['Items'] if
+            str((row.get('ProviderIds') or {}).get(provider)) == str(item['external_id']) and row.get('Id')]
+        selected = next((row for row in rows if candidate and identity(row['Id']) == identity(candidate)), None)
+        if not selected and len(rows) == 1 and int(matches.get('TotalRecordCount', 1)) == 1:
+            selected = rows[0]
+        if not selected:
+            raise UserError('No unique accessible item was found. Ask an operator to refresh availability.')
+        url = self.jellyfin_link(account, {'jellyfin_id': identity(selected['Id'])})
         if not url:
-            raise UserError('No Jellyfin ID or configured device link is available for this item.')
+            raise UserError('The browser destination is unavailable. Ask an operator to check configuration.')
         return url
 
     def _op_watches(self, account, api, user):
-        return [dict(w, available=False, subtitle='Followed') for w in self.store.watches(account['discord_id'])]
+        self._op_sync_watchlist(account, api, user)
+        return self._gallery_posters([dict(w, available=False, subtitle='Followed') for w in self.store.watches(account['discord_id'])])
 
     async def watches(self, discord_id):
-        account = self.account(discord_id)
-        return [dict(w, available=False, subtitle='Followed') for w in self.store.watches(account['discord_id'])]
+        return await self.run(discord_id, 'watches')
+
+    def _gallery_posters(self, items):
+        # Fixed artwork only, not cached availability/permissions. Renderers accept
+        # strictly validated TMDB paths and never upstream private image URLs.
+        with self.store.connect() as db:
+            for item in items:
+                if item['kind'] not in ('movie', 'tv') or item.get('poster_path'):
+                    continue
+                tmdb = json.loads(item['payload']).get('tmdb_id') if item.get('action') == 'delete' else item['external_id']
+                row = db.execute('SELECT poster_path FROM media_details WHERE type=? AND tmdb_id=? LIMIT 1', (item['kind'], tmdb)).fetchone()
+                if row:
+                    item['poster_path'] = row['poster_path']
+        return items
 
     async def unwatch(self, discord_id, item):
-        account = self.account(discord_id)
-        self.store.watch(account['discord_id'], item['kind'], item['external_id'], item.get('title', ''), remove=True)
-        return 'Unfollowed.'
+        return await self.run(discord_id, 'watch', item, True)
 
     def _op_import_watchlist(self, account, api, user):
-        page, total = 1, 0
-        while True:
-            data = api._request('GET', '/discover/watchlist', params={'page': page})
-            for row in data['results']:
-                kind = row.get('type') or row.get('mediaType')
-                if kind in ('movie', 'tv') and row.get('tmdbId'):
-                    self.store.watch(account['discord_id'], kind, row['tmdbId'], row.get('title') or 'Untitled')
-                    total += 1
-            if page >= data.get('totalPages', 1):
-                return f'Imported {total} Seerr watchlist items. Repeat after changing your Seerr watchlist.'
-            page += 1
+        # Backward-compatible operation for existing clients; it now reconciles.
+        return self._op_sync_watchlist(account, api, user)
+
+    def _op_sync_watchlist(self, account, api, user):
+        def before_write():
+            with self.as_user(account):
+                pass  # Recheck Jellyfin and the live Seerr/Discord binding before writes.
+        return self.watchlists.sync(account, api, before_write)
+
+    async def sync_watchlists(self):
+        # Not tied to DM opt-in or a successful global library/storage refresh.
+        # Isolate users: an outage/revoked link must not erase state or stop others.
+        with self.store.connect() as db:
+            users = [r['discord_id'] for r in db.execute('SELECT discord_id FROM accounts ORDER BY discord_id')]
+        slots = asyncio.Semaphore(4)
+        async def sync_user(uid):
+            try:
+                async with slots:
+                    await self.run(uid, 'sync_watchlist')
+            except Exception:
+                log.warning('A linked watchlist could not sync; saved entries and pending changes preserved')
+        await asyncio.gather(*(sync_user(uid) for uid in users))
 
     def _op_preferences(self, account, api, user, opted_in=None, device=None):
-        if device is not None and device not in self.config.devices:
+        if device is not None and device not in self.devices():
             raise UserError('This device is not configured.')
         self.store.preference(account['discord_id'], opted_in=opted_in, device=device)
         return 'Preferences saved.'
@@ -402,10 +619,14 @@ class MediaService:
         return f'File deletion #{action_id} is scheduled for <t:{int(deadline)}:F> (24 hours). Use /deletions to undo it before execution. Seerr request history will be kept.'
 
     async def deletions(self, discord_id):
-        account = self.account(discord_id)
+        account = await self.verified_account(discord_id)
+        return self._op_deletions(account, None, None)
+
+    def _op_deletions(self, account, api, user):
         with self.store.connect() as db:
             rows = db.execute("SELECT * FROM actions WHERE discord_id=? AND action='delete' ORDER BY id DESC", (account['discord_id'],)).fetchall()
-            return [dict(r, available=False, subtitle=f"#{r['id']} · {r['status']} · {'4K' if json.loads(r['payload'])['is4k'] else 'Standard'}") for r in rows]
+            items = [dict(r, available=False, subtitle=f"#{r['id']} · {r['status']} · {'4K' if json.loads(r['payload'])['is4k'] else 'Standard'}") for r in rows]
+        return self._gallery_posters(items)
 
     async def cancel_deletion(self, discord_id, action_id):
         # Local atomic undo remains available even if upstream services are offline.
@@ -483,12 +704,15 @@ class MediaService:
             db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error', ?)", (reason,))
 
     def jellyfin_link(self, account, item):
-        device = account.get('device') or next(iter(self.config.devices), None)
-        base = self.config.devices.get(device)
+        settings = self.jellyfin_settings()
+        devices = {'Browser': settings.external_url, **self.config.devices}
+        device = account.get('device') or next(iter(devices), None)
+        base = devices.get(device) or devices.get('Browser')
         item_id = item.get('jellyfin_id')
         if not base or not item_id:
             return None
-        return f"{base.rstrip('/')}/web/index.html#!/details?id={quote(str(item_id), safe='')}"
+        return (f"{base.rstrip('/')}/web/index.html#!/details?id={quote(str(item_id), safe='')}"
+            f"&serverId={quote(settings.server_id, safe='')}")
 
     def _observe(self, db, snapshots, watched):
         states = {}

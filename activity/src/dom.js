@@ -14,7 +14,8 @@ export function formatBytes(value = 0) {
 }
 
 export function reference(item) {
-  return { kind: item.kind, external_id: item.external_id, title: item.title.slice(0, 100), source: item.source };
+  return { kind: item.kind, external_id: item.external_id, title: item.title.slice(0, 100), source: item.source,
+    ...(typeof item.is4k === 'boolean' ? { is4k: item.is4k } : {}) };
 }
 
 export function identity(item) {
