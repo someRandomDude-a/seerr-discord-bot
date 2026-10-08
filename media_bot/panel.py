@@ -8,7 +8,7 @@ import secrets
 import time
 from functools import partial
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 import requests
 from aiohttp import web
@@ -19,6 +19,7 @@ from .config import ArrConfig, Config, http_url, integer
 from .discovery import discover_arr
 from .security import RateLimiter, UserError
 from .settings import SECRET_KEYS, load_settings, save_settings, settings_path
+from .chat import FILE_LIMIT, fetch_asset, image_type
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = Path(__file__).resolve().parent / 'panel_assets'
@@ -56,6 +57,10 @@ class ControlPanel:
         self.changed = asyncio.Event()
         self.operation_lock = asyncio.Lock()
         self.runtime_error = ''
+        self.media_slots = asyncio.Semaphore(4)
+        self.media_limiter = RateLimiter(120, 60)
+        self.upload_limiter = RateLimiter(10, 60)
+        self.admin_limiter = RateLimiter(240, 60)
 
     @web.middleware
     async def guard(self, request, handler):
@@ -69,8 +74,10 @@ class ControlPanel:
             if not private:
                 raise web.HTTPForbidden(reason='Use a local/private IP address for the admin panel')
             if request.method == 'POST':
-                if request.content_type != 'application/json':
+                if request.content_type != ('multipart/form-data' if request.path == '/api/admin/uploads' else 'application/json'):
                     raise web.HTTPUnsupportedMediaType()
+                if request.path != '/api/admin/uploads' and request.content_length and request.content_length > 128 * 1024:
+                    raise web.HTTPRequestEntityTooLarge(max_size=128 * 1024, actual_size=request.content_length)
                 if request.headers.get('Origin') != 'http://' + request.host:
                     raise web.HTTPForbidden(reason='Same-origin requests required')
             if request.path.startswith('/api/') and request.path != '/api/login':
@@ -86,7 +93,9 @@ class ControlPanel:
             response = web.json_response({'error': 'Verification failed. Check connectivity and credentials; no success was confirmed.'}, status=400)
         response.headers.update({'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
             'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
-            'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"})
+            'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"})
+        if request.path.startswith(('/api/admin/media/', '/api/admin/files/')):
+            response.headers['Content-Security-Policy'] = "sandbox; default-src 'none'; frame-ancestors 'none'"
         return response
 
     def session(self, request):
@@ -343,6 +352,7 @@ class ControlPanel:
 
     async def admin_action(self, request):
         self.session(request)  # Local code grants operator authority; never infer it from a browser actor ID.
+        self.admin_limiter.check(request.cookies.get('panel_session'))
         bot = self.bot
         if not bot or not bot.is_ready():
             raise UserError('Bot is not connected yet')
@@ -362,9 +372,18 @@ class ControlPanel:
             guilds = data.get('guild_ids', [])
             if not isinstance(guilds, list) or len(guilds) > 1000:
                 raise web.HTTPBadRequest()
-            result = await bot.admin.prepare(actor, data.get('message'), [snowflake(g) for g in guilds],
+            result = await bot.admin.prepare(actor, data.get('message', ''), [snowflake(g) for g in guilds],
                 user_id=snowflake(data['user_id']) if data.get('user_id') else None, all_users=data.get('all_users') is True,
-                channel_id=snowflake(data['channel_id']) if data.get('channel_id') else None)
+                channel_id=snowflake(data['channel_id']) if data.get('channel_id') else None, uploads=data.get('uploads', []))
+        elif operation == 'chat':
+            from .activity import snowflake
+            result = {'job': await bot.admin.chat(actor, data.get('message', ''),
+                user_id=snowflake(data['user_id']) if data.get('user_id') else None,
+                guild_id=snowflake(data['guild_id']) if data.get('guild_id') else None,
+                channel_id=snowflake(data['channel_id']) if data.get('channel_id') else None,
+                uploads=data.get('uploads', []), request_id=data.get('request_id'))}
+        elif operation == 'history':
+            result = await bot.service.offload(bot.admin.history, actor, data.get('page', 1))
         elif operation == 'send':
             if data.get('confirmed') is not True:
                 raise UserError('Confirm the preview before sending')
@@ -377,17 +396,115 @@ class ControlPanel:
             raise web.HTTPBadRequest()
         return web.json_response({'result': result})
 
+    def connected_admin(self, request):
+        self.session(request)
+        if not self.bot or not self.bot.is_ready():
+            raise UserError('Bot is not connected yet')
+        return self.bot.admin
+
+    async def upload(self, request):
+        admin = self.connected_admin(request)
+        self.upload_limiter.check(request.cookies.get('panel_session'))
+        reader = await request.multipart()
+        part = await reader.next()
+        if not part or part.name != 'file' or not part.filename:
+            raise web.HTTPBadRequest(reason='Attach one file')
+        chunks, size = [], 0
+        while True:
+            chunk = await part.read_chunk(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > FILE_LIMIT:
+                raise UserError('Each file is limited to 8 MiB.')
+            chunks.append(chunk)
+        if await reader.next() is not None:
+            raise UserError('Upload one file per request.')
+        self.session(request)
+        result = await asyncio.to_thread(admin.files.upload, 'local-panel', part.filename, b''.join(chunks))
+        return web.json_response({'result': result})
+
+    async def media(self, request):
+        admin = self.connected_admin(request)
+        self.media_limiter.check(request.cookies.get('panel_session'))
+        if 'file' in request.match_info:
+            with admin.store.connect() as db:
+                row = db.execute('SELECT * FROM admin_files WHERE id=? AND expires>?', (request.match_info['file'], time.time())).fetchone()
+            if not row or row['actor'] != 'local-panel' and row['announcement_id'] is None:
+                raise web.HTTPNotFound()
+            body, filename = row['body'], row['filename']
+        else:
+            with admin.store.connect() as db:
+                row = db.execute('SELECT * FROM inbox WHERE message_id=? AND deleted=0', (request.match_info['message'],)).fetchone()
+            if not row or row['created_at'] < time.time() - admin.config.inbox_retention_days * 86400:
+                raise web.HTTPNotFound()
+            asset = json.loads(row['rich']).get('assets', {}).get(request.match_info['asset'])
+            if not asset:
+                raise web.HTTPNotFound()
+            async with self.media_slots:
+                try:
+                    body = await fetch_asset(asset['url'])
+                except UserError:
+                    # Discord signs attachment URLs. Refresh only this retained
+                    # message's known channel/ID; never fetch a client-supplied URL.
+                    channel = admin.bot.get_channel(int(row['channel_id'])) or await admin.bot.fetch_channel(int(row['channel_id']))
+                    message = await channel.fetch_message(int(row['message_id']))
+                    await admin.edited(message, mark_edited=False)
+                    from .chat import metadata
+                    asset = metadata(message).get('assets', {}).get(request.match_info['asset'])
+                    if not asset:
+                        raise web.HTTPNotFound()
+                    body = await fetch_asset(asset['url'])
+            filename = asset['filename']
+            # A delete/retention prune may arrive while CDN I/O is in flight.
+            with admin.store.connect() as db:
+                retained = db.execute('SELECT 1 FROM inbox WHERE id=? AND deleted=0 AND created_at>?',
+                    (row['id'], time.time() - admin.config.inbox_retention_days * 86400)).fetchone()
+            if not retained:
+                raise web.HTTPNotFound()
+        self.session(request)
+        kind = image_type(body)
+        return web.Response(body=body, content_type=kind, headers={
+            'Content-Disposition': ("inline" if kind.startswith('image/') else 'attachment') + "; filename*=UTF-8''" + quote(filename, safe=''),
+            'Content-Security-Policy': "sandbox; default-src 'none'"})
+
+    async def events(self, request):
+        admin = self.connected_admin(request)
+        queue = admin.subscribe()
+        response = web.StreamResponse(headers={'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff'})
+        try:
+            await response.prepare(request)
+            while self.bot and self.bot.admin is admin and self.bot.is_ready():
+                self.session(request)  # Recheck expiry/host at least every heartbeat.
+                try:
+                    revision = await asyncio.wait_for(queue.get(), timeout=15)
+                    self.session(request)
+                    await response.write(f'event: update\ndata: {{"revision":{revision}}}\n\n'.encode())
+                    await asyncio.sleep(1)  # Coalesce busy channels; at most one browser reload per second.
+                except asyncio.TimeoutError:
+                    await response.write(b': heartbeat\n\n')
+        except (ConnectionError, web.HTTPUnauthorized):
+            pass
+        finally:
+            admin.subscribers.discard(queue)
+        return response
+
     def application(self):
-        app = web.Application(middlewares=[self.guard], client_max_size=128 * 1024)
+        app = web.Application(middlewares=[self.guard], client_max_size=10 * 1024 * 1024)
         app.router.add_post('/api/login', self.login)
         app.router.add_get('/api/state', self.state)
         app.router.add_post('/api/action', self.action)
         app.router.add_post('/api/admin', self.admin_action)
+        app.router.add_post('/api/admin/uploads', self.upload)
+        app.router.add_get('/api/admin/events', self.events)
+        app.router.add_get('/api/admin/files/{file}', self.media)
+        app.router.add_get('/api/admin/media/{message}/{asset}', self.media)
         async def asset(request):
             files = {'/': ASSETS / 'index.html', '/panel.js': ASSETS / 'panel.js',
-                '/panel.css': ASSETS / 'panel.css', '/glass.css': ROOT / 'activity/src/style.css'}
+                '/panel.css': ASSETS / 'panel.css', '/chat.js': ASSETS / 'chat.js', '/messenger.js': ASSETS / 'messenger.js', '/glass.css': ROOT / 'activity/src/style.css'}
             return web.FileResponse(files[request.path])
-        for path in ('/', '/panel.js', '/panel.css', '/glass.css'):
+        for path in ('/', '/panel.js', '/panel.css', '/chat.js', '/messenger.js', '/glass.css'):
             app.router.add_get(path, asset)
         return app
 

@@ -54,6 +54,15 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
         await view.import_watchlist(self.interaction)
         self.bot.service.run.assert_awaited_once_with(42, 'sync_watchlist')
 
+    async def test_native_normal_chat_defaults_to_current_channel_without_announcement_preview(self):
+        self.bot.admin.require_admin = MagicMock()
+        self.bot.admin.chat = AsyncMock(return_value=1)
+        self.interaction.id = 1234567890123456789
+        await self.bot.tree.get_command('chat').callback(self.interaction, 'Normal reply')
+        self.bot.admin.chat.assert_awaited_once_with(42, 'Normal reply', user_id=None,
+            guild_id=555, channel_id=111, uploads=[], request_id='discord-1234567890123456789')
+        self.assertIn('queued', self.interaction.followup.send.await_args.args[0])
+
     async def test_inbox_command_local_filtered_paginated_and_private(self):
         self.bot.admin.inbox = MagicMock(return_value={'messages': [], 'total': 0})
         await self.bot.tree.get_command('inbox').callback(self.interaction, kind='dm', user_id='7', query='film')

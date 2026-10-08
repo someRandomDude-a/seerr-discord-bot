@@ -80,6 +80,50 @@ class SeerrBot(commands.Bot):
     async def on_message(self, message):
         await self.admin.receive(message)
 
+    async def on_raw_message_edit(self, payload):
+        with self.service.store.connect() as db:
+            known = db.execute('SELECT 1 FROM inbox WHERE message_id=? AND channel_id=?', (str(payload.message_id), str(payload.channel_id))).fetchone()
+        if known:
+            try:
+                channel = self.get_channel(payload.channel_id) or await self.fetch_channel(payload.channel_id)
+                await self.admin.edited(await channel.fetch_message(payload.message_id))
+            except discord.HTTPException:
+                pass
+
+    async def on_raw_message_delete(self, payload):
+        self.admin.deleted(payload.message_id, payload.channel_id)
+
+    async def on_raw_bulk_message_delete(self, payload):
+        for mid in payload.message_ids:
+            self.admin.deleted(mid, payload.channel_id)
+
+    async def on_guild_channel_create(self, channel):
+        self.admin.publish()
+
+    async def on_guild_channel_update(self, before, after):
+        self.admin.publish()
+
+    async def on_guild_channel_delete(self, channel):
+        self.admin.publish()
+
+    async def on_thread_create(self, thread):
+        self.admin.publish()
+
+    async def on_thread_update(self, before, after):
+        self.admin.publish()
+
+    async def on_thread_delete(self, thread):
+        self.admin.publish()
+
+    async def on_guild_join(self, guild):
+        self.admin.publish()
+
+    async def on_guild_remove(self, guild):
+        self.admin.publish()
+
+    async def on_guild_update(self, before, after):
+        self.admin.publish()
+
     async def sync_worker(self):
         await self.wait_until_ready()
         while not self.is_closed():
@@ -174,7 +218,7 @@ def register_commands(bot):
     @bot.tree.command(name='announce', description='Operators: message this server, a chosen user/server, or an explicit broadcast')
     async def announce(interaction: discord.Interaction, message: str, server_id: str = None,
                        recipient: discord.User = None, all_servers: bool = False, all_users: bool = False,
-                       server_ids: str = None, channel_id: str = None):
+                       server_ids: str = None, channel_id: str = None, attachment: discord.Attachment = None):
         bot.guard(interaction)
         await interaction.response.defer(ephemeral=True)
         await bot.service.offload(bot.admin.require_admin, interaction.user.id)
@@ -191,11 +235,40 @@ def register_commands(bot):
         guild_ids = selected if selected is not None else [g.id for g in bot.guilds] if all_servers else ([int(server_id)] if server_id else
                       [interaction.guild_id] if interaction.guild_id and not recipient else [])
         preferred = snowflake(channel_id) if channel_id else interaction.channel_id if guild_ids == [interaction.guild_id] and not recipient and not all_servers else None
+        uploads = {}
+        if attachment:
+            from media_bot.chat import FILE_LIMIT
+            if attachment.size > FILE_LIMIT:
+                raise UserError('Attachments are limited to 8 MiB.')
+            uploaded = await bot.service.offload(bot.admin.files.upload, interaction.user.id, attachment.filename, await attachment.read())
+            uploads['uploads'] = [uploaded['id']]
         plan = await bot.admin.prepare(interaction.user.id, message, guild_ids,
-             user_id=recipient.id if recipient else None, all_users=all_users, channel_id=preferred)
+             user_id=recipient.id if recipient else None, all_users=all_users, channel_id=preferred, **uploads)
         from media_bot.ui import AnnouncementConfirmView
         view = AnnouncementConfirmView(bot, interaction.user.id, plan)
         await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='chat', description='Operators: send a normal bot message to one DM or server channel')
+    async def chat(interaction: discord.Interaction, message: str, recipient: discord.User = None,
+                   channel: discord.TextChannel = None, attachment: discord.Attachment = None):
+        bot.guard(interaction)
+        await interaction.response.defer(ephemeral=True)
+        await bot.service.offload(bot.admin.require_admin, interaction.user.id)
+        if recipient and channel:
+            raise UserError('Choose one DM or one server channel, not both.')
+        uploads = []
+        if attachment:
+            from media_bot.chat import FILE_LIMIT
+            if attachment.size > FILE_LIMIT:
+                raise UserError('Attachments are limited to 8 MiB.')
+            uploaded = await bot.service.offload(bot.admin.files.upload, interaction.user.id, attachment.filename, await attachment.read())
+            uploads.append(uploaded['id'])
+        target_user = recipient.id if recipient else interaction.user.id if not interaction.guild_id and not channel else None
+        job = await bot.admin.chat(interaction.user.id, message, user_id=target_user,
+            guild_id=channel.guild.id if channel else interaction.guild_id if target_user is None else None,
+            channel_id=channel.id if channel else interaction.channel_id if target_user is None else None,
+            uploads=uploads, request_id='discord-' + str(interaction.id))
+        await interaction.followup.send(f'Normal message #{job} queued. Check /deliveries or the private panel for its result.', ephemeral=True)
 
     @bot.tree.command(name='inbox', description='Operators: private DMs, bot mentions and replies with filters')
     @app_commands.choices(kind=[app_commands.Choice(name=n, value=v) for n, v in [('All', 'all'), ('DMs', 'dm'), ('Servers', 'guild')]],

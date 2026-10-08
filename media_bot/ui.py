@@ -97,6 +97,8 @@ class AnnouncementConfirmView(OwnedView):
         result.set_footer(text='Operator preview · Private')
         if self.plan.get('message'):
             result.add_field(name='Message', value=clean(self.plan['message'], 1000), inline=False)
+        if self.plan.get('attachments'):
+            result.add_field(name='Files', value='\n'.join(clean(file['filename'], 120) for file in self.plan['attachments']), inline=False)
         if self.plan['destinations']:
             result.add_field(name='Recipients', value='\n'.join(clean(label, 80) for label in self.plan['destinations'])[:1000], inline=False)
         if self.plan['skipped']:

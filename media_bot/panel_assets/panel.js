@@ -1,5 +1,7 @@
+import { mountMessenger } from './messenger.js';
+
 const root = document.querySelector('#app');
-let state, tab = 'setup', inboxPage = 1, selectedChannel = null;
+let state, tab = 'setup', messenger, messengerGeneration = 0;
 const draft = new Map(), clear = new Set();
 const reports = new Map(), profileChoices = new Map();
 const labels = { DISCORD_TOKEN: 'Bot token', ALLOWED_GUILD_IDS: 'Allowed servers', ADMIN_DISCORD_IDS: 'Bot-only admin IDs',
@@ -21,10 +23,17 @@ function node(tag, text, cls) {
   return element;
 }
 async function api(path, data) {
+  const multipart = data instanceof FormData;
   const response = await fetch(path, { method: data ? 'POST' : 'GET', credentials: 'same-origin',
-    headers: data ? { 'Content-Type': 'application/json' } : {}, body: data ? JSON.stringify(data) : undefined });
+    headers: data && !multipart ? { 'Content-Type': 'application/json' } : {}, body: multipart ? data : data ? JSON.stringify(data) : undefined });
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error || 'Not confirmed');
+  if (!response.ok) {
+    if (response.status === 401) {
+      messenger?.dispose(); messengerGeneration += 1; draft.clear(); clear.clear();
+      root.replaceChildren(node('p', 'Panel session expired. Reconnect using a new console access code.', 'notice error'));
+    }
+    throw new Error(body.error || 'Not confirmed');
+  }
   return body;
 }
 function error(message) {
@@ -100,6 +109,7 @@ function shell() {
   if (Object.keys(state.webhook_tests || {}).length) root.append(node('p', 'Receiver tests: ' + Object.entries(state.webhook_tests).map(([source, time]) => `${source} ${new Date(time * 1000).toLocaleTimeString()}`).join(' · '), 'fine'));
 }
 function render() {
+  messenger?.dispose(); messenger = null; messengerGeneration += 1;
   shell();
   if (tab === 'messages') { root.append(node('div', 'Loading messages…', 'loading')); return; }
   if (tab === 'help') { renderHelp(); return; }
@@ -164,86 +174,12 @@ function renderHelp() {
   root.append(section);
 }
 async function loadMessages() {
-  selectedChannel = null;
-  const [admin, inbox] = await Promise.all([api('/api/admin', { operation: 'state' }), api('/api/admin', { operation: 'inbox', ...inboxFilters() })]);
-  shell();
-  const grid = node('div', undefined, 'panel-grid');
-  const composer = node('section', undefined, 'setting'); composer.append(node('h2', 'Send'));
-  const message = node('textarea', undefined, 'panel-draft'); message.maxLength = 2000; message.placeholder = 'Message…'; composer.append(message);
-  const user = node('input'); user.placeholder = 'User ID · optional DM'; user.id = 'recipient'; user.addEventListener('input', () => { selectedChannel = null; }); composer.append(user);
-  const recipients = node('div', undefined, 'panel-recipients');
-  for (const guild of admin.result.guilds) {
-    const label = node('label'); const check = node('input'); check.type = 'checkbox'; check.value = guild.id;
-    check.addEventListener('change', () => { selectedChannel = null; });
-    label.append(check, node('span', guild.name + (guild.channel ? ' · #' + guild.channel : ' · no channel'))); recipients.append(label);
-  }
-  composer.append(recipients);
-  composer.append(button('Select all servers', () => { selectedChannel = null; for (const check of recipients.querySelectorAll('input')) check.checked = true; }));
-  const allLabel = node('label', undefined, 'check-row'); const all = node('input'); all.type = 'checkbox'; all.disabled = !admin.result.all_users_enabled;
-  allLabel.append(all, node('span', 'Also DM all members')); composer.append(allLabel);
-  composer.append(button('Preview', async () => {
-    const plan = (await api('/api/admin', { operation: 'prepare', message: message.value,
-      guild_ids: [...recipients.querySelectorAll('input:checked')].map(check => check.value), user_id: user.value.trim() || null,
-      channel_id: selectedChannel, all_users: all.checked })).result;
-    const dialog = node('dialog', undefined, 'confirm-dialog'); dialog.append(node('h2', 'Send?'), node('p', `${plan.channels} channels · ${plan.users} DMs\n${plan.destinations.join('\n')}\n${plan.skipped.length} unavailable\n\n${plan.message}\n\nMentions disabled.`));
-    const close = () => { dialog.close(); dialog.remove(); };
-    dialog.append(button('Cancel', close), button('Confirm', async () => { await api('/api/admin', { operation: 'send', plan: plan.plan, confirmed: true }); close(); await loadMessages(); }, 'button primary')); root.append(dialog); dialog.showModal();
-  }, 'button primary full'));
-  for (const job of admin.result.jobs) composer.append(button(`#${job.id} · ${job.sent} sent · ${job.pending} pending · ${job.failed} blocked · ${job.uncertain} unconfirmed`, () => showDeliveries(job.id), 'button subtle full'));
-  const received = node('section', undefined, 'setting'); received.append(node('h2', 'Inbox'));
-  const form = inboxForm(); received.append(form);
-  const threads = node('div', undefined, 'panel-tabs');
-  for (const kind of ['dm', 'guild']) {
-    threads.append(node('span', kind === 'dm' ? 'DMs' : 'Servers', 'fine'));
-    for (const thread of admin.result.threads.filter(t => t.kind === kind)) threads.append(button(`${thread.name} · ${thread.count}`, async () => {
-      filters.kind = kind; filters.guild_id = kind === 'guild' ? thread.id : null; filters.user_id = kind === 'dm' ? thread.id : null; filters.channel_id = null; inboxPage = 1; await loadMessages();
-    }, 'button subtle'));
-  }
-  received.append(threads);
-  const list = node('div', undefined, 'panel-messages');
-  for (const item of inbox.result.messages) {
-    const card = node('article', undefined, 'received-message');
-    card.append(node('strong', item.author_name), node('p', `${item.guild_name || 'DM'}${item.guild_id ? ' / #' + item.channel_name : ''} · ${new Date(item.created_at * 1000).toLocaleString()} · user ${item.author_id}`, 'fine'), node('p', item.content || 'No text', 'received-content'));
-    if (item.attachment_count) card.append(node('span', `${item.attachment_count} attachments`, 'fine'));
-    card.append(button('Reply', () => {
-      for (const check of recipients.querySelectorAll('input')) check.checked = check.value === item.guild_id;
-      user.value = item.guild_id ? '' : item.author_id; selectedChannel = item.guild_id ? item.channel_id : null; all.checked = false; message.focus();
-    })); list.append(card);
-  }
-  if (!inbox.result.messages.length) list.append(node('p', 'No messages', 'empty'));
-  received.append(list);
-  const controls = node('div', undefined, 'panel-actions');
-  const previous = button('←', async () => { inboxPage = Math.max(1, inboxPage - 1); await loadMessages(); }); previous.disabled = inboxPage === 1;
-  const next = button('→', async () => { inboxPage += 1; await loadMessages(); }); next.disabled = inboxPage * 50 >= inbox.result.total;
-  controls.append(previous, node('span', `${inboxPage} · ${inbox.result.total} messages`, 'fine'), next, button('Refresh', loadMessages)); received.append(controls);
-  grid.append(composer, received); root.append(grid);
-}
-const filters = { kind: 'all', guild_id: null, user_id: null, channel_id: null, query: '', order: 'newest' };
-async function showDeliveries(job) {
-  let page = 1;
-  const dialog = node('dialog', undefined, 'confirm-dialog'); root.append(dialog);
-  async function load() {
-    const { result } = await api('/api/admin', { operation: 'deliveries', job, page });
-    dialog.replaceChildren(node('h2', `Delivery #${job}`), node('p', result.announcement.content));
-    for (const row of result.rows) dialog.append(node('p', `${row.label} · ${row.status}\n${row.error || ''}`, 'panel-report'));
-    const previous = button('←', async () => { page -= 1; await load(); }); previous.disabled = page === 1;
-    const next = button('→', async () => { page += 1; await load(); }); next.disabled = page * 5 >= result.total;
-    dialog.append(previous, node('span', ` ${page} · ${result.total} recipients `, 'fine'), next,
-      button('Refresh', load), button('Close', () => { dialog.close(); dialog.remove(); }));
-  }
-  try { await load(); dialog.showModal(); } catch (exc) { dialog.remove(); throw exc; }
-}
-function inboxFilters() { return { ...filters, page: inboxPage }; }
-function inboxForm() {
-  const form = node('form', undefined, 'panel-inbox-tools');
-  for (const [key, label] of [['kind', 'Kind'], ['guild_id', 'Server ID'], ['channel_id', 'Channel ID'], ['user_id', 'Sender ID'], ['query', 'Search text'], ['order', 'Order']]) {
-    const input = key === 'kind' || key === 'order' ? node('select') : node('input'); input.name = key; input.placeholder = label; input.setAttribute('aria-label', label);
-    if (input.tagName === 'SELECT') for (const value of key === 'kind' ? ['all', 'dm', 'guild'] : ['newest', 'oldest']) { const option = node('option', value); option.value = value; input.append(option); }
-    input.value = filters[key] || ''; form.append(input);
-  }
-  const submit = node('button', 'Filter', 'button'); submit.type = 'submit'; form.append(submit);
-  form.addEventListener('submit', async event => { event.preventDefault(); for (const [key, value] of new FormData(form)) filters[key] = ['guild_id', 'channel_id', 'user_id'].includes(key) ? value || null : value; inboxPage = 1; try { await loadMessages(); } catch (exc) { error(exc.message); } });
-  return form;
+  const version = ++messengerGeneration;
+  root.querySelector('.loading')?.remove();
+  const host = node('div'); root.append(host);
+  const mounted = await mountMessenger(host, api, error);
+  if (version !== messengerGeneration || tab !== 'messages') mounted.dispose();
+  else messenger = mounted;
 }
 document.querySelector('#login').addEventListener('submit', async event => {
   event.preventDefault();

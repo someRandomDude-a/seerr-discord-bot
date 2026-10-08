@@ -79,10 +79,28 @@ class Store:
                     message_id TEXT, error TEXT,
                     UNIQUE(announcement_id, kind, target_id)
                 );
+                CREATE TABLE IF NOT EXISTS admin_files (
+                    id TEXT PRIMARY KEY, actor TEXT NOT NULL, filename TEXT NOT NULL,
+                    content_type TEXT NOT NULL, body BLOB NOT NULL, expires REAL NOT NULL,
+                    announcement_id INTEGER
+                );
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(actions)')}
             if 'execute_after' not in columns:
                 db.execute('ALTER TABLE actions ADD COLUMN execute_after REAL')
+            for table, additions in {
+                'inbox': {'direction': "TEXT NOT NULL DEFAULT 'in'", 'peer_id': 'TEXT', 'peer_name': 'TEXT',
+                    'rich': "TEXT NOT NULL DEFAULT '{}'", 'deleted': 'INTEGER NOT NULL DEFAULT 0',
+                    'edited_at': 'REAL', 'delivery_id': 'INTEGER', 'status': "TEXT NOT NULL DEFAULT 'received'"},
+                'announcements': {'mode': "TEXT NOT NULL DEFAULT 'announcement'", 'uploads': "TEXT NOT NULL DEFAULT '[]'",
+                    'request_id': 'TEXT', 'fingerprint': 'TEXT'},
+            }.items():
+                existing = {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}
+                for name, definition in additions.items():
+                    if name not in existing:
+                        db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS admin_request ON announcements(actor_id,request_id) WHERE request_id IS NOT NULL')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS inbox_delivery ON inbox(delivery_id) WHERE delivery_id IS NOT NULL')
 
     @contextmanager
     def connect(self):

@@ -14,7 +14,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from bot import SeerrBot
 from media_bot.activity import ActivityAPI
 from media_bot.config import Config
-from media_bot.jellyfin import JellyfinConfig, discover_jellyfin
+from media_bot.jellyfin import JellyfinClient, JellyfinConfig, discover_jellyfin
+from media_bot.linking import QuickConnect
 from media_bot.security import RateLimiter, VerificationRequired, VerificationUnavailable
 from media_bot.service import MediaService
 from media_bot.ui import DetailView, ItemsView
@@ -177,9 +178,72 @@ class IdentityTests(unittest.IsolatedAsyncioTestCase):
             restarted.api.close()
         call = self.http.call_args
         self.assertEqual(call.args, ('GET', 'http://jellyfin:8096/Users/Me'))
-        self.assertEqual(call.kwargs['headers']['X-Emby-Token'], 'PRIVATE-USER-TOKEN')
+        self.assertIn('Token="PRIVATE-USER-TOKEN"', call.kwargs['headers']['Authorization'])
+        self.assertNotIn('X-Emby-Token', call.kwargs['headers'])
         self.assertNotIn('admin-key', str(call))
         self.assertFalse(call.kwargs['allow_redirects'])
+
+    async def test_quick_connect_links_and_survives_restart_without_legacy_token_headers(self):
+        user_api = MagicMock()
+        user_api.get_current_user.return_value = {'id': 7, 'jellyfinUserId': USER_ID, 'displayName': 'Viewer'}
+        user_api.get_notification_settings.side_effect = [{'discordIds': []}, {'discordIds': ['42']}]
+        calls = []
+
+        def jellyfin(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            response = MagicMock(status_code=200)
+            if url.endswith('/QuickConnect/Initiate'):
+                response.json.return_value = {'Code': '123456', 'Secret': 'a' * 32}
+            elif url.endswith('/QuickConnect/Connect'):
+                response.json.return_value = {'Authenticated': True}
+            elif url.endswith('/Users/AuthenticateWithQuickConnect'):
+                response.json.return_value = {'AccessToken': 'PRIVATE-USER-TOKEN', 'User': {'Id': USER_ID}}
+            elif url.endswith('/Users/Me'):
+                # Reproduce Jellyfin 10.11 with EnableLegacyAuthorization=false:
+                # X-Emby-Token alone is ignored even immediately after approval.
+                if 'Token="PRIVATE-USER-TOKEN"' not in kwargs['headers'].get('Authorization', ''):
+                    response.status_code = 401
+                response.json.return_value = {'Id': USER_ID, 'ServerId': SERVER_ID, 'Policy': {}}
+            else:
+                self.fail('Unexpected Jellyfin endpoint')
+            return response
+
+        self.http.side_effect = jellyfin
+        manager = QuickConnect(self.service)
+        try:
+            with patch('media_bot.linking.SeerrAPI', return_value=user_api):
+                session = await manager.begin(42)
+                self.assertEqual(await manager.check(session), 'Viewer')
+            self.assertEqual(session.state, 'linked')
+            user_api._request.assert_called_once_with('POST', '/auth/jellyfin/quickconnect/authenticate', {'secret': 'a' * 32})
+            user_api.logout_user.assert_not_called()
+            await manager.close()
+            restarted = MediaService(self.config)
+            try:
+                self.assertEqual(restarted.verify_identity(42)['seerr_id'], 7)
+            finally:
+                restarted.api.close()
+            for _, _, kwargs in calls:
+                self.assertNotIn('admin-key', str(kwargs))
+                self.assertNotIn('X-Emby-Token', kwargs['headers'])
+                self.assertFalse(kwargs['allow_redirects'])
+        finally:
+            await manager.close()
+
+    async def test_native_authorization_escapes_token_and_device_values_without_query_credentials(self):
+        from urllib.parse import unquote
+        token = 'token",Injected="value+\r\n'
+        client = JellyfinClient('http://jellyfin:8096', 'device",Injected="value', token=token)
+        client.me()
+        call = self.http.call_args
+        authorization = call.kwargs['headers']['Authorization']
+        self.assertNotIn('Injected="', authorization)
+        self.assertNotIn('\r', authorization)
+        self.assertNotIn('\n', authorization)
+        self.assertNotIn('X-Emby-Token', call.kwargs['headers'])
+        self.assertEqual(unquote(authorization.split(', Token="', 1)[1][:-1]), token)
+        self.assertEqual(call.args[1], 'http://jellyfin:8096/Users/Me')
+        self.assertNotIn('params', call.kwargs)
 
     async def test_rejected_token_requires_reverification_but_keeps_permanent_binding(self):
         for status in (400, 401, 403, 404):

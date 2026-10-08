@@ -197,6 +197,90 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(UserError):
                 snowflake(value)
 
+    async def test_normal_chat_is_single_target_deduplicated_and_kept_in_the_dm_conversation(self):
+        await self.admin.receive(self.message(content='Incoming'))
+        job = await self.admin.chat(42, 'Reply', user_id=7, request_id='chat-request-000001')
+        self.assertEqual(await self.admin.chat(42, 'Reply', user_id=7, request_id='chat-request-000001'), job)
+        with self.assertRaises(UserError):
+            await self.admin.chat(42, 'Different reply', user_id=7, request_id='chat-request-000001')
+        rows = self.admin.inbox(42, kind='dm', user_id='7')['messages']
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r['direction'] for r in rows}, {'in', 'out'})
+        self.assertEqual(self.admin.history(42)['jobs'], [])
+        self.assertEqual(self.admin.state(42)['threads'][0]['id'], '7')
+        self.bot.is_closed.side_effect = [False, True]
+        await self.admin.deliver()
+        self.user.send.assert_awaited_once()
+        self.assertEqual(self.admin.inbox(42, user_id='7')['messages'][0]['status'], 'sent')
+
+    async def test_normal_chat_requires_explicit_channel_and_cannot_broadcast(self):
+        for kwargs in ({'guild_ids': [555]}, {'guild_ids': [555, 556]}, {'guild_ids': [555], 'all_users': True, 'channel_id': 111}):
+            with self.assertRaises(UserError):
+                await self.admin.prepare(42, 'Hello', mode='normal', **kwargs)
+        await self.admin.chat(42, 'Channel reply', guild_id=555, channel_id=111, request_id='channel-request-01')
+        with self.store.connect() as db:
+            row = db.execute('SELECT * FROM announcement_deliveries').fetchone()
+        self.assertEqual((row['kind'], row['target_id']), ('channel', '111'))
+        await self.admin.receive(self.message(guild=self.guild, channel=self.channel, content='Ordinary channel reply', mid=101))
+        self.assertEqual(self.admin.inbox(42, kind='guild')['total'], 2)
+
+    async def test_attachment_preview_ownership_claims_and_delivery(self):
+        upload = self.admin.files.upload(42, '../photo.png', b'\x89PNG\r\n\x1a\nimage')
+        self.assertEqual(upload['filename'], 'photo.png')
+        self.assertTrue(upload['image'])
+        with self.assertRaises(UserError):
+            await self.admin.prepare(43, 'Hello', user_id=7, uploads=[upload['id']])
+        plan = await self.admin.prepare(42, '', user_id=7, uploads=[upload['id']])
+        self.assertEqual(plan['attachments'][0]['filename'], 'photo.png')
+        self.user.send.assert_not_awaited()
+        self.admin.confirm(42, plan['plan'])
+        with self.assertRaises(UserError):
+            await self.admin.prepare(42, 'Reuse', user_id=7, uploads=[upload['id']])
+        self.bot.is_closed.side_effect = [False, True]
+        await self.admin.deliver()
+        call = self.user.send.await_args
+        self.assertEqual(call.kwargs['files'][0].filename, 'photo.png')
+        self.assertEqual(call.kwargs['allowed_mentions'].to_dict()['parse'], [])
+        self.assertEqual(self.admin.history(42)['jobs'][0]['attachments'][0]['filename'], 'photo.png')
+
+    async def test_rich_metadata_tags_embeds_and_signed_urls_stay_private(self):
+        message = self.message(content='Hello <@7> **bold**')
+        message.author.display_name = 'Viewer'
+        message.mentions = [message.author]
+        message.attachments = [SimpleNamespace(filename='photo.png', size=123, content_type='image/png', url='https://cdn.discordapp.com/attachments/222/333/photo.png?ex=signed')]
+        embed = discord.Embed(title='Title', description='**Description**')
+        embed.set_image(url='https://cdn.discordapp.com/attachments/222/333/photo.png')
+        message.embeds = [embed]
+        await self.admin.receive(message)
+        row = self.admin.inbox(42)['messages'][0]
+        self.assertEqual(row['tags']['user:7'], 'Viewer')
+        self.assertEqual(row['attachments'][0]['filename'], 'photo.png')
+        self.assertEqual(row['embeds'][0]['image'], 'embed0image')
+        self.assertNotIn('signed', str(row)); self.assertNotIn('assets', row)
+        message.content = 'Edited'; await self.admin.edited(message)
+        self.assertEqual(self.admin.inbox(42)['messages'][0]['content'], 'Edited')
+        self.admin.deleted(message.id, message.channel.id)
+        row = self.admin.inbox(42)['messages'][0]
+        self.assertTrue(row['deleted']); self.assertEqual(row['content'], ''); self.assertNotIn('attachments', row)
+
+    async def test_live_notifications_are_coalesced_and_contain_revision_only(self):
+        queue = self.admin.subscribe()
+        await queue.get()
+        await self.admin.receive(self.message(content='Private message'))
+        await self.admin.receive(self.message(mid=101, content='Another private message'))
+        await asyncio.sleep(0)
+        self.assertEqual(queue.qsize(), 1)
+        self.assertIsInstance(await queue.get(), int)
+        self.admin.subscribers.discard(queue)
+
+    async def test_concurrent_chat_retries_claim_uploaded_files_only_once(self):
+        file = self.admin.files.upload(42, 'guide.txt', b'guide')
+        jobs = await asyncio.gather(*(self.admin.chat(42, 'Guide', user_id=7,
+            uploads=[file['id']], request_id='concurrent-chat-00001') for _ in range(2)))
+        self.assertEqual(jobs[0], jobs[1])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM announcement_deliveries').fetchone()[0], 1)
+
 
 class AnnouncementCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_defaults_to_invoking_server_channel(self):

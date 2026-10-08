@@ -1,6 +1,7 @@
 """User-token Jellyfin access. Never substitute Seerr's Jellyfin administrator API key."""
 import re
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import requests
 from .config import http_url
@@ -44,9 +45,14 @@ class JellyfinClient:
         self.url, self.device_id, self.timeout, self.token = url, device_id, timeout, token
 
     def request(self, method, path, **kwargs):
-        headers = {'Authorization': f'MediaBrowser Client="Discord Media", Device="Discord", DeviceId="{self.device_id}", Version="1.0"'}
+        authorization = f'MediaBrowser Client="Discord Media", Device="Discord", DeviceId="{quote(self.device_id, safe="")}", Version="1.0"'
         if self.token:
-            headers['X-Emby-Token'] = self.token
+            # Jellyfin 10.11 can disable legacy X-Emby-Token authentication.
+            # Use the native header for the retained *user* token, never an API key.
+            # Jellyfin URL-decodes quoted header values; escaping prevents delimiters
+            # or control characters from changing the authorization parameters.
+            authorization += f', Token="{quote(self.token, safe="")}"'
+        headers = {'Authorization': authorization}
         try:
             response = requests.request(method, self.url + path, headers=headers,
                 timeout=self.timeout, allow_redirects=False, **kwargs)
