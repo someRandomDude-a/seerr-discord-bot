@@ -84,7 +84,7 @@ Set `JELLYFIN_DEVICE_URLS` to your real server URL(s), or `{}` to disable links.
 
 ## 6. Run the bot
 
-Install Python 3.10+ and dependencies. From the repository root:
+Docker is the deployment target and includes Python 3.14. For local development, install Python 3.14 and dependencies. From the repository root:
 
 ```sh
 python -m pip install -r requirements.txt
@@ -144,6 +144,34 @@ Skip for polling-only use. Generate the webhook credential in the panel (or set 
 Use the [README's notification instructions](../README.md#notifications) to configure Seerr/Servarr Connect webhooks. Send each integration's Test event and confirm it is accepted. Webhook payloads only wake a verified API refresh; they do not supply trusted messages or authorize actions. No Discord **Interactions Endpoint URL** is needed: slash commands arrive through the bot's gateway connection.
 
 ## Troubleshooting
+
+### Docker DNS failures and private panel access
+
+`ClientConnectorDNSError`, `socket.gaierror` and “Temporary failure in name resolution” mean the container cannot resolve the Discord gateway hostname. This happens before TLS/authentication and is not evidence of a bad token or a Python-version problem. Discord retries with randomized exponential backoff, so retries may be many minutes apart. Once DNS is repaired, restarting just the bot can avoid waiting for the next retry, but restart alone does not repair DNS.
+
+Run these read-only checks on the Docker host (replace `discord-bot` if your Compose service has another name):
+
+```sh
+docker compose exec discord-bot cat /etc/resolv.conf
+docker compose exec discord-bot python -c "import socket; print(sorted({r[4][0] for r in socket.getaddrinfo('gateway-us-east1-d.discord.gg', 443, type=socket.SOCK_STREAM)}))"
+docker compose exec discord-bot python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8787/', timeout=5).status)"
+```
+
+The DNS check tests the failing gateway; the last check tests the panel independently, without Discord or upstream service authentication. Adjust `8787` if you changed the panel port. If DNS fails, inspect the configured resolver, Docker/VPN routing and DNS firewall rules. Docker's `127.0.0.11` resolver is normal on user-defined networks; its upstream resolver must still be reachable. Preserve an existing `dns: *vpn-dns` configuration and the `vpn_network`, `media_network` and `proxy_network` attachments/static IPs. Do not substitute public DNS or disable the VPN/killswitch as an automatic workaround.
+
+The panel starts separately, before Discord login, and should remain reachable during Discord reconnects. With `PANEL_HOST=0.0.0.0`, it listens on the container's interfaces; a printed loopback browser URL is not the bind address. For an existing Docker-host-only panel at `172.18.1.15:8787`, test from that host:
+
+```sh
+curl -v --connect-timeout 5 http://172.18.1.15:8787/
+```
+
+If the internal panel check returns `200` but this host check fails, investigate the container bind address, assigned IP and host firewall/routing. If both succeed but browser access fails, investigate the SSH forward. On your computer, leave this running:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8787:172.18.1.15:8787 user@DOCKER_HOST
+```
+
+Then open exactly `http://127.0.0.1:8787/`, not the Docker IP or an IPv6 `localhost`. No LAN/public panel port needs to be published. Use the latest console access code; keep it and tokens out of diagnostic output shared with others. Failed live media/watchlist refreshes deliberately block private disclosures and preserve credentials/watchlists/pending changes; never delete the database/key to resolve a network outage.
 
 ### SQLite storage permissions
 

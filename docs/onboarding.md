@@ -4,7 +4,7 @@ The bot now has **one configuration panel on a separate HTTP port**. It handles 
 
 ## Start with a preset
 
-### Native Python
+### Local development (Python 3.14)
 
 ```sh
 python -m pip install -r requirements.txt
@@ -48,6 +48,7 @@ Docker builds the frontend automatically. Native Activity installs also run `npm
 
 - The one-time code grants **local operator authority**: editing configuration, adding bot-only exceptions, reading the shared inbox and sending confirmed announcements. It is separate from Seerr/Discord viewer authentication. Local sends are audited as `local-panel`, never attributed to a Discord user.
 - Default binding is loopback. For Docker, `0.0.0.0` is only the **container bind**; the supplied templates publish it to **host loopback**. Do not remove that restriction accidentally.
+- Startup prints the listener's bind address separately from the local browser URL. For an existing private container IP with no published panel port, forward directly to that IP over SSH; see [DNS and panel reachability checks](setup.md#docker-dns-failures-and-private-panel-access).
 - For a remote host, use an SSH tunnel: `ssh -L 8787:127.0.0.1:HOST_PANEL_PORT user@host`, then open `http://127.0.0.1:8787`. The panel supports direct private-IP access when explicitly bound/published on your LAN, but plain HTTP is unencrypted—SSH forwarding is safer.
 - Never expose this panel to the public Internet, configure it in Discord URL Mapping, or share its code/logs. Its browser requests require same-origin JSON, sessions use HttpOnly/SameSite=Strict cookies, public/DNS-rebinding hostnames are rejected, and pages cannot be framed.
 - The code is consumed at login. Sessions expire after **8 hours** (live updates do not extend this deadline). When the last session expires, the next panel API request prints one replacement code in the service console; enter it in the login form without restarting the bot. If a still-valid cookie was lost, restart the service to obtain a new code. An authenticated session stays valid across **Save & apply** bot restarts. Service/process restarts invalidate it and print a new startup code.

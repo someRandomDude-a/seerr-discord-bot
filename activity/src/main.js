@@ -12,6 +12,33 @@ let queuedDestination = null;
 const galleryState = new Map();
 const posterObservers = new Map();
 const posterUrls = new Map();
+let dialogSequence = 0;
+
+function setAppearance(value) {
+  const appearance = value === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.appearance = appearance;
+  try { localStorage.setItem('media-appearance', appearance); } catch {}
+}
+try { document.documentElement.dataset.appearance = localStorage.getItem('media-appearance') === 'light' ? 'light' : 'dark'; } catch {}
+
+function emptyState(title, description, action) {
+  const block = node('div', 'empty');
+  const symbol = node('span', 'empty-symbol', '◈'); symbol.setAttribute('aria-hidden', 'true');
+  block.append(symbol, node('h2', '', title), node('p', '', description));
+  if (action) block.append(action);
+  return block;
+}
+
+function loadingState() {
+  const block = node('div', 'loading-state'); block.setAttribute('role', 'status');
+  block.append(node('p', 'loading', 'Refreshing live state…'));
+  if (profile.account) {
+    const grid = node('div', 'skeleton-grid'); grid.setAttribute('aria-hidden', 'true');
+    for (let i = 0; i < 6; i++) grid.append(node('div', 'skeleton-card'));
+    block.append(grid);
+  }
+  return block;
+}
 
 function releasePoster(url) { URL.revokeObjectURL(url); posterUrls.delete(url); }
 
@@ -50,8 +77,9 @@ function button(text, handler, className = 'button') {
   element.type = 'button';
   element.addEventListener('click', async () => {
     element.disabled = true;
+    element.setAttribute('aria-busy', 'true');
     try { await handler(); } catch (error) { showError(error); }
-    finally { element.disabled = false; }
+    finally { element.disabled = element.dataset.blocked === 'true'; element.removeAttribute('aria-busy'); }
   });
   return element;
 }
@@ -91,8 +119,11 @@ function buildShell() {
   root.replaceChildren();
   const shell = node('div', 'shell');
   const sidebar = node('aside', 'sidebar');
-  sidebar.append(node('div', 'brand', '◈ Media'));
+  const brand = node('div', 'brand');
+  brand.append(node('span', 'brand-symbol', '◈'), node('span', '', 'Media'));
+  sidebar.append(brand, node('p', 'nav-eyebrow', profile.account ? 'YOUR PERSONAL HUB' : 'PRIVATE BY DESIGN'));
   const navigation = node('nav');
+  navigation.setAttribute('aria-label', 'Main navigation');
   const tabs = profile.account ? [['home', '◈ Home'], ['search', '⌕ Discover'], ['library', '▦ Library'], ['requests', '☷ Requests'], ['watches', '☆ Watchlist'], ['storage', '◉ Storage'], ['deletions', '◷ Deletions'], ['settings', '⚙ Preferences']] : [];
   if (profile.is_admin) tabs.push(['admin', '↗ Messages']);
   for (const [key, label] of tabs) {
@@ -101,13 +132,26 @@ function buildShell() {
     navigation.append(tab);
   }
   sidebar.append(navigation);
+  const footer = node('div', 'sidebar-footer');
+  if (profile.account) {
+    const account = node('div', 'account-chip');
+    const avatar = node('span', 'account-avatar', profile.account.name.slice(0, 1).toUpperCase()); avatar.setAttribute('aria-hidden', 'true');
+    const identity = node('div'); identity.append(node('strong', '', profile.account.name), node('small', '', 'Your private media space'));
+    account.append(avatar, identity); footer.append(account);
+  }
+  const appearance = button(document.documentElement.dataset.appearance === 'light' ? '☾ Dark appearance' : '☀ Light appearance', () => {
+    setAppearance(document.documentElement.dataset.appearance === 'light' ? 'dark' : 'light');
+    appearance.textContent = document.documentElement.dataset.appearance === 'light' ? '☾ Dark appearance' : '☀ Light appearance';
+  }, 'appearance-button');
+  appearance.setAttribute('aria-label', 'Switch color appearance'); footer.append(appearance); sidebar.append(footer);
   const main = node('main', 'main');
   const header = node('header', 'topbar');
   health = node('span', 'health', '● Verifying live data');
   health.setAttribute('aria-live', 'polite');
   header.append(health, button('↻ Refresh', loadPage, 'button subtle'));
-  const notice = node('div', 'notice'); notice.id = 'notice'; notice.hidden = true;
+  const notice = node('div', 'notice'); notice.id = 'notice'; notice.hidden = true; notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite');
   content = node('section', 'content');
+  content.id = 'main-content'; content.setAttribute('aria-label', 'Media content');
   main.append(header, notice, content);
   shell.append(sidebar, main);
   root.append(shell);
@@ -138,8 +182,12 @@ async function loadPage() {
   loading = true;
   const generation = privacyGeneration;
   try {
-    for (const tab of document.querySelectorAll('.nav-button')) tab.classList.toggle('selected', tab.dataset.page === page);
-    content.replaceChildren(node('div', 'loading', 'Refreshing live state…'));
+    for (const tab of document.querySelectorAll('.nav-button')) {
+      tab.classList.toggle('selected', tab.dataset.page === page);
+      if (tab.dataset.page === page) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
+    }
+    content.setAttribute('aria-busy', 'true');
+    content.replaceChildren(loadingState());
     cleanupPosters();
     const notice = document.querySelector('#notice'); notice.hidden = true;
     const wasLinked = Boolean(profile.account);
@@ -177,10 +225,11 @@ async function loadPage() {
     if (['home', 'library', 'requests', 'storage'].includes(page)) updateHealth(bundle.meta);
     else { health.textContent = '● Account verified · Live access'; health.className = 'health'; }
   } catch (error) {
-    if (!error.privateDataBlocked) content.replaceChildren(node('div', 'empty', page === 'admin' ? 'Messages unavailable' : 'Live data unavailable · Try refreshing'));
+    if (!error.privateDataBlocked) content.replaceChildren(emptyState(page === 'admin' ? 'Messages unavailable' : 'Live data unavailable', 'Nothing private is shown until access can be checked. Try again when the connection is available.', button('Try again', loadPage, 'button primary')));
     showError(error);
   } finally {
     loading = false;
+    content?.removeAttribute('aria-busy');
     if (queuedDestination !== null) {
       const destination = queuedDestination; queuedDestination = null;
       if (destination !== page) void navigate(destination);
@@ -190,14 +239,14 @@ async function loadPage() {
 
 function renderHome(data) {
   profile.account = data.account;
-  heading(`Hi, ${data.account.name}`);
+  heading(`Hi, ${data.account.name}`, 'A little less searching. A lot more enjoying.');
   const welcome = node('div', 'discovery-banner');
-  welcome.append(node('h2', '', 'What would you like to watch?'), node('p', '', 'Discover something new, or jump straight into your library.'),
+  welcome.append(node('p', 'eyebrow', 'YOUR NEXT GREAT FIND'), node('h2', '', 'Make time for\nsomething good.'), node('p', '', 'Discover a new favorite, revisit a classic, or pick up right where your curiosity left off.'),
     button('✨ Find something new', () => navigate('search'), 'button primary'), button('▶ Browse library', () => navigate('library'), 'button subtle'));
   content.append(welcome);
   const stats = node('div', 'stats');
-  for (const [label, value] of [['Your requests', data.requests], ['Available items', data.library], ['Personal updates', data.account.opted_in ? 'On' : 'Off']]) {
-    const card = node('div', 'stat'); card.append(node('p', '', label), node('strong', '', value)); stats.append(card);
+  for (const [label, value, destination] of [['Your requests', data.requests, 'requests'], ['Available items', data.library, 'library'], ['Personal updates', data.account.opted_in ? 'On' : 'Off', 'settings']]) {
+    const card = button('', () => navigate(destination), 'stat'); card.append(node('p', '', label), node('strong', '', value), node('span', 'stat-arrow', '↗')); stats.append(card);
   }
   content.append(stats);
   const shortcuts = node('div', 'shortcuts');
@@ -207,28 +256,31 @@ function renderHome(data) {
   content.append(shortcuts);
 }
 
-function select(options, current, onChange) {
+function select(options, current, onChange, label = 'Choose an option') {
   const element = node('select');
+  element.setAttribute('aria-label', label);
   for (const [value, label] of options) { const option = node('option', '', label); option.value = value; element.append(option); }
   element.value = current;
   element.addEventListener('change', async () => {
+    element.disabled = true;
     try { await onChange(element.value); } catch (error) { showError(error); }
+    finally { element.disabled = false; }
   });
   return element;
 }
 
 function renderItems(items) {
-  const titles = { library: ['Library'], requests: ['Requests'], watches: ['Watchlist'], deletions: ['Deletions', '24-hour delay · Undo until execution'] };
+  const titles = { library: ['Your library', 'Good things, all in one place. Browse your available movies, series, music and books.'], requests: ['Your requests', 'Keep up with the things you’re looking forward to.'], watches: ['Your watchlist', 'A place for your next favorites. Movies and series stay in sync with Seerr.'], deletions: ['Scheduled deletions', '24-hour delay · You can undo until execution begins.'] };
   heading(...titles[page]);
   const tools = node('div', 'toolbar');
   let redraw = () => {};
-  if (page === 'library') tools.append(select([['all', 'Everything'], ['movie', 'Movies'], ['tv', 'Series'], ['music', 'Music'], ['book', 'Books']], category, async (value) => { category = value; redraw(); }));
-  if (page === 'requests') tools.append(select([['mine', 'Mine'], ['all', 'All']], allRequests ? 'all' : 'mine', async (value) => { allRequests = value === 'all'; await loadPage(); }));
+  if (page === 'library') tools.append(select([['all', 'Everything'], ['movie', 'Movies'], ['tv', 'Series'], ['music', 'Music'], ['book', 'Books']], category, async (value) => { category = value; redraw(); }, 'Library category'));
+  if (page === 'requests') tools.append(select([['mine', 'My requests'], ['all', 'All requests']], allRequests ? 'all' : 'mine', async (value) => { allRequests = value === 'all'; await loadPage(); }, 'Request scope'));
   const stateKey = `${page}:${allRequests}`;
   if (!galleryState.has(stateKey)) galleryState.set(stateKey, { query: '', sort: 'default', page: 0 });
   const state = galleryState.get(stateKey);
   const filter = node('input'); filter.type = 'search'; filter.placeholder = 'Filter titles…'; filter.value = state.query; filter.setAttribute('aria-label', 'Filter collection'); tools.append(filter);
-  tools.append(select([['default', 'Default order'], ['title', 'Title A–Z'], ['available', 'Available first']], state.sort, async value => { state.sort = value; state.page = 0; redraw(); }));
+  tools.append(select([['default', 'Default order'], ['title', 'Title A–Z'], ['available', 'Available first']], state.sort, async value => { state.sort = value; state.page = 0; redraw(); }, 'Sort titles'));
   const count = node('span', 'count', `${items.length} items`); tools.append(count); content.append(tools);
   const grid = node('div', 'grid'); content.append(grid);
   const paging = node('div', 'toolbar gallery-paging'); content.append(paging);
@@ -241,7 +293,13 @@ function renderItems(items) {
     grid.replaceChildren();
     cleanupPosters();
     for (const item of shown.slice(state.page * 12, state.page * 12 + 12)) grid.append(itemCard(item));
-    if (!shown.length) grid.append(node('div', 'empty', 'No matches. Change your filter or try Discover.'));
+    if (!shown.length) {
+      const empty = page === 'deletions' ? ['Nothing scheduled', 'Files stay right where they are. Any deletions you schedule will appear here with a 24-hour window to undo.'] :
+        page === 'requests' ? ['Your next request starts here', 'Find something you love in Discover. You can follow its progress here.'] :
+        page === 'watches' ? ['Save something for later', 'Follow titles in Discover or your library to build a watchlist that feels like you.'] :
+        ['A little room for something new', 'Find something you love in Discover and make it your next request.'];
+      grid.append(emptyState(state.query ? 'No matches just yet' : empty[0], state.query ? 'Try a shorter title or a different category.' : empty[1], page === 'deletions' ? undefined : button('Explore Discover', () => navigate('search'), 'button primary')));
+    }
     const previous = button('← Previous', () => { state.page -= 1; draw(); }); previous.disabled = state.page === 0;
     const next = button('Next →', () => { state.page += 1; draw(); }); next.disabled = state.page + 1 >= pages;
     paging.replaceChildren(previous, node('span', 'fine', `${state.page + 1} / ${pages} · Open gallery snapshot`), next);
@@ -283,8 +341,10 @@ function itemCard(item) {
   cover.setAttribute('aria-label', `Details for ${item.title}`);
   attachPoster(cover, item);
   cover.append(node('span', 'cover-category', item.kind));
+  if (item.available) cover.append(node('span', 'cover-availability', 'Available'));
   const body = node('div', 'card-body');
-  body.append(button(item.title, () => showDetails(item), 'card-title'), node('p', 'item-status', item.subtitle || (item.available ? 'Available' : 'Not yet available')));
+  const title = button(item.title, () => showDetails(item), 'card-title'); title.title = item.title;
+  body.append(title, node('p', 'item-status', item.subtitle || (item.available ? 'Available' : 'Not yet available')));
   if (page === 'requests') body.append(node('p', 'fine', `#${item.id}${item.is4k ? ' · 4K' : ''}`));
   if (item.size) body.append(node('p', 'fine', formatBytes(item.size)));
   if (page === 'deletions') {
@@ -306,10 +366,12 @@ function itemActions(item, destination = page, close = () => {}) {
   if (destination === 'search' && item.requestable !== false) actions.append(button('＋ Request', () => {
     close(); confirm('Request this item?', `${item.title}. TV: all seasons. Music/books: configured profiles.`, async () => { const result = await api('request', { item: reference(item), confirmed: true }); await loadPage(); toast(result); });
   }, 'button primary'));
-  actions.append(button(destination === 'watches' ? '☆ Unfollow' : '☆ Follow', async () => {
+  const follow = button(destination === 'watches' ? '☆ Unfollow' : '☆ Follow', async () => {
     const result = await api('watch', { item: reference(item), remove: destination === 'watches' });
-    if (destination === 'watches') { close(); await loadPage(); } toast(result);
-  }, 'button subtle'));
+    if (destination === 'watches') { close(); await loadPage(); }
+    else { follow.textContent = '✓ Following'; follow.setAttribute('aria-pressed', 'true'); follow.dataset.blocked = 'true'; }
+    toast(result);
+  }, 'button subtle'); actions.append(follow);
   if (['movie', 'tv'].includes(item.kind) && item.available) actions.append(button('▶ Jellyfin', async () => { const url = await api('open', { item: reference(item) }); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
   if (destination === 'requests' && item.available && item.deletable) actions.append(button('Delete files…', () => {
     close(); confirm('Delete files in 24 hours?', `${item.title}${item.is4k ? ' (4K)' : ''}. Removes the entire movie/series, including shared files. Request history stays. Undo in Deletions until execution begins.`, async () => { const result = await api('delete', { id: item.id, confirmed: true }); await loadPage(); toast(result); });
@@ -323,6 +385,7 @@ async function showDetails(item) {
   const destination = page;
   const trigger = document.activeElement;
   const dialog = node('dialog', 'media-detail');
+  dialog.setAttribute('aria-label', 'Title details');
   const close = () => { dialog.close(); dialog.remove(); cleanupPosters(); startRefresh(); if (trigger?.isConnected) trigger.focus(); };
   dialog.append(button('← Back to browsing', close, 'button subtle'), node('div', 'loading', 'Loading title details…'));
   dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
@@ -339,7 +402,8 @@ async function showDetails(item) {
       node('p', 'pill', detail.available ? 'Available to watch' : 'Not yet available'));
     information.append(itemActions(detail, destination, close));
     layout.append(cover, information);
-    dialog.replaceChildren(button('← Back to browsing', close, 'button subtle'), layout);
+    const back = button('← Back to browsing', close, 'button subtle');
+    dialog.replaceChildren(back, layout); back.focus();
   } catch (error) {
     if (dialog.isConnected) { close(); showError(error); }
     else showError(error);
@@ -349,7 +413,7 @@ async function showDetails(item) {
 function renderSearch(items) {
   heading('Discover', searchQuery ? `Results for “${searchQuery}”` : 'Popular now · Powered by your Seerr account');
   const form = node('form', 'search-form');
-  const kind = select([['movie', '🎬 Movies'], ['tv', '📺 Series'], ['music', '🎵 Albums'], ['book', '📚 Books']], searchKind, async (value) => { searchKind = value; searchPage = 1; await loadPage(); });
+  const kind = select([['movie', '🎬 Movies'], ['tv', '📺 Series'], ['music', '🎵 Albums'], ['book', '📚 Books']], searchKind, async (value) => { searchKind = value; searchPage = 1; await loadPage(); }, 'Discovery category');
   const query = node('input'); query.type = 'search'; query.maxLength = 100; query.required = true; query.placeholder = 'Title, artist, or author…'; query.value = searchQuery; query.setAttribute('aria-label', 'Search media');
   const submit = node('button', 'button primary', 'Search'); submit.type = 'submit';
   form.append(kind, query, submit);
@@ -359,7 +423,7 @@ function renderSearch(items) {
   shortcuts.append(button('Open Seerr ↗', async () => { const url = await api('seerr_link'); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
   content.append(shortcuts);
   const grid = node('div', 'grid'); for (const item of items) grid.append(itemCard(item)); content.append(grid);
-  if (!items.length) content.append(node('div', 'empty', ['music', 'book'].includes(searchKind) && !searchQuery ? 'Search by title, artist or author to get started.' : 'No results. Try another title or category.'));
+  if (!items.length) content.append(emptyState(searchQuery ? 'No results this time' : 'Find your next favorite', ['music', 'book'].includes(searchKind) && !searchQuery ? 'Search by title, artist or author to get started.' : 'Try another title or category. Your next favorite could be one search away.'));
   if (['movie', 'tv'].includes(searchKind)) {
     const controls = node('div', 'toolbar');
     const prev = button('← Previous results', async () => { searchPage = Math.max(1, searchPage - 1); await loadPage(); }); prev.disabled = searchPage === 1;
@@ -394,12 +458,12 @@ function renderSettings(data) {
   notifications.append(button('Enable', async () => { await api('preferences', { enabled: true }); await loadPage(); }, 'button primary'), button('Mute', async () => { await api('mute'); await loadPage(); }, 'button subtle'));
   const devices = node('article', 'setting');
   devices.append(node('h2', '', 'Jellyfin device'));
-  if (data.devices.length) devices.append(select(data.devices.map(name => [name, name]), profile.account.device || data.devices[0], async (device) => { toast(await api('preferences', { device })); }));
+  if (data.devices.length) devices.append(select(data.devices.map(name => [name, name]), profile.account.device || data.devices[0], async (device) => { const result = await api('preferences', { device }); await loadPage(); toast(result); }, 'Jellyfin destination'));
   else devices.append(node('p', 'fine', 'Configure JELLYFIN_DEVICE_URLS in the bot environment.'));
   const watchlist = node('article', 'setting');
   watchlist.append(node('h2', '', 'Two-way watchlist sync'),
     node('p', '', 'Movies and series sync with Seerr automatically, including removals. Music/books stay here. Following does not request media.'),
-    button('Sync now', async () => toast(await api('sync_watchlist')), 'button subtle'));
+    button('Sync now', async () => { const result = await api('sync_watchlist'); await loadPage(); toast(result); }, 'button subtle'));
   settings.append(notifications, devices, watchlist); content.append(settings);
 }
 
@@ -537,11 +601,26 @@ function renderAdminAgain(state, inbox) {
 function confirm(title, description, action) {
   clearInterval(refreshTimer);  // Do not replace confirmation while it is being reviewed.
   const dialog = node('dialog', 'confirm-dialog');
-  dialog.append(node('h2', '', title), node('p', '', description));
+  const trigger = document.activeElement;
+  const heading = node('h2', '', title); heading.id = `confirmation-${++dialogSequence}`; dialog.setAttribute('aria-labelledby', heading.id);
+  dialog.append(node('p', 'eyebrow', 'ONE LAST CHECK'), heading, node('p', '', description));
   const actions = node('div', 'card-actions');
-  const close = () => { dialog.close(); dialog.remove(); startRefresh(); };
-  actions.append(button('Cancel', close, 'button subtle'), button('Confirm', async () => { close(); await action(); }, 'button primary'));
-  dialog.append(actions); dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); }); root.append(dialog); dialog.showModal();
+  let pending = false;
+  const close = () => { if (pending) return; dialog.close(); dialog.remove(); startRefresh(); if (trigger?.isConnected) trigger.focus(); };
+  const cancel = button('Cancel', close, 'button subtle');
+  const submit = button('Confirm', async () => {
+    pending = true; cancel.disabled = true; dialog.setAttribute('aria-busy', 'true');
+    try { await action(); pending = false; close(); }
+    catch (error) {
+      pending = false;
+      if (dialog.isConnected) {
+        const notice = node('p', 'notice error', `${error.message} Check the current state before trying again.`); notice.setAttribute('role', 'alert');
+        dialog.append(notice); submit.hidden = true; submit.dataset.blocked = 'true';
+      }
+    } finally { pending = false; cancel.disabled = false; dialog.removeAttribute('aria-busy'); }
+  }, 'button primary');
+  actions.append(cancel, submit);
+  dialog.append(actions); dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); }); root.append(dialog); dialog.showModal(); cancel.focus();
 }
 
 function startRefresh() {

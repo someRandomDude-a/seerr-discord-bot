@@ -1,2 +1,30 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Media · Admin</title><link rel="stylesheet" href="/glass.css"><link rel="stylesheet" href="/panel.css"></head><body><main id="app" class="panel-root"><section class="setting login"><h1>Media</h1><p>Enter the access code printed by the service.</p><form id="login"><input name="code" type="password" autocomplete="off" required aria-label="Console access code"><button class="button primary">Connect</button></form><p id="login-error" class="notice error" hidden></p></section></main><script type="module" src="/panel.js"></script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Media · Your private control room</title>
+  <link rel="stylesheet" href="/glass.css">
+  <link rel="stylesheet" href="/panel.css">
+</head>
+<body data-ui="panel">
+  <main id="app" class="panel-root">
+    <section class="setting login">
+      <div class="login-mark" aria-hidden="true">◈</div>
+      <p class="eyebrow">MEDIA · PRIVATE ADMIN</p>
+      <h1>Welcome home.</h1>
+      <p class="login-intro">Your media. Your conversations. One calm place to manage it all.</p>
+      <form id="login">
+        <label for="access-code" class="panel-label">Console access code</label>
+        <input id="access-code" name="code" type="password" autocomplete="off" required aria-label="Console access code" placeholder="Paste your one-time code">
+        <small class="fine">Enter the current one-time access code printed by the service.</small>
+        <button class="button primary">Connect</button>
+      </form>
+      <p id="login-error" class="notice error" role="alert" hidden></p>
+      <small class="login-security">Private by design. Keep this code to yourself.</small>
+    </section>
+  </main>
+  <script type="module" src="/panel.js"></script>
+</body>
+</html>

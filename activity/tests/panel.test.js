@@ -21,11 +21,12 @@ async function harness({ privateHTTP = false, expireUploads = false, signedIn = 
   dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; };
   const calls = [];
   const events = [];
-  const control = { authenticated: signedIn, networkFailure: false, serverFailure: false };
+  const control = { authenticated: signedIn, networkFailure: false, serverFailure: false, delayChat: null };
+  const stored = [];
   let nonce = 0;
   const context = vm.createContext({ document: dom.window.document, FormData: dom.window.FormData, console,
     URL, crypto: privateHTTP ? { getRandomValues: values => { values.fill(++nonce); return values; } } : { randomUUID: () => `nonce-${String(++nonce).padStart(20, '0')}` },
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: { getItem: () => null, setItem: (key, value) => stored.push({ key, value }) },
     EventSource: class {
       readyState = 1; handlers = new Map(); closed = false;
       constructor(path) { this.path = path; events.push(this); }
@@ -36,6 +37,7 @@ async function harness({ privateHTTP = false, expireUploads = false, signedIn = 
     fetch: async (path, options = {}) => {
       const args = options.body instanceof dom.window.FormData ? { file: options.body.get('file').name } : options.body ? JSON.parse(options.body) : {};
       calls.push({ path, ...args });
+      if (args.operation === 'chat' && control.delayChat) await control.delayChat;
       if (control.networkFailure && path === '/api/state') throw new Error('Network unavailable');
       if (control.serverFailure && path === '/api/state') return { ok: false, status: 503, json: async () => ({ error: 'Temporarily unavailable' }) };
       if (path === '/api/login') {
@@ -74,7 +76,7 @@ async function harness({ privateHTTP = false, expireUploads = false, signedIn = 
     const button = [...dom.window.document.querySelectorAll('button')].find(element => element.textContent === text);
     assert.ok(button, `Missing button: ${text}`); button.click();
   };
-  return { document: dom.window.document, window: dom.window, context, calls, events, control, click, settle, close: () => dom.window.close() };
+  return { document: dom.window.document, window: dom.window, context, calls, events, control, stored, click, settle, close: () => dom.window.close() };
 }
 
 test('panel keeps saved secrets blank and environment overrides read-only', async () => {
@@ -294,4 +296,84 @@ test('a late unauthorized response from the old session cannot expire a new sign
     assert.equal(h.document.querySelector('#login'), null);
     assert.ok(h.document.querySelector('[data-key="DISCORD_TOKEN"]'));
   } finally { h.close(); }
+});
+
+test('the redesigned login remains generic and saves only an appearance preference', async () => {
+  const h = await harness({ signedIn: false });
+  try {
+    assert.equal(h.document.querySelector('.login h1').textContent, 'Welcome home.');
+    assert.equal(h.document.querySelector('label[for="access-code"]').textContent, 'Console access code');
+    assert.equal(h.document.querySelector('#access-code').type, 'password');
+    h.document.querySelector('[aria-label="Switch color appearance"]').click(); await h.settle();
+    assert.equal(h.document.documentElement.dataset.appearance, 'light');
+    assert.deepEqual(h.stored, [{ key: 'media-appearance', value: 'light' }]);
+    assert.equal(h.document.querySelector('.chat-shell,.panel-grid'), null);
+    assert.doesNotMatch(h.document.body.textContent, /Viewer|Cinema/);
+  } finally { h.close(); }
+});
+
+test('advanced search preserves hidden drafts and configuration labels target their controls', async () => {
+  const h = await harness();
+  try {
+    h.click('Advanced'); await h.settle();
+    const token = h.document.querySelector('[data-key="DISCORD_TOKEN"]'); token.value = 'new-secret'; token.dispatchEvent(new h.window.Event('input'));
+    assert.ok(h.document.querySelector(`label[for="${token.id}"]`));
+    assert.match(h.document.querySelector('#draft-status').textContent, /1 unsaved change/);
+    const search = h.document.querySelector('[aria-label="Search settings"]'); search.value = 'SEERR_URL'; search.dispatchEvent(new h.window.Event('input'));
+    assert.equal(token.closest('.panel-step').hidden, true);
+    assert.equal(h.document.querySelector('[data-key="SEERR_URL"]').closest('.panel-step').hidden, false);
+    assert.equal(h.document.querySelector('[data-key="SEERR_URL"]').disabled, true);
+    search.value = ''; search.dispatchEvent(new h.window.Event('input')); assert.equal(token.value, 'new-secret');
+    h.click('Setup'); await h.settle(); assert.equal(h.document.querySelector('[data-key="DISCORD_TOKEN"]').value, 'new-secret');
+    h.click('Save & apply'); await h.settle(); assert.equal(h.document.querySelector('#draft-status').textContent, 'All changes saved');
+    assert.equal(h.document.querySelector('[data-key="DISCORD_TOKEN"]').value, '');
+    assert.equal(h.stored.length, 0);
+  } finally { h.close(); }
+});
+
+test('mode cards expose the selected preset and keep the current navigation accessible', async () => {
+  const h = await harness();
+  try {
+    assert.equal(h.document.querySelector('.panel-tabs [aria-current="page"]').textContent, 'Setup');
+    h.click('Activity'); await h.settle();
+    assert.equal(h.document.querySelector('.mode-card.selected button').textContent, 'Activity');
+    assert.equal(h.document.querySelector('.mode-card.selected button').getAttribute('aria-pressed'), 'true');
+    assert.match(h.document.querySelector('#draft-status').textContent, /unsaved/);
+  } finally { h.close(); }
+});
+
+test('mobile conversations can open and close without losing the selected transcript', async () => {
+  const h = await harness();
+  try {
+    h.click('Messages'); await h.settle();
+    let toggle = h.document.querySelector('.conversation-toggle');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    toggle.click(); await h.settle(); assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+    assert.equal(h.document.querySelector('.chat-shell').classList.contains('sidebar-open'), true);
+    h.click('Viewer'); await h.settle();
+    toggle = h.document.querySelector('.conversation-toggle'); assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(h.document.querySelector('.chat-shell').classList.contains('sidebar-open'), false);
+    assert.equal(h.document.querySelector('.chat-header h2').textContent, 'Viewer');
+    assert.ok(h.document.querySelector('.chat-date'));
+    assert.equal([...h.document.querySelectorAll('.chat-timeline button')].some(button => button.textContent === 'Reply'), false);
+    assert.equal(h.document.querySelector('.chat-timeline').hasAttribute('aria-busy'), false);
+  } finally { h.close(); }
+});
+
+test('composer counts text, blocks empty sends and avoids duplicate sends during live updates', async () => {
+  const h = await harness();
+  let release;
+  try {
+    h.click('Messages'); await h.settle(); h.click('Viewer'); await h.settle();
+    h.click('Send'); await h.settle(); assert.equal(h.calls.some(call => call.operation === 'chat'), false);
+    assert.match(h.document.querySelector('#notice').textContent, /Write a message/);
+    const textarea = h.document.querySelector('.panel-draft'); textarea.value = 'Hello'; textarea.dispatchEvent(new h.window.Event('input'));
+    assert.equal(h.document.querySelector('.chat-compose-count').textContent, '5 / 2,000');
+    h.control.delayChat = new Promise(resolve => { release = resolve; });
+    h.click('Send'); await h.settle(); h.click('Send');
+    h.events[0].emit('update'); await h.settle();
+    assert.equal(h.document.querySelector('.panel-draft'), textarea);
+    assert.equal(h.calls.filter(call => call.operation === 'chat').length, 1);
+    release(); await h.settle(); assert.equal(h.document.querySelector('.chat-compose-count').textContent, '0 / 2,000');
+  } finally { release?.(); h.close(); }
 });

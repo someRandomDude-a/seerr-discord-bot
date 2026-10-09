@@ -43,8 +43,7 @@ class SyncManager:
                 yield conn
         except sqlite3.OperationalError as exc:
             code = getattr(exc, 'sqlite_errorcode', 0)
-            # Python 3.10 lacks the named SQLite codes and exception code attributes.
-            if (code & 0xff) == getattr(sqlite3, 'SQLITE_READONLY', 8) or 'readonly' in str(exc).lower():
+            if (code & 0xff) == sqlite3.SQLITE_READONLY or 'readonly' in str(exc).lower():
                 raise PermissionError(
                     f'SQLite database is not writable: {self.db_path}. The bot needs write access '
                     'to the database, its parent directory, and existing -wal/-shm files. '

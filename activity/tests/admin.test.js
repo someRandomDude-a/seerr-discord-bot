@@ -25,11 +25,14 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
   const calls = [];
   let isVerified = verified;
   let unavailable = false;
+  const control = { delayBrowse: null, delayWrite: null, failWrite: false };
+  const preferences = new Map(), stored = [];
   const viewer = () => ({ account: isVerified ? { name: 'Private Viewer', opted_in: false } : null,
     devices: isVerified ? ['Secret Server'] : [], is_admin: isVerified && isAdmin, refresh_interval: 60, sync_interval: 300 });
   const context = vm.createContext({
     document: dom.window.document, console, crypto: { randomUUID: () => 'state' },
     setInterval: () => 1, clearInterval: () => {},
+    localStorage: { getItem: key => preferences.get(key), setItem: (key, value) => { preferences.set(key, value); stored.push({ key, value }); } },
     URL: { createObjectURL: () => 'blob:private-image', revokeObjectURL: () => {} },
     DiscordSDK: class {
       guildId = guild;
@@ -39,6 +42,11 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
     fetch: async (path, options) => {
       const args = options.body ? JSON.parse(options.body) : {};
       calls.push({ path, ...args, headers: options.headers });
+      if (args.operation === 'browse' && control.delayBrowse) await control.delayBrowse;
+      if (args.operation === 'request') {
+        if (control.delayWrite) await control.delayWrite;
+        if (control.failWrite) return { ok: false, status: 400, json: async () => ({ error: 'Request could not be confirmed.' }) };
+      }
       let data;
       if (path.endsWith('/config')) data = { application_id: '123', scopes: ['identify'], refresh_interval: 60 };
       else if (path.endsWith('/auth')) data = { access_token: 'mock', session_token: 'mock' };
@@ -52,6 +60,8 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
       else if (args.operation === 'details') data = { result: { ...args.item, overview: 'Fresh live synopsis', available: true, poster_path: '/a.jpg' } };
       else if (args.operation === 'seerr_link') data = { result: 'https://seerr.example' };
       else if (args.operation === 'sync_watchlist') data = { result: 'Movie/series watchlists synced both ways. Music and books stay hub-only.' };
+      else if (args.operation === 'watch') data = { result: 'Added to watchlist.' };
+      else if (args.operation === 'request') data = { result: 'Request recorded.' };
       else if (args.operation === 'dashboard') data = { result: { account: { name: 'Private Viewer', opted_in: false }, requests: 1, library: 1 } };
       else if (args.operation === 'status') data = { last_success: 1000 };
       else if (args.operation === 'library') data = { result: [{ kind: 'movie', title: 'Private Film', available: true, poster_path: '/a.jpg' }] };
@@ -72,7 +82,7 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
   vm.runInContext(domSource + '\n' + main + '\nglobalThis.testUI = { openAdmin: async () => { page = "admin"; await loadPage(); }, openLibrary: async () => { page = "library"; await loadPage(); }, reload: loadPage };', context);
   await context.ready;
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
-  return { document: dom.window.document, window: dom.window, calls, context, settle,
+  return { document: dom.window.document, window: dom.window, calls, context, settle, control, stored,
     revoke: () => { isVerified = false; }, outage: () => { unavailable = true; }, close: () => dom.window.close() };
 }
 
@@ -259,5 +269,95 @@ test('send preview preserves snowflake strings and sends only after confirmation
     click(h.document, 'Confirm'); await h.settle();
     assert.equal(h.calls.find(call => call.operation === 'admin_send').confirmed, true);
     assert.equal(h.document.querySelector('textarea').value, '');
+  } finally { h.close(); }
+});
+
+test('appearance is usable before linking and persists only a cosmetic preference', async () => {
+  const h = await harness(true, inbox, false);
+  try {
+    const control = h.document.querySelector('[aria-label="Switch color appearance"]'); control.click(); await h.settle();
+    assert.equal(h.document.documentElement.dataset.appearance, 'light');
+    assert.deepEqual(h.stored, [{ key: 'media-appearance', value: 'light' }]);
+    assert.equal(h.document.querySelector('.account-chip,.media-card,.skeleton-card'), null);
+    assert.doesNotMatch(h.document.body.textContent, /Private Viewer|Secret Server|Private Film/);
+    assert.equal(h.calls.some(call => call.operation === 'browse'), false);
+  } finally { h.close(); }
+});
+
+test('slow gallery loads provide generic accessible skeletons without artwork', async () => {
+  const h = await harness();
+  let release;
+  try {
+    h.control.delayBrowse = new Promise(resolve => { release = resolve; });
+    const pending = h.context.testUI.openLibrary(); await h.settle();
+    assert.equal(h.document.querySelector('.content').getAttribute('aria-busy'), 'true');
+    assert.equal(h.document.querySelectorAll('.skeleton-card').length, 6);
+    assert.equal(h.document.querySelector('.loading-state img'), null);
+    assert.doesNotMatch(h.document.querySelector('.content').textContent, /Private Film/);
+    release(); await pending;
+    assert.equal(h.document.querySelector('.content').hasAttribute('aria-busy'), false);
+    assert.ok(h.document.querySelector('.media-card'));
+    assert.equal(h.document.querySelector('[data-page="library"]').getAttribute('aria-current'), 'page');
+  } finally { release?.(); h.close(); }
+});
+
+test('empty collection filters give an actionable path to discovery', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.openLibrary();
+    const filter = h.document.querySelector('[aria-label="Filter collection"]'); filter.value = 'No such title'; filter.dispatchEvent(new h.window.Event('input'));
+    assert.ok(h.document.querySelector('.empty h2'));
+    click(h.document, 'Explore Discover'); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'browse').at(-1).page, 'search');
+  } finally { h.close(); }
+});
+
+test('following gives an inline receipt without repeating the write or losing the gallery', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.openLibrary();
+    click(h.document, '☆ Follow'); await h.settle();
+    const followed = [...h.document.querySelectorAll('button')].find(button => button.textContent === '✓ Following');
+    assert.equal(followed.getAttribute('aria-pressed'), 'true'); assert.equal(followed.disabled, true);
+    followed.click(); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'watch').length, 1);
+    assert.ok(h.document.querySelector('.media-card'));
+  } finally { h.close(); }
+});
+
+test('confirmation stays visible and non-dismissable while a mutation is pending', async () => {
+  const h = await harness();
+  let release;
+  try {
+    h.document.querySelector('[data-page="search"]').click(); await h.settle();
+    click(h.document, '＋ Request'); await h.settle();
+    const dialog = h.document.querySelector('dialog');
+    assert.ok(dialog.getAttribute('aria-labelledby'));
+    assert.equal(h.document.activeElement.textContent, 'Cancel');
+    h.control.delayWrite = new Promise(resolve => { release = resolve; });
+    click(h.document, 'Confirm'); await h.settle();
+    assert.equal(dialog.isConnected, true); assert.equal(dialog.getAttribute('aria-busy'), 'true');
+    dialog.dispatchEvent(new h.window.Event('cancel', { cancelable: true }));
+    assert.equal(dialog.isConnected, true);
+    click(h.document, 'Confirm'); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'request').length, 1);
+    release(); await h.settle();
+    assert.equal(h.document.querySelector('dialog'), null);
+    assert.match(h.document.querySelector('#notice').textContent, /Request recorded/);
+  } finally { release?.(); h.close(); }
+});
+
+test('failed confirmations explain uncertainty and cannot silently replay a write', async () => {
+  const h = await harness();
+  try {
+    h.document.querySelector('[data-page="search"]').click(); await h.settle();
+    click(h.document, '＋ Request'); await h.settle(); h.control.failWrite = true;
+    click(h.document, 'Confirm'); await h.settle();
+    const dialog = h.document.querySelector('dialog');
+    assert.match(dialog.querySelector('[role="alert"]').textContent, /Check the current state/);
+    const submit = [...dialog.querySelectorAll('button')].find(button => button.textContent === 'Confirm');
+    assert.equal(submit.hidden, true); assert.equal(submit.disabled, true);
+    submit.click(); await h.settle(); assert.equal(h.calls.filter(call => call.operation === 'request').length, 1);
+    click(h.document, 'Cancel'); await h.settle(); assert.equal(h.document.querySelector('dialog'), null);
   } finally { h.close(); }
 });

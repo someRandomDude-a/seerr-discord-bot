@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiohttp import CookieJar, web
+from aiohttp import ClientSession, CookieJar, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from media_bot.config import Config
@@ -350,6 +350,43 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ApplicationLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wildcard_panel_listener_is_reachable_while_discord_connection_waits(self):
+        from bot import run_application
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ,
+                {'PANEL_HOST': '0.0.0.0', 'PANEL_PORT': '0'}, clear=True):
+            panel = ControlPanel('0.0.0.0', path=Path(temp) / 'settings.json')
+            config = Config('http://seerr', 'key', 'token', str(Path(temp) / 'cache.db'))
+            started, finished = asyncio.Event(), asyncio.Event()
+            async def connecting(token):
+                started.set()
+                await finished.wait()  # Discord's DNS/reconnect loop has not completed.
+            async def close():
+                finished.set()
+            bot = MagicMock()
+            bot.start = AsyncMock(side_effect=connecting)
+            bot.close = AsyncMock(side_effect=close)
+            bot.is_ready.return_value = False
+            with patch('media_bot.panel.ControlPanel', return_value=panel) as factory, \
+                    patch('bot.Config.from_env', return_value=config), patch('bot.SeerrBot', return_value=bot), \
+                    patch('builtins.print') as output:
+                task = asyncio.create_task(run_application())
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    factory.assert_called_once_with('0.0.0.0', 0)
+                    self.assertFalse(task.done())
+                    self.assertFalse(bot.is_ready())
+                    text = output.call_args.args[0]
+                    self.assertIn(f'listening on 0.0.0.0:{panel.port}', text)
+                    self.assertIn(f'http://127.0.0.1:{panel.port}', text)
+                    async with ClientSession() as client:
+                        for path in ('/', '/panel.js'):
+                            async with client.get(f'http://127.0.0.1:{panel.port}{path}') as response:
+                                self.assertEqual(response.status, 200)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual(panel.runner.addresses, [])
+
     async def test_panel_survives_incomplete_config_and_bot_login_failure_and_can_restart(self):
         from bot import run_application
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):

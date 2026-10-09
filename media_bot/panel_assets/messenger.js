@@ -10,11 +10,12 @@ export async function mountMessenger(host, api, reportError) {
   const el = (tag, text, cls) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
   const btn = (text, fn, cls = 'button subtle') => {
     const button = el('button', text, cls); button.type = 'button';
-    button.addEventListener('click', async () => { button.disabled = true; try { await fn(); } catch (error) { reportError(error.message); } finally { button.disabled = false; } });
+    button.addEventListener('click', async () => { button.disabled = true; button.setAttribute('aria-busy', 'true'); try { await fn(); } catch (error) { reportError(error.message); } finally { button.disabled = false; button.removeAttribute('aria-busy'); } });
     return button;
   };
   const shell = el('section', undefined, 'chat-shell');
   const sidebar = el('aside', undefined, 'chat-sidebar');
+  sidebar.id = 'conversation-list'; sidebar.setAttribute('aria-label', 'Conversations');
   const main = el('section', undefined, 'chat-main');
   const header = el('header', undefined, 'chat-header');
   const timeline = el('div', undefined, 'chat-timeline'); timeline.setAttribute('role', 'log'); timeline.setAttribute('aria-live', 'polite');
@@ -26,16 +27,20 @@ export async function mountMessenger(host, api, reportError) {
   const request = async (operation, args = {}) => (await api('/api/admin', { operation, ...args })).result;
 
   function modal(title, build) {
-    const dialog = el('dialog', undefined, 'confirm-dialog chat-dialog'); dialog.append(el('h2', title));
-    const close = () => { dialog.close(); dialog.remove(); };
+    const trigger = document.activeElement;
+    const dialog = el('dialog', undefined, 'confirm-dialog chat-dialog'); dialog.setAttribute('aria-label', title); dialog.append(el('h2', title));
+    const close = () => { dialog.close(); dialog.remove(); if (trigger?.isConnected) trigger.focus(); };
     dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
     build(dialog, close); host.append(dialog); dialog.showModal(); return dialog;
   }
   async function open(selection) {
+    shell.classList.remove('sidebar-open');
     active = selection; page = 1; query = ''; generation += 1;
     mode = selection.kind === 'history' ? 'announcement' : 'normal';
     recipients = { guilds: selection.kind === 'guild' ? [selection.id] : [], user: selection.kind === 'dm' ? selection.id : null,
       channel: selection.channel || null, all: false };
+    timeline.replaceChildren(el('p', 'Loading conversation…', 'loading'));
+    timeline.setAttribute('aria-busy', 'true');
     drawHeader(); drawComposer(); await refresh();
   }
   function drawSidebar() {
@@ -50,6 +55,8 @@ export async function mountMessenger(host, api, reportError) {
     sidebar.append(el('h3', 'DIRECT MESSAGES', 'chat-section-label'));
     for (const thread of admin.threads.filter(item => item.kind === 'dm')) {
       const button = btn(thread.name, () => open({ kind: 'dm', id: thread.id, name: thread.name }), 'chat-thread');
+      button.setAttribute('aria-label', thread.name);
+      button.dataset.initial = thread.name.slice(0, 1).toUpperCase(); button.dataset.count = String(thread.count);
       button.classList.toggle('selected', active.kind === 'dm' && active.id === thread.id); button.title = `${thread.count} retained messages`; sidebar.append(button);
     }
     sidebar.append(el('h3', 'SERVERS & CHANNELS', 'chat-section-label'));
@@ -77,7 +84,11 @@ export async function mountMessenger(host, api, reportError) {
     sidebar.scrollTop = scroll;
   }
   function drawHeader() {
-    header.replaceChildren(el('span', active.kind === 'dm' ? '◉' : '#', 'chat-header-icon'), el('h2', active.name));
+    const toggle = btn('Conversations', () => {
+      const expanded = shell.classList.toggle('sidebar-open'); toggle.setAttribute('aria-expanded', String(expanded));
+    }, 'button subtle conversation-toggle');
+    toggle.setAttribute('aria-controls', sidebar.id); toggle.setAttribute('aria-expanded', String(shell.classList.contains('sidebar-open')));
+    header.replaceChildren(toggle, el('span', active.kind === 'dm' ? '◉' : '#', 'chat-header-icon'), el('h2', active.name));
     if (active.guild) header.append(el('span', active.guild, 'fine'));
     const search = el('form', undefined, 'chat-search');
     const input = el('input'); input.type = 'search'; input.maxLength = 100; input.value = query; input.placeholder = 'Search this conversation'; input.setAttribute('aria-label', 'Search conversation');
@@ -126,7 +137,9 @@ export async function mountMessenger(host, api, reportError) {
     else tools.append(el('span', `Reply as the bot · ${active.name}`, 'fine'));
     const textarea = el('textarea', undefined, 'panel-draft'); textarea.maxLength = 2000; textarea.rows = 3; textarea.value = current.text;
     textarea.placeholder = `Message ${active.kind === 'dm' ? '@' : '#'}${active.name}`; textarea.setAttribute('aria-label', 'Message');
-    textarea.addEventListener('input', () => { current.text = textarea.value; current.nonce = nonce(); });
+    const counter = el('small', `${current.text.length} / 2,000`, 'chat-compose-count'); counter.setAttribute('aria-label', 'Message character count');
+    const resize = () => { textarea.style.height = 'auto'; textarea.style.height = `${Math.min(160, Math.max(64, textarea.scrollHeight))}px`; };
+    textarea.addEventListener('input', () => { current.text = textarea.value; current.nonce = nonce(); counter.textContent = `${current.text.length} / 2,000`; resize(); });
     const attachments = el('div', undefined, 'chat-upload-list');
     const drawFiles = () => {
       attachments.replaceChildren(chatAttachments(current.files));
@@ -148,34 +161,41 @@ export async function mountMessenger(host, api, reportError) {
         }
       } catch (error) { reportError(error.message); } finally { current.uploading = false; input.value = ''; }
     });
+    let sending = false;
     const send = async () => {
+      if (sending) return;
       if (current.uploading) throw new Error('Wait for attachments to finish uploading before sending.');
       current.text = textarea.value; // Also supports autofill/test inputs without an input event.
-      const uploads = current.files.map(file => file.id);
-      const sentFiles = current.files.map(file => ({ ...file })), sentNonce = current.nonce;
-      const clearSent = () => {
-        if (current.nonce !== sentNonce) return;
-        current.text = ''; current.files = []; current.nonce = nonce(); textarea.value = ''; drawFiles();
-      };
-      if (mode === 'normal') {
-        await request('chat', { message: current.text, uploads, request_id: current.nonce,
-          user_id: active.kind === 'dm' ? active.id : null, guild_id: active.kind === 'guild' ? active.id : null, channel_id: active.channel || null });
-        clearSent(); await refresh();
-      } else {
-        const plan = await request('prepare', { message: current.text, uploads, guild_ids: recipients.guilds,
-          user_id: recipients.user, channel_id: recipients.channel, all_users: recipients.all });
-        modal('Confirm announcement', (dialog, close) => {
-          dialog.append(el('p', `${plan.channels} channels · ${plan.users} DMs · ${plan.skipped.length} unavailable`));
-          for (const target of plan.destinations) dialog.append(el('p', target, 'discord-tag'));
-          dialog.append(discordContent(plan.message), chatAttachments(sentFiles), el('p', 'Mentions and URL unfurls are disabled.', 'fine'));
-          dialog.append(btn('Cancel', close), btn('Confirm', async () => { await request('send', { plan: plan.plan, confirmed: true }); close(); clearSent(); await refresh(); }, 'button primary'));
-        });
-      }
+      if (!current.text.trim() && !current.files.length) throw new Error('Write a message or attach a file first.');
+      sending = true;
+      try {
+        const uploads = current.files.map(file => file.id);
+        const sentFiles = current.files.map(file => ({ ...file })), sentNonce = current.nonce;
+        const clearSent = () => {
+          if (current.nonce !== sentNonce) return;
+          current.text = ''; current.files = []; current.nonce = nonce(); textarea.value = ''; counter.textContent = '0 / 2,000'; resize(); drawFiles();
+        };
+        if (mode === 'normal') {
+          await request('chat', { message: current.text, uploads, request_id: current.nonce,
+            user_id: active.kind === 'dm' ? active.id : null, guild_id: active.kind === 'guild' ? active.id : null, channel_id: active.channel || null });
+          clearSent(); await refresh();
+        } else {
+          const plan = await request('prepare', { message: current.text, uploads, guild_ids: recipients.guilds,
+            user_id: recipients.user, channel_id: recipients.channel, all_users: recipients.all });
+          modal('Confirm announcement', (dialog, close) => {
+            dialog.append(el('p', `${plan.channels} channels · ${plan.users} DMs · ${plan.skipped.length} unavailable`));
+            for (const target of plan.destinations) dialog.append(el('p', target, 'discord-tag'));
+            dialog.append(discordContent(plan.message), chatAttachments(sentFiles), el('p', 'Mentions and URL unfurls are disabled.', 'fine'));
+            dialog.append(btn('Cancel', close), btn('Confirm', async () => { await request('send', { plan: plan.plan, confirmed: true }); close(); clearSent(); await refresh(); }, 'button primary'));
+          });
+        }
+      } finally { sending = false; }
     };
     const sendButton = btn(mode === 'normal' ? 'Send' : 'Preview announcement', send, 'button primary');
     textarea.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && mode === 'normal') { event.preventDefault(); sendButton.click(); } });
-    tools.append(btn('＋ Attach files', () => input.click()), sendButton);
+    tools.append(btn('＋ Attach files', () => input.click()), counter, sendButton);
     composer.append(attachments, textarea, tools, input, el('small', 'Enter to send · Shift+Enter for a new line · Up to 4 files, 8 MiB each / 16 MiB total', 'fine'));
+    resize();
   }
   async function refresh() {
     if (disposed) return;
@@ -200,8 +220,11 @@ export async function mountMessenger(host, api, reportError) {
         attachments: job.attachments, deliveries: job.deliveries, job: job.id, counts: job.counts })) : [...result.messages].reverse();
       const old = new Map([...timeline.children].map(node => [node.dataset.message, node]));
       const nodes = [];
+      let lastDay;
       for (const item of messages) {
-        const signature = JSON.stringify(item); let node = old.get(item.message_id);
+        const day = new Date(item.created_at * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+        if (day !== lastDay) { const divider = el('div', day, 'chat-date'); nodes.push(divider); lastDay = day; }
+        const signature = JSON.stringify([key(), item]); let node = old.get(item.message_id);
         if (!node || node.dataset.signature !== signature) {
           node = chatMessage(item); node.dataset.signature = signature;
           const body = node.querySelector('.chat-message-body');
@@ -235,8 +258,15 @@ export async function mountMessenger(host, api, reportError) {
       const newer = btn('Newer messages', async () => { page = Math.max(1, page - 1); generation += 1; await refresh(); }); newer.disabled = page === 1;
       paging.replaceChildren(older, el('small', `Page ${page} · ${result.total} retained`, 'fine'), newer);
       const status = header.querySelector('.chat-live'); if (status) status.textContent = source?.readyState === 1 ? '● Live' : '● Reconnecting';
-    } catch (error) { if (!disposed) reportError(error.message); }
-    finally { refreshBusy = false; if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); } }
+    } catch (error) {
+      if (!disposed) {
+        reportError(error.message);
+        if (version === generation && timeline.querySelector('.loading')) timeline.replaceChildren(el('p', 'Conversation unavailable. Use Refresh to try again.', 'chat-empty'));
+      }
+    } finally {
+      if (version === generation) timeline.removeAttribute('aria-busy');
+      refreshBusy = false; if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); }
+    }
   }
   admin = await request('state');
   if (disposed || !host.isConnected) return { dispose() {} };

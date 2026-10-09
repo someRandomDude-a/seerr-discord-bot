@@ -449,7 +449,9 @@ async def run_application():
         panel = ControlPanel(os.getenv('PANEL_HOST', '127.0.0.1'), port)
         await panel.start()
         address = '127.0.0.1' if panel.host in ('0.0.0.0', '::') else panel.host
-        print(f'Local admin panel: http://{address}:{panel.port}\nOne-time access code: {panel.code}\n'
+        print(f'Private admin panel listening on {panel.host}:{panel.port}\n'
+              f'Local browser URL (use SSH forwarding for remote Docker): http://{address}:{panel.port}\n'
+              f'One-time access code: {panel.code}\n'
               'Keep this code/private port out of public proxies and shared logs.', flush=True)
     try:
         while True:
