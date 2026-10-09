@@ -1,6 +1,7 @@
 import math
 import re
 import time
+from types import SimpleNamespace
 import discord
 
 from .security import UserError
@@ -47,6 +48,58 @@ class OwnedView(discord.ui.View):
     def __init__(self, bot, owner, timeout=300):
         super().__init__(timeout=timeout)
         self.bot, self.owner = bot, owner
+        self.flow = SimpleNamespace(busy=False, current=self)
+        self.revision = 0
+
+    def clear_items(self):
+        self.revision += 1
+        return super().clear_items()
+
+    def callback(self, callback):
+        revision = self.revision
+
+        async def invoke(interaction):
+            await self.perform(interaction, callback, revision)
+        return invoke
+
+    async def perform(self, interaction, callback, revision=None):
+        # Acknowledge overlapping/stale clicks without queuing another mutation.
+        # The same flow follows the message through Home, Back and detail views.
+        if self.flow.busy:
+            await error_message(interaction, 'This message is updating. Please wait for the result.')
+            return
+        if self.flow.current is not self or (revision is not None and revision != self.revision):
+            await error_message(interaction, 'This control was replaced. Use the controls currently displayed.')
+            return
+        self.flow.busy = True
+        try:
+            await callback(interaction)
+        except Exception as exc:
+            await self.on_error(interaction, exc, None)
+        finally:
+            self.flow.busy = False
+
+    async def defer_update(self, interaction):
+        if interaction.type in (discord.InteractionType.component, discord.InteractionType.modal_submit):
+            # A deferred acknowledgement alone leaves old controls looking idle.
+            # Replace them immediately; never re-render cached private data here.
+            await interaction.response.edit_message(content=None,
+                embeds=[embed('Updating…', 'Please wait while live access and your selection are checked.')], view=None)
+        else:
+            await interaction.response.defer(ephemeral=True)
+
+    async def update(self, interaction, **kwargs):
+        view = kwargs.get('view')
+        if isinstance(view, OwnedView):
+            view.flow = self.flow
+        previous = self.flow.current
+        if isinstance(previous, OwnedView) and previous is not view:
+            # Stop before the edit registers the replacement. discord.py's
+            # ViewStore removes message tracking when an old view is stopped;
+            # doing that after registration also untracks the new view.
+            previous.stop()
+        await interaction.edit_original_response(content=None, **kwargs)
+        self.flow.current = view
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.owner:
@@ -60,11 +113,15 @@ class OwnedView(discord.ui.View):
             return False
 
     async def on_error(self, interaction, error, item):
-        await error_message(interaction, str(error) if isinstance(error, UserError) else 'Something went wrong. No success was confirmed. Refresh and check /status.')
+        message = str(error) if isinstance(error, UserError) else 'Something went wrong. No success was confirmed. Check /status before retrying.'
+        if interaction.response.is_done() and interaction.response.type != discord.InteractionResponseType.deferred_channel_message:
+            await self.update(interaction, embeds=[embed('Unable to update', message + '\nOpen the slash command again to continue.')], view=None)
+        else:
+            await error_message(interaction, message)
 
     def button(self, label, callback, style=discord.ButtonStyle.secondary, row=None, disabled=False):
         button = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
-        button.callback = callback
+        button.callback = self.callback(callback)
         self.add_item(button)
         return button
 
@@ -76,11 +133,14 @@ class QuickConnectView(OwnedView):
         self.button('Cancel connection', self.cancel)
 
     async def cancel(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        # The polling worker can finish while cancellation waits for its lock.
+        # Do not replace its successful result with a loading/error screen.
+        await interaction.response.defer(ephemeral=True, thinking=False)
         cancelled = await self.bot.linking.cancel(self.owner, self.session.generation)
         if not cancelled:
-            raise UserError('This connection already finished or was replaced. Check /dashboard or run /link.')
-        await interaction.edit_original_response(embed=embed('Connection cancelled', 'No new account was linked. Run /link whenever you are ready.'), view=None)
+            await error_message(interaction, 'This connection already finished or was replaced. Check /dashboard or run /link.')
+            return
+        await self.update(interaction, embed=embed('Connection cancelled', 'No new account was linked. Run /link whenever you are ready.'), view=None)
         self.stop()
 
 
@@ -109,33 +169,40 @@ class AnnouncementConfirmView(OwnedView):
         if self.used:
             raise UserError('This preview was already used.')
         self.used = True
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         job = await self.bot.service.offload(self.bot.admin.confirm, self.owner, self.plan['plan'])
-        await interaction.edit_original_response(embed=embed('Announcement started', f'#{job} · /deliveries job:{job}'), view=None)
+        await self.update(interaction, embed=embed('Announcement started', f'#{job} · /deliveries job:{job}'), view=None)
         self.stop()
 
     async def cancel(self, interaction):
+        if self.used:
+            raise UserError('This preview was already used.')
         self.used = True
         self.bot.admin.plans.pop(self.plan['plan'], None)
         await interaction.response.edit_message(embed=embed('Cancelled'), view=None)
+        self.flow.current = None
         self.stop()
 
 
 class SearchModal(discord.ui.Modal, title='Discover something great'):
     query = discord.ui.TextInput(label='Title, artist or author', placeholder='What would you like to enjoy?', max_length=100)
 
-    def __init__(self, bot, owner, kind):
+    def __init__(self, bot, owner, kind, parent):
         super().__init__(timeout=300)
-        self.bot, self.owner, self.kind = bot, owner, kind
+        self.bot, self.owner, self.kind, self.parent = bot, owner, kind, parent
+        self.revision = parent.revision
 
     async def on_submit(self, interaction):
         if interaction.user.id != self.owner:
             raise UserError('This form belongs to another user.')
         self.bot.guard(interaction)
-        await interaction.response.defer(ephemeral=True)
+        await self.parent.perform(interaction, self.search, self.revision)
+
+    async def search(self, interaction):
+        await self.parent.defer_update(interaction)
         view = ItemsView(self.bot, self.owner, 'search', (self.kind, self.query.value, 1), title='Discover')
         await view.load()
-        await interaction.followup.send(embeds=view.gallery(), view=view, ephemeral=True)
+        await self.parent.update(interaction, embeds=view.gallery(), view=view)
 
     async def on_error(self, interaction, error):
         await error_message(interaction, str(error) if isinstance(error, UserError) else 'Search failed. Please try again.')
@@ -155,22 +222,22 @@ class DashboardView(OwnedView):
             discord.SelectOption(label=f'{ICONS[k]} {label}', value=k) for k, label in
             [('movie', 'Movies'), ('tv', 'Series'), ('music', 'Music'), ('book', 'Books')]], row=2)
         async def browse(interaction):
-            await self.show_items(interaction, 'library', (select.values[0],), 'Available library')
-        select.callback = browse
+            await self.show_items(interaction, 'library', (interaction.data['values'][0],), 'Available library')
+        select.callback = self.callback(browse)
         self.add_item(select)
         search = discord.ui.Select(placeholder='Search & make a new request…', options=[
             discord.SelectOption(label=f'{ICONS[k]} {label}', value=k) for k, label in
             [('movie', 'Movies'), ('tv', 'Series'), ('music', 'Albums'), ('book', 'Books')]], row=3)
         async def discover(interaction):
-            await interaction.response.send_modal(SearchModal(bot, owner, search.values[0]))
-        search.callback = discover
+            await interaction.response.send_modal(SearchModal(bot, owner, interaction.data['values'][0], self))
+        search.callback = self.callback(discover)
         self.add_item(search)
 
     async def show_items(self, interaction, operation, args, title):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         view = ItemsView(self.bot, self.owner, operation, args, title)
         await view.load()
-        await interaction.edit_original_response(embeds=view.gallery(), view=view)
+        await self.update(interaction, embeds=view.gallery(), view=view)
 
     async def discover(self, interaction):
         await self.show_items(interaction, 'discover', ('movie', 1), 'Discover · Popular movies')
@@ -188,7 +255,7 @@ class DashboardView(OwnedView):
         await self.show_items(interaction, 'deletions', (), 'My file deletions · 24-hour undo window')
 
     async def storage(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         disks = await self.bot.service.run(self.owner, 'storage')
         result = embed('💽 Storage overview', 'Live free space reported by each configured service. Shared volumes may appear more than once.')
         for source, rows in disks.items():
@@ -204,19 +271,19 @@ class DashboardView(OwnedView):
                 break
         if not result.fields:
             result.description = 'Configure RADARR, SONARR, LIDARR or READARR URL/API key to report live storage.'
-        await interaction.edit_original_response(embed=result, view=DashboardView(self.bot, self.owner))
+        await self.update(interaction, embed=result, view=DashboardView(self.bot, self.owner))
 
     async def notifications(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         await self.bot.service.verified_account(self.owner)
         devices = await self.bot.service.offload(self.bot.service.devices)
         view = PreferencesView(self.bot, self.owner, devices)
-        await interaction.edit_original_response(embed=view.render(), view=view)
+        await self.update(interaction, embed=view.render(), view=view)
 
     async def refresh(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         result = await self.bot.service.run(self.owner, 'dashboard')
-        await interaction.edit_original_response(embed=dashboard_embed(result), view=DashboardView(self.bot, self.owner))
+        await self.update(interaction, embed=dashboard_embed(result), view=DashboardView(self.bot, self.owner))
 
 
 def dashboard_embed(data):
@@ -252,7 +319,7 @@ class ItemsView(OwnedView):
         if not isinstance(self.query, str) or len(self.query) > 100:
             raise UserError('Filter must be at most 100 characters.')
         self.items = [i for i in self.catalog if self.query.lower() in i['title'].lower()]
-        self.page = min(self.page, max(0, math.ceil(len(self.items) / 5) - 1))
+        self.page = min(max(0, self.page), max(0, math.ceil(len(self.items) / 5) - 1))
         self.rebuild()
 
     def visible(self):
@@ -311,17 +378,24 @@ class ItemsView(OwnedView):
     def rebuild(self):
         self.clear_items()
         if self.visible():
+            visible = tuple(self.visible())
             select = discord.ui.Select(placeholder='Choose an item…', options=[
                  discord.SelectOption(label=f'{index + 1}. {it["title"]}'[:100], value=str(index), description=(it.get('subtitle') or it['kind'])[:100])
                 for index, it in enumerate(self.visible())], row=0)
             async def details(interaction):
-                selected = self.visible()[int(select.values[0])]
-                await interaction.response.defer(ephemeral=True)
+                selected = visible[int(interaction.data['values'][0])]
+                await self.defer_update(interaction)
                 await self.validate()
-                fresh = selected if self.operation == 'deletions' else await self.bot.service.run(self.owner, 'details', selected)
+                if self.operation == 'deletions':
+                    rows = await self.bot.service.deletions(self.owner)
+                    fresh = next((row for row in rows if row['id'] == selected['id']), None)
+                    if fresh is None:
+                        raise UserError('This deletion is no longer listed. Open /deletions again.')
+                else:
+                    fresh = await self.bot.service.run(self.owner, 'details', selected)
                 view = DetailView(self.bot, self.owner, fresh, self)
-                await interaction.edit_original_response(embed=view.render(), view=view)
-            select.callback = details
+                await self.update(interaction, embed=view.render(), view=view)
+            select.callback = self.callback(details)
             self.add_item(select)
         self.button('← Previous', self.previous, row=1, disabled=self.page == 0 and not (self.remote_page() and self.args[-1] > 1))
         self.button('Next →', self.next, row=1, disabled=(self.page + 1) * 5 >= len(self.items) and not (self.remote_page() and self.args[-1] < 500 and self.items))
@@ -338,59 +412,63 @@ class ItemsView(OwnedView):
             category = discord.ui.Select(placeholder='Change category…', options=[
                 discord.SelectOption(label=label, value=kind, default=self.args[0] == kind) for kind, label in kinds], row=3)
             async def change(interaction):
-                self.args = (category.values[0], 1) if self.operation == 'discover' else (category.values[0],)
-                self.page = 0
-                await self.refresh(interaction)
-            category.callback = change
+                kind = interaction.data['values'][0]
+                args = (kind, 1) if self.operation == 'discover' else (kind,)
+                title = f"Discover · Popular {'movies' if kind == 'movie' else 'series'}" if self.operation == 'discover' else self.title
+                await self.refresh(interaction, args=args, page=0, title=title)
+            category.callback = self.callback(change)
             self.add_item(category)
 
     async def previous(self, interaction):
         if self.page == 0 and self.remote_page() and self.args[-1] > 1:
-            self.args = (*self.args[:-1], self.args[-1] - 1)
-            await interaction.response.defer(ephemeral=True)
-            await self.load()
-            self.page = max(0, math.ceil(len(self.items) / 5) - 1)
-            self.rebuild()
-            await interaction.edit_original_response(embeds=self.gallery(), view=self)
+            await self.refresh(interaction, args=(*self.args[:-1], self.args[-1] - 1), page=-1)
             return
-        self.page = max(0, self.page - 1)
-        await self.show_page(interaction)
+        await self.show_page(interaction, page=max(0, self.page - 1))
 
     async def next(self, interaction):
         if (self.page + 1) * 5 >= len(self.items) and self.remote_page() and self.args[-1] < 500:
-            self.args = (*self.args[:-1], self.args[-1] + 1)
-            self.page = 0
-            await self.refresh(interaction)
+            await self.refresh(interaction, args=(*self.args[:-1], self.args[-1] + 1), page=0)
             return
-        self.page += 1
-        await self.show_page(interaction)
+        await self.show_page(interaction, page=self.page + 1)
 
-    async def show_page(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+    def copy(self, args=None, page=None, title=None, query=None):
+        view = ItemsView(self.bot, self.owner, self.operation, self.args if args is None else args,
+            self.title if title is None else title, self.query if query is None else query)
+        view.page = self.page if page is None else page
+        return view
+
+    async def show_page(self, interaction, page=None, query=None):
+        await self.defer_update(interaction)
         await self.validate()
-        self.page = min(max(0, self.page), max(0, math.ceil(len(self.items) / 5) - 1))
-        self.rebuild()
-        await interaction.edit_original_response(embeds=self.gallery(), view=self)
+        view = self.copy(page=page, query=query)
+        view.catalog = self.catalog
+        view.filter_items()
+        await self.update(interaction, embeds=view.gallery(), view=view)
 
     async def filter(self, interaction):
         await interaction.response.send_modal(CollectionFilterModal(self))
 
     async def search(self, interaction):
         kind = self.args[0] if self.operation in ('search', 'discover', 'library') and self.args[0] != 'all' else 'movie'
-        await interaction.response.send_modal(SearchModal(self.bot, self.owner, kind))
+        await interaction.response.send_modal(SearchModal(self.bot, self.owner, kind, self))
 
     async def toggle_requests(self, interaction):
-        self.args, self.page = (not self.args[0],), 0
-        self.title = 'All requests' if self.args[0] else 'My requests'
-        await self.refresh(interaction)
+        all_requests = not self.args[0]
+        await self.refresh(interaction, args=(all_requests,), page=0, title='All requests' if all_requests else 'My requests')
 
-    async def refresh(self, interaction):
-        await interaction.response.defer(ephemeral=True)
-        await self.load()
-        await interaction.edit_original_response(embeds=self.gallery(), view=self)
+    async def refresh(self, interaction, args=None, page=None, title=None):
+        await self.defer_update(interaction)
+        view = self.copy(args=args, page=page, title=title)
+        await view.load()
+        if page == -1:
+            view.page = max(0, math.ceil(len(view.items) / 5) - 1)
+            view.rebuild()
+        await self.update(interaction, embeds=view.gallery(), view=view)
 
     async def home(self, interaction):
-        await DashboardView(self.bot, self.owner).refresh(interaction)
+        view = DashboardView(self.bot, self.owner)
+        view.flow = self.flow
+        await view.refresh(interaction)
 
 
 def identity(item):
@@ -401,6 +479,7 @@ class CollectionFilterModal(discord.ui.Modal, title='Filter this gallery'):
     def __init__(self, parent):
         super().__init__(timeout=300)
         self.parent = parent
+        self.revision = parent.revision
         self.query = discord.ui.TextInput(label='Title contains', default=parent.query, required=False, max_length=100)
         self.add_item(self.query)
 
@@ -408,11 +487,9 @@ class CollectionFilterModal(discord.ui.Modal, title='Filter this gallery'):
         if interaction.user.id != self.parent.owner:
             raise UserError('This gallery belongs to another user.')
         self.parent.bot.guard(interaction)
-        await interaction.response.defer(ephemeral=True)
-        await self.parent.validate()
-        self.parent.query, self.parent.page = self.query.value, 0
-        self.parent.filter_items()
-        await interaction.edit_original_response(embeds=self.parent.gallery(), view=self.parent)
+        async def apply(interaction):
+            await self.parent.show_page(interaction, page=0, query=self.query.value)
+        await self.parent.perform(interaction, apply, self.revision)
 
     async def on_error(self, interaction, error):
         await error_message(interaction, str(error) if isinstance(error, UserError) else 'Filter unavailable. Refresh the gallery.')
@@ -452,36 +529,37 @@ class DetailView(OwnedView):
         return result
 
     async def request(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         await self.bot.service.verified_account(self.owner)
-        view = ConfirmView(self.bot, self.owner, 'request', (self.item,), f"Request {clean(self.item['title'], 100)}?", 'TV requests include all seasons. Music/book requests are sent directly to the configured service using its default profiles.')
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        view = ConfirmView(self.bot, self.owner, 'request', (self.item,), f"Request {clean(self.item['title'], 100)}?", 'TV requests include all seasons. Music/book requests are sent directly to the configured service using its default profiles.', parent=self.parent)
+        await self.update(interaction, embed=view.render(), view=view)
 
     async def follow(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         if self.parent.operation == 'watches':
             message = await self.bot.service.unwatch(self.owner, self.item)
         else:
             message = await self.bot.service.run(self.owner, 'watch', self.item, False)
-        await interaction.followup.send(message, ephemeral=True)
+        await self.update(interaction, embed=embed('Watchlist updated', message), view=ActionResultView(self.bot, self.owner, self.parent))
 
     async def open(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        # Opening a browser link does not change the source message's state.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         url = await self.bot.service.run(self.owner, 'open', self.item)
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label='▶ Open in Jellyfin', url=url))
         await interaction.followup.send('Open this item on your selected Jellyfin server/device. You may need to sign in there.', view=view, ephemeral=True)
 
     async def delete(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         await self.bot.service.verified_account(self.owner)
-        view = ConfirmView(self.bot, self.owner, 'delete', (self.item['id'],), 'Schedule file deletion in 24 hours?', 'No files are deleted now. You can undo with /deletions during the 24-hour delay. After that, the entire movie/series is removed from Radarr/Sonarr, including files shared by other users. Seerr requests will not be deleted.')
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        view = ConfirmView(self.bot, self.owner, 'delete', (self.item['id'],), 'Schedule file deletion in 24 hours?', 'No files are deleted now. You can undo with /deletions during the 24-hour delay. After that, the entire movie/series is removed from Radarr/Sonarr, including files shared by other users. Seerr requests will not be deleted.', parent=self.parent)
+        await self.update(interaction, embed=view.render(), view=view)
 
     async def undo(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         message = await self.bot.service.cancel_deletion(self.owner, self.item['id'])
-        await interaction.edit_original_response(embed=embed('Deletion undone', message), view=None)
+        await self.update(interaction, embed=embed('Deletion undone', message), view=ActionResultView(self.bot, self.owner, self.parent))
 
     async def back(self, interaction):
         await self.parent.show_page(interaction)
@@ -491,9 +569,10 @@ class DetailView(OwnedView):
 
 
 class ConfirmView(OwnedView):
-    def __init__(self, bot, owner, operation, args, title, description):
+    def __init__(self, bot, owner, operation, args, title, description, parent=None):
         super().__init__(bot, owner, timeout=60)
         self.operation, self.args, self.title, self.description = operation, args, title, description
+        self.parent = parent
         self.claimed = False
         self.button('Confirm', self.confirm, discord.ButtonStyle.danger if operation == 'delete' else discord.ButtonStyle.primary)
         self.button('Cancel', self.cancel)
@@ -505,17 +584,38 @@ class ConfirmView(OwnedView):
         if self.claimed:
             raise UserError('This confirmation was already used.')
         self.claimed = True
-        await interaction.response.defer(ephemeral=True)
-        self.clear_items()
-        await interaction.edit_original_response(view=self)
+        await self.defer_update(interaction)
         message = await self.bot.service.run(self.owner, self.operation, *self.args)
-        await interaction.edit_original_response(embed=embed('Action recorded', message), view=None)
+        await self.update(interaction, embed=embed('Action recorded', message), view=ActionResultView(self.bot, self.owner, self.parent))
         self.stop()
 
     async def cancel(self, interaction):
+        if self.claimed:
+            raise UserError('This confirmation was already used.')
         self.claimed = True
         self.stop()
-        await interaction.response.edit_message(content='Cancelled. No changes were made.', embed=None, view=None)
+        await self.defer_update(interaction)
+        await self.update(interaction, embed=embed('Cancelled', 'No changes were made.'), view=ActionResultView(self.bot, self.owner, self.parent))
+
+
+class ActionResultView(OwnedView):
+    """A mutation receipt never retains stale action buttons or media state."""
+    def __init__(self, bot, owner, parent=None):
+        super().__init__(bot, owner)
+        self.parent = parent
+        if parent is not None:
+            self.button('← Back', self.back)
+        self.button('⌂ Home', self.home)
+
+    async def back(self, interaction):
+        # A successful mutation invalidates the old collection snapshot.
+        self.parent.flow = self.flow
+        await self.parent.refresh(interaction)
+
+    async def home(self, interaction):
+        view = DashboardView(self.bot, self.owner)
+        view.flow = self.flow
+        await view.refresh(interaction)
 
 
 class PreferencesView(OwnedView):
@@ -530,14 +630,21 @@ class PreferencesView(OwnedView):
             select = discord.ui.Select(placeholder='Choose your Jellyfin device/server link…', options=[
                 discord.SelectOption(label=name, value=name) for name in self.devices], row=1)
             async def device(interaction):
-                await interaction.response.defer(ephemeral=True)
-                message = await bot.service.run(owner, 'preferences', None, select.values[0])
-                await interaction.edit_original_response(embed=self.render(), view=self)
-            select.callback = device
+                selected = interaction.data['values'][0]
+                await self.defer_update(interaction)
+                await bot.service.run(owner, 'preferences', None, selected)
+                view = PreferencesView(bot, owner, self.devices)
+                await self.update(interaction, embed=view.render(), view=view)
+            select.callback = self.callback(device)
             self.add_item(select)
 
     def render(self):
         account = self.bot.service.account(self.owner)
+        selected = account.get('device') or next(iter(self.devices))
+        for child in self.children:
+            if isinstance(child, discord.ui.Select):
+                for option in child.options:
+                    option.default = option.value == selected
         result = embed('Preferences', 'DMs for requests and watched items. Off by default.')
         result.add_field(name='Personal DMs', value='🟢 Enabled' if account['opted_in'] else '⚪ Muted')
         result.add_field(name='Jellyfin link', value=clean(account.get('device') or next(iter(self.devices))))
@@ -545,14 +652,15 @@ class PreferencesView(OwnedView):
         return result
 
     async def set_opt_in(self, interaction, enabled):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         if enabled:
             await self.bot.service.run(self.owner, 'preferences', True)
         else:
             self.bot.service.mute_notifications(self.owner)
-            await interaction.edit_original_response(embed=embed('Updates muted', 'All personal updates muted.'), view=None)
+            await self.update(interaction, embed=embed('Updates muted', 'All personal updates muted.'), view=ActionResultView(self.bot, self.owner))
             return  # Generic local safety receipt; never re-render cached account/device details.
-        await interaction.edit_original_response(embed=self.render(), view=self)
+        view = PreferencesView(self.bot, self.owner, self.devices)
+        await self.update(interaction, embed=view.render(), view=view)
 
     async def enable(self, interaction):
         await self.set_opt_in(interaction, True)
@@ -561,9 +669,14 @@ class PreferencesView(OwnedView):
         await self.set_opt_in(interaction, False)
 
     async def import_watchlist(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await self.defer_update(interaction)
         message = await self.bot.service.run(self.owner, 'sync_watchlist')
-        await interaction.followup.send(message, ephemeral=True)
+        view = PreferencesView(self.bot, self.owner, self.devices)
+        result = view.render()
+        result.add_field(name='Sync result', value=clean(message, 1000), inline=False)
+        await self.update(interaction, embed=result, view=view)
 
     async def home(self, interaction):
-        await DashboardView(self.bot, self.owner).refresh(interaction)
+        view = DashboardView(self.bot, self.owner)
+        view.flow = self.flow
+        await view.refresh(interaction)

@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { JSDOM } from 'jsdom';
 
 const guild = '1234567890123456789', channel = '1234567890123456790', user = '1234567890123456791';
-async function harness({ privateHTTP = false, expireUploads = false } = {}) {
+async function harness({ privateHTTP = false, expireUploads = false, signedIn = true } = {}) {
   const html = await readFile(new URL('../../media_bot/panel_assets/index.html', import.meta.url), 'utf8');
   const source = (await Promise.all(['chat.js', 'messenger.js', 'panel.js'].map(name => readFile(new URL('../../media_bot/panel_assets/' + name, import.meta.url), 'utf8')))).join('\n')
     .replace(/^import .*;\r?\n/gm, '').replace(/export (async )?function/g, '$1function');
@@ -21,6 +21,7 @@ async function harness({ privateHTTP = false, expireUploads = false } = {}) {
   dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; };
   const calls = [];
   const events = [];
+  const control = { authenticated: signedIn, networkFailure: false, serverFailure: false };
   let nonce = 0;
   const context = vm.createContext({ document: dom.window.document, FormData: dom.window.FormData, console,
     URL, crypto: privateHTTP ? { getRandomValues: values => { values.fill(++nonce); return values; } } : { randomUUID: () => `nonce-${String(++nonce).padStart(20, '0')}` },
@@ -35,6 +36,14 @@ async function harness({ privateHTTP = false, expireUploads = false } = {}) {
     fetch: async (path, options = {}) => {
       const args = options.body instanceof dom.window.FormData ? { file: options.body.get('file').name } : options.body ? JSON.parse(options.body) : {};
       calls.push({ path, ...args });
+      if (control.networkFailure && path === '/api/state') throw new Error('Network unavailable');
+      if (control.serverFailure && path === '/api/state') return { ok: false, status: 503, json: async () => ({ error: 'Temporarily unavailable' }) };
+      if (path === '/api/login') {
+        control.authenticated = args.code === 'console-code';
+        return { ok: control.authenticated, status: control.authenticated ? 200 : 401,
+          json: async () => control.authenticated ? { ok: true } : { error: 'Invalid or already used access code' } };
+      }
+      if (!control.authenticated) return { ok: false, status: 401, json: async () => ({ error: 'Panel sign-in required' }) };
       let body = saved;
       if (path === '/api/admin/uploads') {
         body = expireUploads ? { error: 'Session expired' } : { result: { id: 'uploaded-photo', filename: args.file, size: 8, image: true } };
@@ -65,7 +74,7 @@ async function harness({ privateHTTP = false, expireUploads = false } = {}) {
     const button = [...dom.window.document.querySelectorAll('button')].find(element => element.textContent === text);
     assert.ok(button, `Missing button: ${text}`); button.click();
   };
-  return { document: dom.window.document, window: dom.window, context, calls, events, click, settle, close: () => dom.window.close() };
+  return { document: dom.window.document, window: dom.window, context, calls, events, control, click, settle, close: () => dom.window.close() };
 }
 
 test('panel keeps saved secrets blank and environment overrides read-only', async () => {
@@ -198,5 +207,91 @@ test('an expired upload session removes the private messenger and closes its liv
     assert.equal(h.document.querySelector('.chat-shell'), null);
     assert.equal(h.events[0].closed, true);
     assert.match(h.document.body.textContent, /Panel session expired/);
+    assert.ok(h.document.querySelector('#login'));
+  } finally { h.close(); }
+});
+
+test('opening the panel without a cookie keeps a usable login form rather than claiming expiry', async () => {
+  const h = await harness({ signedIn: false });
+  try {
+    assert.ok(h.document.querySelector('#login'));
+    assert.equal(h.document.querySelector('#login-error').hidden, true);
+    assert.doesNotMatch(h.document.querySelector('#login-error').textContent, /expired/i);
+    h.document.querySelector('#login input').value = 'console-code';
+    h.document.querySelector('#login').dispatchEvent(new h.window.Event('submit', { cancelable: true })); await h.settle();
+    assert.ok(h.document.querySelector('[data-key="DISCORD_TOKEN"]'));
+    assert.equal(h.document.querySelector('#login'), null);
+  } finally { h.close(); }
+});
+
+test('a wrong or consumed code shows a login error and allows a successful retry', async () => {
+  const h = await harness({ signedIn: false });
+  try {
+    const form = h.document.querySelector('#login');
+    form.querySelector('input').value = 'wrong';
+    form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await h.settle();
+    assert.equal(h.document.querySelector('#login'), form);
+    assert.match(h.document.querySelector('#login-error').textContent, /Invalid or already used/);
+    assert.doesNotMatch(h.document.querySelector('#login-error').textContent, /session expired/i);
+    form.querySelector('input').value = 'console-code';
+    form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await h.settle();
+    assert.ok(h.document.querySelector('[data-key="DISCORD_TOKEN"]'));
+  } finally { h.close(); }
+});
+
+test('an expired live session removes private content and permits reauthentication in the same page', async () => {
+  const h = await harness();
+  try {
+    h.click('Messages'); await h.settle(); h.click('Viewer'); await h.settle();
+    h.control.authenticated = false; h.events[0].emit('error'); await h.settle();
+    assert.equal(h.document.querySelector('.chat-shell'), null);
+    assert.equal(h.events[0].closed, true);
+    const form = h.document.querySelector('#login'); assert.ok(form);
+    assert.match(h.document.querySelector('#login-error').textContent, /Panel session expired/);
+    form.querySelector('input').value = 'console-code';
+    form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await h.settle();
+    h.click('Messages'); await h.settle();
+    assert.ok(h.document.querySelector('.chat-shell'));
+    assert.equal(h.events.at(-1).closed, false);
+  } finally { h.close(); }
+});
+
+test('tunnel and server interruptions do not masquerade as expiry or permanently close live updates', async () => {
+  const h = await harness();
+  try {
+    h.click('Messages'); await h.settle(); h.click('Viewer'); await h.settle();
+    const draft = h.document.querySelector('.panel-draft'); draft.value = 'Keep my reply'; draft.dispatchEvent(new h.window.Event('input'));
+    for (const fault of ['networkFailure', 'serverFailure']) {
+      h.control[fault] = true; h.events[0].emit('error'); await h.settle();
+      assert.equal(h.document.querySelector('.panel-draft'), draft);
+      assert.equal(h.events[0].closed, false);
+      assert.equal(h.document.querySelector('#login'), null);
+      assert.doesNotMatch(h.document.querySelector('#notice').textContent, /expired/i);
+      h.control[fault] = false;
+    }
+    h.events[0].emit('open'); h.events[0].emit('update'); await h.settle();
+    assert.equal(draft.value, 'Keep my reply');
+    assert.equal(h.document.querySelector('.chat-live').textContent, '● Live');
+  } finally { h.close(); }
+});
+
+test('a late unauthorized response from the old session cannot expire a new sign-in', async () => {
+  const h = await harness();
+  try {
+    const fetch = h.context.fetch;
+    let release;
+    h.context.fetch = async () => new Promise(resolve => { release = resolve; });
+    const pending = vm.runInContext('api("/api/state").catch(error => error.message)', h.context);
+    h.context.fetch = fetch;
+    h.control.authenticated = false;
+    await vm.runInContext('api("/api/state").catch(() => {})', h.context);
+    const form = h.document.querySelector('#login');
+    form.querySelector('input').value = 'console-code';
+    form.dispatchEvent(new h.window.Event('submit', { cancelable: true })); await h.settle();
+    assert.equal(h.document.querySelector('#login'), null);
+    release({ ok: false, status: 401, json: async () => ({ error: 'Old session expired' }) });
+    assert.match(await pending, /Panel session changed/);
+    assert.equal(h.document.querySelector('#login'), null);
+    assert.ok(h.document.querySelector('[data-key="DISCORD_TOKEN"]'));
   } finally { h.close(); }
 });

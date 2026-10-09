@@ -1,7 +1,7 @@
 import { mountMessenger } from './messenger.js';
 
 const root = document.querySelector('#app');
-let state, tab = 'setup', messenger, messengerGeneration = 0;
+let state, tab = 'setup', messenger, messengerGeneration = 0, authGeneration = 0;
 const draft = new Map(), clear = new Set();
 const reports = new Map(), profileChoices = new Map();
 const labels = { DISCORD_TOKEN: 'Bot token', ALLOWED_GUILD_IDS: 'Allowed servers', ADMIN_DISCORD_IDS: 'Bot-only admin IDs',
@@ -23,18 +23,51 @@ function node(tag, text, cls) {
   return element;
 }
 async function api(path, data) {
+  const generation = authGeneration;
   const multipart = data instanceof FormData;
   const response = await fetch(path, { method: data ? 'POST' : 'GET', credentials: 'same-origin',
     headers: data && !multipart ? { 'Content-Type': 'application/json' } : {}, body: multipart ? data : data ? JSON.stringify(data) : undefined });
   const body = await response.json();
+  if (generation !== authGeneration) throw new Error('Panel session changed. Retry after signing in.');
   if (!response.ok) {
-    if (response.status === 401) {
-      messenger?.dispose(); messengerGeneration += 1; draft.clear(); clear.clear();
-      root.replaceChildren(node('p', 'Panel session expired. Reconnect using a new console access code.', 'notice error'));
+    let message = body.error || 'Not confirmed';
+    if (response.status === 401 && path !== '/api/login') {
+      const wasConnected = Boolean(state);
+      if (wasConnected) message = 'Panel session expired or the service restarted. Sign in with the current console access code.';
+      renderLogin(wasConnected ? message : '');
     }
-    throw new Error(body.error || 'Not confirmed');
+    const failure = new Error(message); failure.status = response.status;
+    throw failure;
   }
   return body;
+}
+function renderLogin(message = '') {
+  authGeneration += 1;
+  messenger?.dispose(); messenger = null; messengerGeneration += 1;
+  state = undefined; tab = 'setup'; draft.clear(); clear.clear(); reports.clear(); profileChoices.clear();
+  const section = node('section', undefined, 'setting login');
+  section.append(node('h1', 'Media'), node('p', 'Enter the current one-time access code printed by the service.'));
+  const form = node('form'); form.id = 'login';
+  const input = node('input'); input.name = 'code'; input.type = 'password'; input.autocomplete = 'off'; input.required = true;
+  input.setAttribute('aria-label', 'Console access code');
+  const connect = node('button', 'Connect', 'button primary'); connect.type = 'submit';
+  form.append(input, connect);
+  const notice = node('p', message, 'notice error'); notice.id = 'login-error'; notice.hidden = !message;
+  section.append(form, notice, node('small', 'Use the same panel URL each time. If a still-valid cookie was lost, restart the service for a new code. Expired sessions print a replacement code in the console.', 'fine'));
+  root.replaceChildren(section);
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (connect.disabled) return;
+    // An older bootstrap/live request must not invalidate a new sign-in.
+    authGeneration += 1;
+    connect.disabled = true; notice.hidden = true;
+    try {
+      await api('/api/login', { code: input.value.trim() });
+      input.value = '';
+      state = await api('/api/state'); render();
+    } catch (exc) { error(exc.message); }
+    finally { connect.disabled = false; }
+  });
 }
 function error(message) {
   let target = document.querySelector('#notice') || document.querySelector('#login-error');
@@ -109,6 +142,7 @@ function shell() {
   if (Object.keys(state.webhook_tests || {}).length) root.append(node('p', 'Receiver tests: ' + Object.entries(state.webhook_tests).map(([source, time]) => `${source} ${new Date(time * 1000).toLocaleTimeString()}`).join(' · '), 'fine'));
 }
 function render() {
+  if (!state) return;
   messenger?.dispose(); messenger = null; messengerGeneration += 1;
   shell();
   if (tab === 'messages') { root.append(node('div', 'Loading messages…', 'loading')); return; }
@@ -181,9 +215,7 @@ async function loadMessages() {
   if (version !== messengerGeneration || tab !== 'messages') mounted.dispose();
   else messenger = mounted;
 }
-document.querySelector('#login').addEventListener('submit', async event => {
-  event.preventDefault();
-  try { await api('/api/login', { code: new FormData(event.target).get('code') }); state = await api('/api/state'); render(); }
-  catch (exc) { error(exc.message); }
+renderLogin();
+api('/api/state').then(value => { state = value; render(); }).catch(exc => {
+  if (exc.status !== 401 && exc.message !== 'Panel session changed. Retry after signing in.') error('Unable to reach the panel. Check the SSH tunnel and try connecting again.');
 });
-api('/api/state').then(value => { state = value; render(); }).catch(() => {});

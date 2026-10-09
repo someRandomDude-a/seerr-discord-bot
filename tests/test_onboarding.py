@@ -5,9 +5,10 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiohttp import CookieJar
+from aiohttp import CookieJar, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from media_bot.config import Config
@@ -152,8 +153,9 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
     async def login(self):
         response = await self.post('/api/login', {'code': self.code})
         self.assertEqual(response.status, 200)
-        self.assertTrue(response.cookies['panel_session']['httponly'])
-        self.assertEqual(response.cookies['panel_session']['samesite'], 'Strict')
+        cookie = next(value for name, value in response.cookies.items() if name.startswith('panel_session_'))
+        self.assertTrue(cookie['httponly'])
+        self.assertEqual(cookie['samesite'], 'Strict')
 
     async def verify_required(self):
         response = await self.post('/api/action', {'operation': 'discord', 'changes': {'DISCORD_TOKEN': 'private-discord-token'}})
@@ -166,6 +168,67 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post('/api/login', {'code': 'wrong'})).status, 401)
         await self.login()
         self.assertEqual((await self.post('/api/login', {'code': self.code})).status, 401)
+
+    async def test_panels_on_different_localhost_ports_do_not_overwrite_each_others_cookies(self):
+        await self.login()
+        second_panel = ControlPanel(path=self.panel.path)
+        second = TestClient(TestServer(second_panel.application()), cookie_jar=self.client.session.cookie_jar)
+        await second.start_server()
+        try:
+            origin = str(second.make_url('/')).rstrip('/')
+            response = await second.post('/api/login', json={'code': second_panel.code}, headers={'Origin': origin})
+            self.assertEqual(response.status, 200)
+            names = [cookie.key for cookie in self.client.session.cookie_jar if cookie.key.startswith('panel_session_')]
+            self.assertEqual(len(set(names)), 2)
+            self.assertEqual((await self.client.get('/api/state')).status, 200)
+            self.assertEqual((await second.get('/api/state')).status, 200)
+            # An unrelated application's legacy cookie cannot stomp either panel.
+            self.client.session.cookie_jar.update_cookies({'panel_session': 'unrelated-app'}, response_url=self.client.make_url('/'))
+            self.assertEqual((await self.client.get('/api/state')).status, 200)
+        finally:
+            await second.close()
+
+    async def test_wrong_origin_cannot_revoke_a_valid_panel_session(self):
+        await self.login()
+        token = next(iter(self.panel.sessions))
+        request = SimpleNamespace(host='127.0.0.1:1', cookies={})
+        request.cookies[self.panel.cookie_name(request)] = token
+        with self.assertRaises(web.HTTPForbidden):
+            self.panel.session(request)
+        self.assertIn(token, self.panel.sessions)
+        self.assertEqual((await self.client.get('/api/state')).status, 200)
+
+    async def test_eight_hour_expiry_prints_one_replacement_code_and_allows_reauthentication(self):
+        with patch('media_bot.panel.time') as clock, patch('builtins.print') as output:
+            clock.monotonic.return_value = 10.0
+            await self.login()
+            clock.monotonic.return_value = 10 + 8 * 3600 - .001
+            self.assertEqual((await self.client.get('/api/state')).status, 200)
+            clock.monotonic.return_value = 10 + 8 * 3600
+            response = await self.client.get('/api/state')
+            self.assertEqual(response.status, 401)
+            replacement = self.panel.code
+            self.assertTrue(replacement)
+            self.assertNotEqual(replacement, self.code)
+            self.assertNotIn(replacement, await response.text())
+            self.assertEqual((await self.client.get('/api/state')).status, 401)
+            output.assert_called_once()
+            self.assertIn(replacement, output.call_args.args[0])
+            self.assertEqual((await self.post('/api/login', {'code': self.code})).status, 401)
+            self.assertEqual((await self.post('/api/login', {'code': replacement})).status, 200)
+            self.assertEqual((await self.client.get('/api/state')).status, 200)
+            self.assertEqual((await self.post('/api/login', {'code': replacement})).status, 401)
+
+    async def test_missing_cookie_does_not_rotate_code_or_invalidate_an_active_session(self):
+        await self.login()
+        token = next(iter(self.panel.sessions))
+        request = SimpleNamespace(host=self.panel.sessions[token]['host'], cookies={})
+        with patch('builtins.print') as output, self.assertRaises(web.HTTPUnauthorized):
+            self.panel.session(request)
+        output.assert_not_called()
+        self.assertEqual(self.panel.code, '')
+        self.assertIn(token, self.panel.sessions)
+        self.assertEqual((await self.client.get('/api/state')).status, 200)
 
     async def test_csrf_content_type_and_dns_rebinding_rejected(self):
         self.assertEqual((await self.post('/api/login', {'code': self.code}, origin='http://evil.example')).status, 403)
@@ -192,6 +255,7 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post('/api/action', {'operation': 'save'})
         self.assertEqual(response.status, 200)
         self.assertTrue(self.panel.changed.is_set())
+        self.assertEqual((await self.client.get('/api/state')).status, 200)
         self.assertEqual(load_settings(self.panel.path)['DISCORD_TOKEN'], 'private-discord-token')
         response = await self.post('/api/action', {'operation': 'save', 'changes': {'SEERR_URL': 'http://other-seerr'}})
         self.assertEqual(response.status, 400)

@@ -149,7 +149,9 @@ class SlashModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cards[1].title.startswith('1.'))
         self.assertLessEqual(sum(len(card) for card in cards), 6000)
         await view.next(self.interaction)
-        self.assertEqual(view.page, 1)
+        updated = self.interaction.edit_original_response.await_args.kwargs['view']
+        self.assertEqual(updated.page, 1)
+        self.assertEqual(view.page, 0)  # The displayed snapshot is immutable during updates.
         self.bot.service.run.assert_awaited_once()
         self.bot.service.validate_browse.assert_called_once_with(42, False, True)
         self.assertIn('embeds', self.interaction.edit_original_response.await_args.kwargs)

@@ -43,15 +43,28 @@ class AdminListView(AdminView):
                 discord.SelectOption(label=(r['author_name'] or r['author_id'])[:100], value=r['message_id'],
                     description=(r['guild_name'] or 'DM')[:100]) for r in self.rows], row=0)
             async def detail(interaction):
-                await interaction.response.defer(ephemeral=True)
+                selected = interaction.data['values'][0]
+                await self.defer_update(interaction)
                 # Re-read retained messages with the same filters, not a stale UI snapshot.
-                await self.load()
-                row = next((r for r in self.rows if r['message_id'] == choice.values[0]), None)
+                fresh = self.copy()
+                await fresh.load()
+                row = next((r for r in fresh.rows if r['message_id'] == selected), None)
                 if not row:
                     raise UserError('Message moved or expired. Refresh the inbox.')
-                view = InboxDetailView(self.bot, self.owner, row, self)
-                await interaction.edit_original_response(embed=view.render(), view=view)
-            choice.callback = detail
+                view = InboxDetailView(self.bot, self.owner, row, fresh)
+                fresh.flow = self.flow
+                await self.update(interaction, embed=view.render(), view=view)
+            choice.callback = self.callback(detail)
+            self.add_item(choice)
+        if self.mode == 'deliveries' and not self.job and self.rows:
+            choice = discord.ui.Select(placeholder='Choose a delivery job…', options=[
+                discord.SelectOption(label=f"Job #{r['id']}", value=str(r['id'])) for r in self.rows], row=0)
+            async def delivery(interaction):
+                await self.defer_update(interaction)
+                view = AdminListView(self.bot, self.owner, 'deliveries', job=int(interaction.data['values'][0]))
+                await view.load()
+                await self.update(interaction, embed=view.render(), view=view)
+            choice.callback = self.callback(delivery)
             self.add_item(choice)
         self.button('←', self.previous, row=1, disabled=self.page <= 1)
         self.button('→', self.next, row=1, disabled=self.page * 5 >= self.total)
@@ -78,18 +91,21 @@ class AdminListView(AdminView):
             result.add_field(name=name, value=value, inline=False)
         return result
 
-    async def refresh(self, interaction):
-        await interaction.response.defer(ephemeral=True)
-        await self.load()
-        await interaction.edit_original_response(embed=self.render(), view=self)
+    def copy(self, page=None):
+        return AdminListView(self.bot, self.owner, self.mode, self.filters,
+            self.page if page is None else page, self.job)
+
+    async def refresh(self, interaction, page=None):
+        await self.defer_update(interaction)
+        view = self.copy(page)
+        await view.load()
+        await self.update(interaction, embed=view.render(), view=view)
 
     async def previous(self, interaction):
-        self.page = max(1, self.page - 1)
-        await self.refresh(interaction)
+        await self.refresh(interaction, page=max(1, self.page - 1))
 
     async def next(self, interaction):
-        self.page += 1
-        await self.refresh(interaction)
+        await self.refresh(interaction, page=self.page + 1)
 
 
 class InboxDetailView(AdminView):
@@ -112,21 +128,32 @@ class InboxDetailView(AdminView):
         return result
 
     async def reply(self, interaction):
-        await interaction.response.send_modal(InboxReplyModal(self.bot, self.owner, self.message))
+        await interaction.response.send_modal(InboxReplyModal(self.bot, self.owner, self.message, self))
 
 
 class InboxReplyModal(discord.ui.Modal, title='Reply'):
     message = discord.ui.TextInput(label='Message', style=discord.TextStyle.paragraph, max_length=2000)
 
-    def __init__(self, bot, owner, source):
+    def __init__(self, bot, owner, source, parent=None):
         super().__init__(timeout=120)
         self.bot, self.owner, self.source = bot, owner, source
+        self.parent = parent
+        self.revision = parent.revision if parent else None
 
     async def on_submit(self, interaction):
         if interaction.user.id != self.owner:
             raise UserError('This reply belongs to another operator.')
         self.bot.guard(interaction)
-        await interaction.response.defer(ephemeral=True)
+        if self.parent:
+            await self.parent.perform(interaction, self.prepare, self.revision)
+        else:
+            await self.prepare(interaction)
+
+    async def prepare(self, interaction):
+        if self.parent:
+            await self.parent.defer_update(interaction)
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
         await self.bot.service.offload(self.bot.admin.require_admin, self.owner)
         r = self.source
         plan = await self.bot.admin.prepare(self.owner, self.message.value,
@@ -134,7 +161,10 @@ class InboxReplyModal(discord.ui.Modal, title='Reply'):
             user_id=None if r['guild_id'] else int(r['author_id']),
             channel_id=int(r['channel_id']) if r['guild_id'] else None)
         view = AnnouncementConfirmView(self.bot, self.owner, plan)
-        await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
+        if self.parent:
+            await self.parent.update(interaction, embed=view.render(), view=view)
+        else:
+            await interaction.followup.send(embed=view.render(), view=view, ephemeral=True)
 
     async def on_error(self, interaction, error):
         from .ui import error_message

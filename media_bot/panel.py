@@ -98,12 +98,34 @@ class ControlPanel:
             response.headers['Content-Security-Policy'] = "sandbox; default-src 'none'; frame-ancestors 'none'"
         return response
 
+    @staticmethod
+    def cookie_name(request):
+        # Cookies are scoped to hosts, not ports. Two panels/tunnels on localhost
+        # must not overwrite each other's operator cookie.
+        suffix = hashlib.sha256(request.host.lower().encode()).hexdigest()[:12]
+        return 'panel_session_' + suffix
+
+    def session_token(self, request):
+        return request.cookies.get(self.cookie_name(request), '')
+
+    def renew_access_code(self):
+        now = time.monotonic()
+        self.sessions = {token: session for token, session in self.sessions.items() if session['expires'] > now}
+        if not self.sessions and not self.code:
+            self.code = secrets.token_urlsafe(24)
+            print(f'Panel sessions expired. One-time access code: {self.code}\n'
+                'Keep this code/private port out of public proxies and shared logs.', flush=True)
+
     def session(self, request):
-        token = request.cookies.get('panel_session', '')
+        token = self.session_token(request)
         session = self.sessions.get(token)
-        if not session or session['expires'] <= time.monotonic() or session['host'] != request.host:
+        if not session or session['expires'] <= time.monotonic():
             self.sessions.pop(token, None)
-            raise web.HTTPUnauthorized()
+            self.renew_access_code()
+            raise web.HTTPUnauthorized(reason='Panel sign-in required. Enter the current one-time access code from the service console.')
+        if session['host'] != request.host:
+            # A request at another origin must not revoke the valid origin's session.
+            raise web.HTTPForbidden(reason='This panel session belongs to a different address. Use the original panel URL.')
         return session
 
     async def login(self, request):
@@ -111,14 +133,14 @@ class ControlPanel:
         data = await request.json()
         code = data.get('code') if isinstance(data, dict) else None
         if not isinstance(code, str) or not self.code or not secrets.compare_digest(code, self.code):
-            raise web.HTTPUnauthorized()
+            raise web.HTTPUnauthorized(reason='Invalid or already used access code. Copy the current code from the service console.')
         draft = load_settings(self.path)
         self.code = ''  # One exchange per console code; restart the panel if the session is lost.
         token = secrets.token_urlsafe(32)
         self.sessions[token] = {'expires': time.monotonic() + 8 * 3600, 'host': request.host,
             'draft': draft, 'verified': {}}
         response = web.json_response({'ok': True})
-        response.set_cookie('panel_session', token, httponly=True, samesite='Strict', max_age=8 * 3600, path='/')
+        response.set_cookie(self.cookie_name(request), token, httponly=True, samesite='Strict', max_age=8 * 3600, path='/')
         return response
 
     def values(self, session):
@@ -352,7 +374,7 @@ class ControlPanel:
 
     async def admin_action(self, request):
         self.session(request)  # Local code grants operator authority; never infer it from a browser actor ID.
-        self.admin_limiter.check(request.cookies.get('panel_session'))
+        self.admin_limiter.check(self.session_token(request))
         bot = self.bot
         if not bot or not bot.is_ready():
             raise UserError('Bot is not connected yet')
@@ -404,7 +426,7 @@ class ControlPanel:
 
     async def upload(self, request):
         admin = self.connected_admin(request)
-        self.upload_limiter.check(request.cookies.get('panel_session'))
+        self.upload_limiter.check(self.session_token(request))
         reader = await request.multipart()
         part = await reader.next()
         if not part or part.name != 'file' or not part.filename:
@@ -426,7 +448,7 @@ class ControlPanel:
 
     async def media(self, request):
         admin = self.connected_admin(request)
-        self.media_limiter.check(request.cookies.get('panel_session'))
+        self.media_limiter.check(self.session_token(request))
         if 'file' in request.match_info:
             with admin.store.connect() as db:
                 row = db.execute('SELECT * FROM admin_files WHERE id=? AND expires>?', (request.match_info['file'], time.time())).fetchone()

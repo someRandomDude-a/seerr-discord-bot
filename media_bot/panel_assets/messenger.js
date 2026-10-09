@@ -245,7 +245,15 @@ export async function mountMessenger(host, api, reportError) {
   if (typeof EventSource === 'function') {
     source = new EventSource('/api/admin/events', { withCredentials: true });
     source.addEventListener('update', () => void refresh());
-    source.addEventListener('error', async () => { if (disposed) return; const status = header.querySelector('.chat-live'); if (status) status.textContent = '● Reconnecting'; try { await api('/api/state'); } catch (error) { source.close(); reportError(error.message); } });
+    source.addEventListener('error', async () => {
+      if (disposed) return;
+      const status = header.querySelector('.chat-live'); if (status) status.textContent = '● Reconnecting';
+      try { await api('/api/state'); }
+      catch (error) {
+        if (error.status === 401) source.close();
+        else if (!disposed) reportError('Live updates disconnected. Reconnecting; check the SSH tunnel if this continues.');
+      }
+    });
     source.addEventListener('open', () => { const status = header.querySelector('.chat-live'); if (status) status.textContent = '● Live'; });
   }
   return { dispose() { disposed = true; generation += 1; source?.close(); drafts.clear(); shell.remove(); host.querySelectorAll('.chat-dialog').forEach(dialog => dialog.remove()); } };
