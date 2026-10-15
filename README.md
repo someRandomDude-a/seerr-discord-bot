@@ -103,6 +103,14 @@ Discord OAuth uses `identify` and `guilds`. The backend verifies identity and co
 
 The Activity shows a live verification timestamp and refreshes every 60 seconds while visible. Local collection filtering does not contact upstream services; actions always revalidate. Slash commands cannot be CSS-themed. Never route the private setup/admin panel through the public Activity hostname.
 
+### UI responsiveness and state updates
+
+- Independent service checks and metadata reads run in bounded parallel batches. Each Seerr worker uses its own connection pool and retains the correct user scope; writes and watchlist reconciliation keep their required ordering.
+- Overlapping collection loads share only a successful refresh completed after those loads started, not a timed/stale cache. New navigation supersedes obsolete reads immediately, and late results cannot overwrite the current page or newer mutation state.
+- Activity requests, follows and preference changes return confirmed state with their receipts rather than reloading the entire page. Requests wake background library sync; library-backed pages remain blocked until fresh sync succeeds. Follow controls reflect saved membership and support immediate Unfollow.
+- The private messenger loads conversation/state reads concurrently and applies incremental transcript updates without rebuilding unchanged messages or losing drafts. Independent setup verification can run concurrently; changed settings must be verified again before saving.
+- To diagnose remaining latency, inspect the authenticated API's **Server-Timing** `app` duration in browser Network tools. It measures server-side work including upstream waits, not browser rendering or tunnel latency. Timing is not exposed to unverified Activity viewers. Live upstream verification remains mandatory; outages are not bypassed for speed.
+
 ## Docker
 
 The Dockerfile builds the Activity automatically and runs Python as UID `10001`.
@@ -190,6 +198,10 @@ Messaging updates subscribe to cookie-authenticated **server-sent events** on th
 Only the original requester can schedule removal of their available files. The deadline persists across restarts and is **24 hours after confirmation**. Undo in Activity **Deletions** or `/deletions` while pending, including during upstream outages. No administrator review is required.
 
 After the deadline, the bot refreshes everything and checks the account link, live owner, exact media ID, 4K variant and availability before calling **only** `/media/{id}/file`. Seerr request/media records remain intact. Seerr can remove the whole movie/series from Radarr/Sonarr while deleting files, including shared files; confirmation warns about this.
+
+After confirmed deletion, the bot verifies that monitoring has stopped in the exact Seerr-selected Radarr/Sonarr instance and regular/4K edition. If Seerr removed the entry, nothing is recreated. If the original entry remains without files, the bot unmonitors the movie or the whole series, including its seasons, episodes and future seasons. It never unmonitors a replacement entry or another instance. Hub/Seerr watchlist membership is unchanged.
+
+Confirmed file deletion is checkpointed before monitoring cleanup. If cleanup fails, `/deletions` shows a processing action with a cleanup-pending explanation; live-authorized cleanup retries survive restarts and **never repeat file deletion**. A changed destination, owner, identity or library entry blocks cleanup rather than targeting something else. Undo is unavailable once file deletion has started.
 
 Outages postpone execution. Changed ownership/target or a revoked link cancels it. Undo cannot stop a deletion already in flight. Ambiguous timeouts/interrupted writes become `uncertain` and are **not automatically retried**; verify the upstream outcome before correcting the local action record.
 

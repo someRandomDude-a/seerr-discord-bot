@@ -6,8 +6,9 @@ import time
 from pathlib import Path
 
 import requests
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 from .security import RateLimiter, UserError
+from .timing import VERIFIED_TIMING
 
 
 class ActivityAPI:
@@ -21,6 +22,7 @@ class ActivityAPI:
         self.poster_slots = asyncio.Semaphore(4)
         self.poster_limiter = RateLimiter(240, 60)
         self.posters = {}
+        self.poster_http = None
         self.assets = Path(__file__).resolve().parent.parent / 'activity' / 'dist'
 
     def discord_request(self, method, path, *, token=None, data=None):
@@ -106,7 +108,9 @@ class ActivityAPI:
         session = await self.session(request, polling=operation == 'link_status', admin_read=operation in ('admin_state', 'admin_inbox'))
         uid = session['discord_id']
         if operation == 'profile':
-            return web.json_response(await self.service.offload(self.service.profile, uid))
+            result = await self.service.offload(self.service.profile, uid)
+            request[VERIFIED_TIMING] = bool(result.get('account'))
+            return web.json_response(result)
         if operation == 'browse':
             page = data.get('page')
             if page in ('home', 'storage', 'watches', 'deletions', 'settings'):
@@ -127,11 +131,13 @@ class ActivityAPI:
             else:
                 raise web.HTTPBadRequest()
             result = await self.service.browse(uid, target, *args)
+            request[VERIFIED_TIMING] = True
             result['result'] = public_result(result['result'])
             return web.json_response(result)
         if isinstance(operation, str) and operation.startswith('admin_'):
             await self.service.verified_account(uid)
             await self.service.offload(self.bot.admin.require_admin, uid)
+            request[VERIFIED_TIMING] = True
             if operation == 'admin_state':
                 result = await self.service.offload(self.bot.admin.state, uid)
             elif operation == 'admin_inbox':
@@ -175,10 +181,12 @@ class ActivityAPI:
                 await self.bot.linking.cancel(uid, link.generation)
                 raise
         # Local owner-only safety actions return generic receipts, never server data.
-        if operation not in ('undo', 'mute'):
-            await self.service.verified_account(uid)
+        # Service methods already perform live verification. Do not repeat it in
+        # the HTTP layer; status remains a synchronous, independently gated read.
         if operation == 'status':
-            return web.json_response(await self.service.offload(self.service.status, uid))
+            result = await self.service.offload(self.service.status, uid)
+            request[VERIFIED_TIMING] = True
+            return web.json_response(result)
         if operation == 'deletions':
             result = await self.service.deletions(uid)
         elif operation == 'watches':
@@ -189,7 +197,7 @@ class ActivityAPI:
             self.service.mute_notifications(uid)
             result = 'All personal updates muted.'
         elif operation in ('dashboard', 'storage', 'import_watchlist', 'sync_watchlist', 'seerr_link'):
-            result = await self.service.run(uid, operation)
+            result = await (self.service.mutate(uid, operation) if data.get('return_state') is True and operation in ('import_watchlist', 'sync_watchlist') else self.service.run(uid, operation))
         elif operation == 'requests':
             result = await self.service.run(uid, operation, data.get('all_requests') is True)
         elif operation == 'library':
@@ -204,24 +212,36 @@ class ActivityAPI:
         elif operation == 'delete':
             if data.get('confirmed') is not True:
                 raise UserError('Explicit confirmation is required to schedule file deletion.')
-            result = await self.service.run(uid, operation, positive_id(data.get('id')))
+            result = await (self.service.mutate(uid, operation, positive_id(data.get('id'))) if data.get('return_state') is True else self.service.run(uid, operation, positive_id(data.get('id'))))
         elif operation in ('request', 'watch', 'open', 'details'):
             item = item_reference(data.get('item'))
             if operation == 'watch' and data.get('remove') is True:
-                result = await self.service.unwatch(uid, item)
-                return web.json_response({'result': result})
+                result = await (self.service.mutate(uid, 'watch', item, True) if data.get('return_state') is True else self.service.unwatch(uid, item))
+                request[VERIFIED_TIMING] = True
+                return web.json_response(self.state_result(result) if data.get('return_state') is True else {'result': result})
             if operation == 'request' and data.get('confirmed') is not True:
                 raise UserError('Confirm the request first.')
             args = (item, data.get('remove') is True) if operation == 'watch' else (item,)
-            result = await self.service.run(uid, operation, *args)
+            result = await (self.service.mutate(uid, operation, *args) if data.get('return_state') is True and operation in ('watch', 'request') else self.service.run(uid, operation, *args))
         elif operation == 'preferences':
             enabled, device = data.get('enabled'), data.get('device')
             if enabled is not None and not isinstance(enabled, bool) or device is not None and not isinstance(device, str):
                 raise web.HTTPBadRequest()
-            result = await self.service.run(uid, operation, enabled, device)
+            result = await (self.service.mutate(uid, operation, enabled, device) if data.get('return_state') is True else self.service.run(uid, operation, enabled, device))
         else:
             raise web.HTTPBadRequest()
+        request[VERIFIED_TIMING] = operation not in ('undo', 'mute')
+        if data.get('return_state') is True and operation in ('watch', 'request', 'preferences', 'delete', 'sync_watchlist', 'import_watchlist'):
+            if operation == 'request':
+                wake = getattr(self.bot, 'refresh_event', None)
+                if wake is not None:
+                    wake.set()
+            return web.json_response(self.state_result(result))
         return web.json_response({'result': public_result(result)})
+
+    @staticmethod
+    def state_result(bundle):
+        return {key: public_result(value) if key in ('result', 'watchlist', 'item', 'deletions') else value for key, value in bundle.items()}
 
     async def index(self, request):
         path = self.assets / 'index.html'
@@ -236,28 +256,41 @@ class ActivityAPI:
             raise web.HTTPBadRequest()
         session = await self.session(request, image=True)
         await self.service.verified_account(session['discord_id'])
+        request[VERIFIED_TIMING] = True
         # Authorization must run even for cached images.
         cached = self.posters.get(name)
         if cached and cached[0] > time.monotonic():
             return web.Response(body=cached[1], content_type=cached[2])
         async with self.poster_slots:
-            async with ClientSession(timeout=ClientTimeout(total=10)) as client:
-                async with client.get('https://image.tmdb.org/t/p/w342/' + name, allow_redirects=False) as response:
-                    if response.status != 200 or response.content_type not in ('image/jpeg', 'image/png', 'image/webp'):
-                        raise web.HTTPNotFound()
-                    chunks, size = [], 0
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        size += len(chunk)
-                        if size > 1024 * 1024:
-                            raise web.HTTPBadRequest()
-                        chunks.append(chunk)
-                    body = b''.join(chunks)
-                    if len(self.posters) >= 100:
-                        self.posters.pop(next(iter(self.posters)))
-                    self.posters[name] = (time.monotonic() + 900, body, response.content_type)
-                    return web.Response(body=body, content_type=response.content_type)
+            # A queued request may now have artwork fetched by another viewer.
+            cached = self.posters.get(name)
+            if cached and cached[0] > time.monotonic():
+                return web.Response(body=cached[1], content_type=cached[2])
+            async with self.poster_http.get('https://image.tmdb.org/t/p/w342/' + name, allow_redirects=False) as response:
+                if response.status != 200 or response.content_type not in ('image/jpeg', 'image/png', 'image/webp'):
+                    raise web.HTTPNotFound()
+                chunks, size = [], 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    size += len(chunk)
+                    if size > 1024 * 1024:
+                        raise web.HTTPBadRequest()
+                    chunks.append(chunk)
+                body = b''.join(chunks)
+                if len(self.posters) >= 100:
+                    self.posters.pop(next(iter(self.posters)))
+                self.posters[name] = (time.monotonic() + 900, body, response.content_type)
+                return web.Response(body=body, content_type=response.content_type)
+
+    async def poster_transport(self, app):
+        async with ClientSession(timeout=ClientTimeout(total=10), connector=TCPConnector(limit=4)) as client:
+            self.poster_http = client
+            try:
+                yield
+            finally:
+                self.poster_http = None
 
     def register(self, app):
+        app.cleanup_ctx.append(self.poster_transport)
         app.router.add_get('/', self.index)
         app.router.add_get('/api/activity/config', self.config_route)
         app.router.add_post('/api/activity/auth', self.authenticate)

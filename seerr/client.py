@@ -15,6 +15,7 @@ class SeerrAPI:
         """
         self.base_url = base_url.rstrip('/') + '/api/v1'
         self.api_key = api_key
+        self.user_id = user_id
         self.timeout = timeout
         self.session = requests.Session()
         # Cookie-authenticated registration remains compatible with Seerr origin checks.
@@ -65,6 +66,12 @@ class SeerrAPI:
 
     def close(self):
         self.session.close()
+
+    def fork(self):
+        """Independent API-key read client, preserving the authoritative user context."""
+        if not self.api_key:
+            raise ValueError('Cookie-authenticated clients cannot be forked')
+        return SeerrAPI(self.base_url[:-7], self.api_key, self.timeout, self.user_id)
 
     def get_notification_settings(self, user_id: int) -> Dict[str, Any]:
         return self._request('GET', f'/user/{user_id}/settings/notifications')

@@ -523,7 +523,7 @@ class DetailView(OwnedView):
         if self.parent.operation == 'requests':
             result.add_field(name='Request', value=f"#{item['id']} · {'4K' if item.get('is4k') else 'Standard'}", inline=False)
         if self.parent.operation == 'deletions':
-            result.add_field(name='24-hour undo window', value=f"Scheduled for <t:{int(item['execute_after'])}:F>. Undo before execution begins. The entire movie/series is removed from the service, including shared files. Seerr request history stays intact.", inline=False)
+            result.add_field(name='24-hour undo window', value=f"Scheduled for <t:{int(item['execute_after'])}:F>. Undo before execution begins. The entire movie/series is removed from the service, including shared files, then monitoring is stopped. Seerr request history stays intact.", inline=False)
             if item.get('error'):
                 result.add_field(name='Execution note', value=clean(item['error'], 400), inline=False)
         return result
@@ -553,7 +553,7 @@ class DetailView(OwnedView):
     async def delete(self, interaction):
         await self.defer_update(interaction)
         await self.bot.service.verified_account(self.owner)
-        view = ConfirmView(self.bot, self.owner, 'delete', (self.item['id'],), 'Schedule file deletion in 24 hours?', 'No files are deleted now. You can undo with /deletions during the 24-hour delay. After that, the entire movie/series is removed from Radarr/Sonarr, including files shared by other users. Seerr requests will not be deleted.', parent=self.parent)
+        view = ConfirmView(self.bot, self.owner, 'delete', (self.item['id'],), 'Schedule file deletion in 24 hours?', 'No files are deleted now. You can undo with /deletions during the 24-hour delay. After that, the entire movie/series is removed from Radarr/Sonarr, including files shared by other users, and monitoring is stopped. Seerr requests will not be deleted.', parent=self.parent)
         await self.update(interaction, embed=view.render(), view=view)
 
     async def undo(self, interaction):

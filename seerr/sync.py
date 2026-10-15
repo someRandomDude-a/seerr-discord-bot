@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from .concurrency import parallel_api
 
 
 class SyncManager:
@@ -84,18 +85,16 @@ class SyncManager:
                 with self._connect() as conn:
                     cached_details = {r[0]: (r[1], r[2]) for r in conn.execute('SELECT media_id,title,poster_path FROM media_details')}
                 # Never hold a SQLite write lock while waiting for metadata HTTP calls.
+                missing = {req['media']['id']: req for req in requests if req['media']['id'] not in cached_details}
+                def lookup(req, api):
+                    media = req['media']
+                    details = api.get_movie_details(media['tmdbId']) if req['type'] == 'movie' else api.get_tv_details(media['tmdbId'])
+                    return (media['id'], req['type'], media['tmdbId'], details.get('title') or details.get('name') or 'Untitled', details.get('posterPath') or '')
+                new_details = parallel_api(self.api, [lambda api, req=req: lookup(req, api) for req in missing.values()])
+                cached_details.update({row[0]: (row[3], row[4]) for row in new_details})
                 for req in requests:
                     media, user = req.get('media') or {}, req.get('requestedBy') or {}
-                    cached = cached_details.get(media.get('id'))
-                    if cached:
-                        title, poster = cached
-                    else:
-                        details = (self.api.get_movie_details(media['tmdbId']) if req['type'] == 'movie'
-                                   else self.api.get_tv_details(media['tmdbId']))
-                        title = details.get('title') or details.get('name') or 'Untitled'
-                        poster = details.get('posterPath') or ''
-                        cached_details[media['id']] = (title, poster)
-                        new_details.append((media['id'], req['type'], media['tmdbId'], title, poster))
+                    title, poster = cached_details[media['id']]
                     rows.append((req['id'], req['type'], req['status'], media.get('id'), media.get('tmdbId'),
                                  title, poster, user.get('id'), user.get('displayName') or user.get('jellyfinUsername'),
                                  int(req.get('is4k', False)), req.get('createdAt'), req.get('updatedAt'),

@@ -102,6 +102,41 @@ class IdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('PRIVATE-USER-TOKEN', json.dumps(body))
         factory.assert_called_once_with('http://seerr', 'admin-key', 15, 7)
 
+    async def test_mutation_bundle_verifies_once_and_returns_current_preferences_without_secrets(self):
+        self.link()
+        api = MagicMock()
+        api.get_current_user.return_value = {'id': 7, 'jellyfinUserId': USER_ID, 'permissions': 32}
+        api.get_notification_settings.return_value = {'discordIds': ['42']}
+        with patch('media_bot.service.SeerrAPI', return_value=api):
+            response = await self.client.post('/api/activity/action', json={'operation': 'preferences', 'enabled': True, 'return_state': True}, headers=self.auth)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body['viewer']['account']['opted_in'])
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(self.settings_mock.call_count, 1)
+        self.assertNotIn('PRIVATE-USER-TOKEN', json.dumps(body))
+        self.assertIn('Server-Timing', response.headers)
+        self.response.status_code = 401
+        response = await self.client.post('/api/activity/action', json={'operation': 'preferences', 'enabled': True, 'return_state': True}, headers=self.auth)
+        self.assertTrue((await response.json())['verification_required'])
+        self.assertNotIn('Server-Timing', response.headers)
+
+    async def test_confirmed_web_request_wakes_background_sync_and_returns_an_inline_receipt(self):
+        self.link()
+        api = MagicMock()
+        api.get_current_user.return_value = {'id': 7, 'jellyfinUserId': USER_ID, 'permissions': 32}
+        api.get_notification_settings.return_value = {'discordIds': ['42']}
+        api.get_movie_details.return_value = {'title': 'Film', 'mediaInfo': {'status': 1}}
+        api.create_request.return_value = {'id': 23}
+        self.activity.bot.refresh_event = asyncio.Event()
+        with patch('media_bot.service.SeerrAPI', return_value=api), patch.object(self.service, '_refresh') as refresh:
+            response = await self.client.post('/api/activity/action', json={'operation': 'request', 'confirmed': True, 'return_state': True,
+                'item': {'kind': 'movie', 'external_id': '10', 'title': 'Film'}}, headers=self.auth)
+        self.assertEqual(response.status, 200)
+        self.assertFalse((await response.json())['item']['requestable'])
+        self.assertTrue(self.activity.bot.refresh_event.is_set())
+        refresh.assert_not_called()
+
     async def test_unverified_browse_bundle_discloses_neither_metadata_nor_artwork(self):
         self.service.store.link(42, 7, 'Private account name')
         response = await self.client.post('/api/activity/action', json={'operation': 'browse', 'page': 'search', 'kind': 'movie'}, headers=self.auth)

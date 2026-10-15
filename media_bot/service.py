@@ -2,15 +2,17 @@ import asyncio
 import json
 import logging
 import time
+import threading
 from contextlib import contextmanager
 from urllib.parse import quote
 
 from seerr import SeerrAPI, SyncManager
+from seerr.concurrency import independent, parallel, parallel_api
 from .arr import ArrClient, arr_item, external_id
 from .security import UserError, VerificationRequired, VerificationUnavailable
 from .jellyfin import JellyfinClient, discover_jellyfin, identity
 from .store import Store
-from .discovery import discover_arr
+from .discovery import deletion_service, discover_arr
 from .watchlists import WatchlistSync
 
 log = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ MEDIA_STATUS = {1: 'Unknown', 2: 'Requested', 3: 'Processing', 4: 'Partially ava
 # These operations fetch their own live dependencies; refreshing every library,
 # disk and notification watch beforehand adds latency without making them fresher.
 LIVE_OPERATIONS = frozenset(('search', 'discover', 'details', 'open', 'preferences', 'account', 'seerr_link', 'import_watchlist', 'sync_watchlist', 'watch'))
-QUICK_READ_OPERATIONS = LIVE_OPERATIONS - {'preferences', 'import_watchlist', 'sync_watchlist', 'watch'}
+QUICK_READ_OPERATIONS = (LIVE_OPERATIONS - {'import_watchlist', 'sync_watchlist', 'watch'}) | {'deletions'}
 WATCHLIST_OPERATIONS = frozenset(('watches', 'watch', 'import_watchlist', 'sync_watchlist'))
 
 
@@ -38,14 +40,19 @@ class MediaService:
         self.watchlist_locks = {}
         # Snapshot refreshes/mutations share this lock; independent live reads do not write snapshots.
         self.lock = asyncio.Lock()
+        self.refresh_revision = 0
+        self._identity_context = threading.local()
 
     @contextmanager
     def as_user(self, account):
         self.verify_identity(account['discord_id'])
+        previous = getattr(self._identity_context, 'authorized', False)
         api = SeerrAPI(self.config.seerr_url, self.config.seerr_key, self.config.timeout, account['seerr_id'])
         try:
-            user = api.get_current_user()
-            settings = api.get_notification_settings(account['seerr_id'])
+            self._identity_context.authorized = True
+            with independent(api) as reader:
+                user, settings = parallel(lambda task: task(), [api.get_current_user,
+                    lambda: reader.get_notification_settings(account['seerr_id'])], workers=2)
             if user['id'] != account['seerr_id'] or account['discord_id'] not in (settings.get('discordIds') or []):
                 raise VerificationRequired('Your account link was revoked in Seerr. Run /link again.')
             credential = self.store.credential(account['discord_id'])
@@ -54,6 +61,7 @@ class MediaService:
             yield api, user
         finally:
             api.close()
+            self._identity_context.authorized = previous
 
     def account(self, discord_id):
         account = self.store.account(discord_id)
@@ -90,22 +98,28 @@ class MediaService:
             raise
         except Exception:
             raise VerificationUnavailable('Identity verification is unavailable. No private data can be shown. Try again later.') from None
+        self._identity_context.settings = settings
         return account
 
     async def verified_account(self, discord_id):
         return await self.offload(self.verify_identity, discord_id)
 
     def devices(self):
-        return {'Browser': self.jellyfin_settings().external_url, **self.config.devices}
+        settings = self._identity_context.settings if getattr(self._identity_context, 'authorized', False) else self.jellyfin_settings()
+        return {'Browser': settings.external_url, **self.config.devices}
 
     def profile(self, discord_id):
         try:
-            self.verify_identity(discord_id)
-            devices = list(self.devices())
-            admin = self.is_admin(discord_id)
-            # A second admin check may detect revocation; do not return the earlier
-            # account/device snapshot simply because is_admin safely returned False.
+            exception = int(discord_id) in self.config.admin_ids
+            if self.config.seerr_admins and not exception:
+                with self.as_user(self.account(discord_id)) as (_api, user):
+                    admin = user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)
+            else:
+                self.verify_identity(discord_id)
+                admin = exception
+            # Final live check catches revocation during profile/binding reads.
             account = self.verify_identity(discord_id)
+            devices = list({'Browser': self._identity_context.settings.external_url, **self.config.devices})
             return {'account': account, 'devices': devices, 'is_admin': admin,
                 'refresh_interval': self.config.activity_refresh_interval, 'sync_interval': self.config.sync_interval}
         except VerificationRequired:
@@ -121,11 +135,10 @@ class MediaService:
 
     def is_admin(self, discord_id):
         try:
-            self.verify_identity(discord_id)
-            if int(discord_id) in self.config.admin_ids:
-                return True  # Bot-only role exception, not an identity-verification exception.
-            if not self.config.seerr_admins:
-                return False
+            exception = int(discord_id) in self.config.admin_ids
+            if exception or not self.config.seerr_admins:
+                self.verify_identity(discord_id)
+                return exception  # Bot-only role exception, never an identity exception.
             account = self.account(discord_id)
             with self.as_user(account) as (_api, user):
                 return user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)
@@ -145,15 +158,16 @@ class MediaService:
             db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('last_attempt', ?)", (str(time.time()),))
             db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error', 'Live refresh in progress')")
         try:
-            self.sync.sync()
-            if self.config.seerr_discovery:
-                discovered = discover_arr(self.api)
+            _, discovered, catalog, watched = parallel(lambda task: task(), [
+                self.sync.sync,
+                lambda: discover_arr(self.api) if self.config.seerr_discovery else None,
+                self._seerr_catalog, self._watched_states])
+            connections = self.arr
+            if discovered is not None:
                 direct = {k: v for k, v in self.config.arr.items() if k not in ('radarr', 'sonarr')}
-                configs = {**direct, **discovered}
-                self.arr = {k: ArrClient(v, self.config.timeout) for k, v in configs.items()}
-            snapshots = {name: api.snapshot() for name, api in self.arr.items()}
-            snapshots['seerr'] = self._seerr_catalog()
-            watched = self._watched_states()
+                connections = {k: ArrClient(v, self.config.timeout) for k, v in {**direct, **discovered}.items()}
+            snapshots = dict(parallel(lambda pair: (pair[0], pair[1].snapshot()), list(connections.items())))
+            snapshots['seerr'] = catalog
             with self.store.connect() as db:
                 db.execute('DELETE FROM snapshots WHERE source NOT IN (' + ','.join('?' for _ in snapshots) + ')', list(snapshots))
                 for source, payload in snapshots.items():
@@ -161,15 +175,20 @@ class MediaService:
                 db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('last_success', ?)", (str(time.time()),))
                 db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error', '')")
                 self._observe(db, snapshots, watched)
+            self.arr = connections
+            self.refresh_revision += 1
         except Exception:
             with self.store.connect() as db:
                 db.execute("INSERT OR REPLACE INTO hub_meta VALUES ('error', 'Refresh failed. Operations blocked until services recover.')")
             raise UserError('Live refresh failed. No cached data was used and no action was performed. Check /status and service connectivity.') from None
 
-    def _seerr_catalog(self):
-        items, skip, ids, tv_identities, expected_count = [], 0, set(), {}, None
+    def _seerr_catalog(self, api=None):
+        if api is None:
+            with independent(self.api) as client:
+                return self._seerr_catalog(client)
+        items, media_rows, skip, ids, tv_identities, expected_count = [], [], 0, set(), {}, None
         while True:
-            data = self.api._request('GET', '/media', params={'take': 50, 'skip': skip, 'sort': 'modified'})
+            data = api._request('GET', '/media', params={'take': 50, 'skip': skip, 'sort': 'modified'})
             batch = data['results']
             count = (data.get('pageInfo') or {}).get('results')
             if count is not None:
@@ -184,47 +203,54 @@ class MediaService:
                     tv_identities[str(media['tvdbId'])] = str(media['tmdbId'])
                 if media.get('status') not in (4, 5) and media.get('status4k') not in (4, 5):
                     continue
-                kind, tmdb = media['mediaType'], media['tmdbId']
-                with self.store.connect() as db:
-                    cached = db.execute('SELECT title, poster_path FROM media_details WHERE media_id=?', (media['id'],)).fetchone()
-                if cached:
-                    title, poster = cached['title'], cached['poster_path']
-                else:
-                    details = self.api.get_movie_details(tmdb) if kind == 'movie' else self.api.get_tv_details(tmdb)
-                    title, poster = details.get('title') or details.get('name') or 'Untitled', details.get('posterPath')
-                    with self.store.connect() as db:
-                        db.execute('INSERT OR REPLACE INTO media_details(media_id,type,tmdb_id,title,poster_path) VALUES (?,?,?,?,?)',
-                                   (media['id'], kind, tmdb, title, poster))
-                regular = media.get('status') in (4, 5)
-                items.append({'kind': kind, 'external_id': str(tmdb), 'title': title, 'poster_path': poster,
-                    'available': True, 'source': 'seerr', 'is4k': not regular, 'tvdb_id': str(media.get('tvdbId') or ''),
-                    'jellyfin_id': media.get('jellyfinMediaId') if regular else media.get('jellyfinMediaId4k'),
-                    'subtitle': MEDIA_STATUS.get(media.get('status' if regular else 'status4k'), 'Unknown') + ('' if regular else ' · 4K')})
+                media_rows.append(media)
             if len(batch) < 50:
                 if expected_count is not None and len(ids) != expected_count:
                     raise RuntimeError('Incomplete media pagination')
-                return {'items': items, 'disks': [], 'tv_identities': tv_identities}
+                break
             skip += 50
+        with self.store.connect() as db:
+            cached = {r['media_id']: (r['title'], r['poster_path']) for r in db.execute('SELECT media_id,title,poster_path FROM media_details')}
+        missing = [media for media in media_rows if media['id'] not in cached]
+        def metadata(client, media):
+            kind, tmdb = media['mediaType'], media['tmdbId']
+            details = client.get_movie_details(tmdb) if kind == 'movie' else client.get_tv_details(tmdb)
+            return (media['id'], kind, tmdb, details.get('title') or details.get('name') or 'Untitled', details.get('posterPath'))
+        details = parallel_api(api, [lambda client, media=media: metadata(client, media) for media in missing])
+        with self.store.connect() as db:
+            db.executemany('INSERT OR REPLACE INTO media_details(media_id,type,tmdb_id,title,poster_path) VALUES (?,?,?,?,?)', details)
+        cached.update({r[0]: (r[3], r[4]) for r in details})
+        for media in media_rows:
+            kind, tmdb = media['mediaType'], media['tmdbId']
+            title, poster = cached[media['id']]
+            regular = media.get('status') in (4, 5)
+            items.append({'kind': kind, 'external_id': str(tmdb), 'title': title, 'poster_path': poster,
+                'available': True, 'source': 'seerr', 'is4k': not regular, 'tvdb_id': str(media.get('tvdbId') or ''),
+                'jellyfin_id': media.get('jellyfinMediaId') if regular else media.get('jellyfinMediaId4k'),
+                'subtitle': MEDIA_STATUS.get(media.get('status' if regular else 'status4k'), 'Unknown') + ('' if regular else ' · 4K')})
+        return {'items': items, 'disks': [], 'tv_identities': tv_identities}
 
-    def _watched_states(self):
+    def _watched_states(self, api=None):
+        if api is None:
+            with independent(self.api) as client:
+                return self._watched_states(client)
         # Watchlists must detect availability even when nobody has requested the media.
         with self.store.connect() as db:
             watches = list(db.execute('SELECT DISTINCT w.kind,w.external_id,w.title FROM watches w JOIN accounts a ON a.discord_id=w.discord_id WHERE a.opted_in=1'))
-        states = []
-        for row in watches:
-            if row['kind'] not in ('movie', 'tv'):
-                continue
-            details = self.api.get_movie_details(int(row['external_id'])) if row['kind'] == 'movie' else self.api.get_tv_details(int(row['external_id']))
+        def lookup(client, row):
+            details = client.get_movie_details(int(row['external_id'])) if row['kind'] == 'movie' else client.get_tv_details(int(row['external_id']))
             info = details.get('mediaInfo') or {}
             state = MEDIA_STATUS.get(info.get('status'), 'Not requested')
             if info.get('status4k') in (4, 5):
                 state += ' · Available in 4K'
-            states.append((row['kind'], row['external_id'], row['title'], state))
-        return states
+            return (row['kind'], row['external_id'], row['title'], state)
+        return parallel_api(api, [lambda client, row=row: lookup(client, row) for row in watches if row['kind'] in ('movie', 'tv')])
 
     async def refresh(self):
+        revision = self.refresh_revision
         async with self.lock:
-            await self.offload(self._refresh)
+            if revision == self.refresh_revision or self.store.meta().get('error'):
+                await self.offload(self._refresh)
 
     @staticmethod
     async def offload(function, *args):
@@ -242,12 +268,20 @@ class MediaService:
     async def run(self, discord_id, operation, *args):
         return await self._run(discord_id, operation, args)
 
+    async def mutate(self, discord_id, operation, *args):
+        if operation not in ('watch', 'preferences', 'request', 'delete', 'sync_watchlist', 'import_watchlist'):
+            raise UserError('Invalid state-changing action.')
+        if operation == 'request':
+            args = (*args, False)  # The Activity wakes background sync after its confirmed receipt.
+        return await self._run(discord_id, operation, args, include_viewer=True)
+
     async def browse(self, discord_id, operation, *args):
         if operation not in ('dashboard', 'library', 'requests', 'search', 'discover', 'storage', 'watches', 'deletions', 'account'):
             raise UserError('Invalid browsing destination.')
         return await self._run(discord_id, operation, args, include_viewer=True)
 
     async def _run(self, discord_id, operation, args, include_viewer=False):
+        revision = self.refresh_revision
         if operation in WATCHLIST_OPERATIONS:
             account = self.account(discord_id)
             lock = self.watchlist_locks.setdefault(str(discord_id), asyncio.Lock())
@@ -260,21 +294,34 @@ class MediaService:
             return await self.offload(self._authorized, account, operation, args, include_viewer)
         async with self.lock:
             account = self.account(discord_id)
-            await self.offload(self.verify_identity, discord_id)
-            if operation not in LIVE_OPERATIONS and operation not in ('watches', 'deletions'):
-                await self.offload(self._refresh)
+            live_request = operation == 'request' and args[0]['kind'] in ('movie', 'tv')
+            if operation not in LIVE_OPERATIONS and operation not in ('watches', 'deletions') and not live_request:
+                await self.offload(self.verify_identity, discord_id)
+                if revision == self.refresh_revision or self.store.meta().get('error'):
+                    await self.offload(self._refresh)
             return await self.offload(self._authorized, account, operation, args, include_viewer)
 
     def _authorized(self, account, operation, args, include_viewer=False):
         with self.as_user(account) as (api, user):
             try:
                 result = getattr(self, '_op_' + operation)(account, api, user, *args)
+                if operation in ('library', 'requests', 'search', 'discover', 'details'):
+                    followed = {(w['kind'], str(w['external_id'])) for w in self.store.watches(account['discord_id'])}
+                    for item in result if isinstance(result, list) else [result]:
+                        item['followed'] = (item['kind'], str(item['external_id'])) in followed
                 if include_viewer:
                     viewer = {'account': self.account(account['discord_id']), 'devices': list(self.devices()),
                         'is_admin': int(account['discord_id']) in self.config.admin_ids or
                             self.config.seerr_admins and (user['id'] == 1 or bool(int(user.get('permissions', 0)) & 2)),
                         'refresh_interval': self.config.activity_refresh_interval, 'sync_interval': self.config.sync_interval}
-                    return {'viewer': viewer, 'result': result, 'meta': self.store.meta()}
+                    bundle = {'viewer': viewer, 'result': result, 'meta': self.store.meta()}
+                    if operation in WATCHLIST_OPERATIONS or operation == 'import_watchlist':
+                        bundle['watchlist'] = self._gallery_posters([dict(w, available=False, subtitle='Followed') for w in self.store.watches(account['discord_id'])])
+                    if operation == 'request':
+                        bundle['item'] = {**args[0], 'requestable': False}
+                    if operation == 'delete':
+                        bundle['deletions'] = self._op_deletions(account, api, user)
+                    return bundle
                 return result
             except UserError:
                 raise
@@ -439,7 +486,7 @@ class MediaService:
             raise UserError('This item could not be verified live. Search again or refresh the library.')
         return {**item, **fresh}
 
-    def _op_request(self, account, api, user, item):
+    def _op_request(self, account, api, user, item, follow_up=True):
         kind, eid = item['kind'], item['external_id']
         if kind in ('movie', 'tv'):
             details = api.get_movie_details(int(eid)) if kind == 'movie' else api.get_tv_details(int(eid))
@@ -448,6 +495,8 @@ class MediaService:
                 raise UserError('This item is already requested or available. Open it in Seerr for individual season requests.')
             result = api.create_request(kind, int(eid))  # X-API-User enforces real permissions/quotas.
             self._invalidate('Request submitted; refreshing state.')
+            if not follow_up:
+                return f"Request #{result['id']} submitted. Library sync is pending; do not resubmit."
             try:
                 self._refresh()
                 return f"Request #{result['id']} submitted."
@@ -486,6 +535,8 @@ class MediaService:
             self.store.watch(account['discord_id'], kind, eid, fresh['title'])
         except UserError:
             pass  # A full watchlist must not misreport a successful upstream request.
+        if not follow_up:
+            return 'Your library request was submitted. Library sync is pending; do not resubmit.'
         try:
             self._refresh()
             return 'Your library request was submitted.'
@@ -616,7 +667,7 @@ class MediaService:
         action_id = self.store.enqueue_action(account['discord_id'], 'delete', req['type'],
              f"{media['id']}:{int(is4k)}", title, {'request_id': request_id, 'media_id': media['id'],
               'tmdb_id': media['tmdbId'], 'is4k': is4k}, execute_after=deadline)
-        return f'File deletion #{action_id} is scheduled for <t:{int(deadline)}:F> (24 hours). Use /deletions to undo it before execution. Seerr request history will be kept.'
+        return f'File deletion #{action_id} is scheduled for <t:{int(deadline)}:F> (24 hours). Media will also be unmonitored after deletion. Use /deletions to undo it before execution. Seerr request history will be kept.'
 
     async def deletions(self, discord_id):
         account = await self.verified_account(discord_id)
@@ -645,21 +696,27 @@ class MediaService:
 
     async def process_due_deletions(self):
         with self.store.connect() as db:
-            due = [r['id'] for r in db.execute("SELECT id FROM actions WHERE action='delete' AND status='pending' AND execute_after<=? ORDER BY execute_after", (time.time(),))]
-        for action_id in due:
+            due = [(r['id'], r['status']) for r in db.execute("""SELECT id,status FROM actions WHERE action='delete' AND execute_after<=?
+                AND (status='pending' OR (status='processing' AND json_extract(payload,'$.files_deleted')=1)) ORDER BY execute_after""", (time.time(),))]
+        for action_id, status in due:
             async with self.lock:
                 try:
-                    await self.offload(self._refresh)  # Fail closed: pending remains retryable if freshness fails.
+                    if status == 'pending':
+                        await self.offload(self._refresh)  # Fail closed: pending remains retryable if freshness fails.
                     await self.offload(self._execute_deletion, action_id)
                 except UserError:
                     log.warning('Scheduled deletion delayed or not confirmed (#%s)', action_id)
 
     def _execute_deletion(self, action_id):
         with self.store.connect() as db:
-            row = db.execute("SELECT * FROM actions WHERE id=? AND status='pending' AND execute_after<=?", (action_id, time.time())).fetchone()
+            row = db.execute("SELECT * FROM actions WHERE id=? AND action='delete' AND status IN ('pending','processing') AND execute_after<=?", (action_id, time.time())).fetchone()
         if not row:
             return
         payload = json.loads(row['payload'])
+        if row['status'] == 'processing':
+            if payload.get('files_deleted') is True:
+                self._finish_deletion_unmonitor(row, payload)
+            return  # No confirmation checkpoint: never replay an ambiguous delete.
         write_started = False
         try:
             requester = self.account(row['discord_id'])
@@ -672,32 +729,73 @@ class MediaService:
                     raise UserError('The requester no longer owns this request.')
                 if req['media'].get('status4k' if payload['is4k'] else 'status') not in (4, 5):
                     raise UserError('The files are no longer available.')
+                try:
+                    payload['unmonitor'] = self._deletion_monitor_target(row['kind'], req['media'], payload['is4k'])
+                except Exception:
+                    raise RuntimeError('Monitoring destination could not be verified') from None
                 with self.store.connect() as db:
-                    claimed = db.execute("UPDATE actions SET status='processing' WHERE id=? AND status='pending'", (action_id,)).rowcount
+                    claimed = db.execute("UPDATE actions SET status='processing',payload=? WHERE id=? AND status='pending'", (json.dumps(payload), action_id)).rowcount
                 if not claimed:
                     return
                 write_started = True
                 # This is the ONLY remote deletion endpoint used. Never delete requests/media records.
                 self._invalidate('File deletion in progress.')
                 self.api.delete_media_files(payload['media_id'], payload['is4k'])
+                # Persist a separate phase before any follow-up network calls.
+                # Restarts/retries can only repeat idempotent unmonitoring now.
+                payload['files_deleted'] = True
+                with self.store.connect() as db:
+                    db.execute("UPDATE actions SET payload=?,error='Files deleted; monitoring cleanup pending.' WHERE id=?", (json.dumps(payload), action_id))
         except UserError as exc:
             with self.store.connect() as db:
                 db.execute("UPDATE actions SET status='cancelled',error=? WHERE id=?", (str(exc), action_id))
             return
         except Exception:
             if not write_started:
-                raise UserError('Live ownership check failed. Deletion remains pending and undoable.') from None
+                raise UserError('Live deletion checks failed. Deletion remains pending and undoable.') from None
             # HTTP timeouts are ambiguous: never auto-retry or allow a duplicate action.
             with self.store.connect() as db:
                 db.execute("UPDATE actions SET status='uncertain',error='Verify upstream result before resolving' WHERE id=?", (action_id,))
             raise UserError('File deletion not confirmed; marked uncertain to prevent duplicate execution.') from None
+        self._finish_deletion_unmonitor(row, payload)
+
+    def _deletion_monitor_target(self, kind, media, is4k):
+        source, config, provider_id = deletion_service(self.api, kind, media, is4k)
+        item = ArrClient(config, self.config.timeout).monitoring_target(provider_id)
+        return {'source': source, 'url': config.url, 'provider_id': provider_id,
+            'library_id': item['id'] if item else None, 'origin': self.config.seerr_url}
+
+    def _finish_deletion_unmonitor(self, row, payload):
+        try:
+            requester = self.account(row['discord_id'])
+            with self.as_user(requester) as (api, _user):
+                req = api.get_request(payload['request_id'])
+                if (req['media']['id'] != payload['media_id'] or req['media'].get('tmdbId') != payload['tmdb_id'] or
+                        req['type'] != row['kind'] or bool(req.get('is4k')) != payload['is4k'] or
+                        (req.get('requestedBy') or {}).get('id') != requester['seerr_id']):
+                    raise UserError('The deletion owner or target changed.')
+                target = payload['unmonitor']
+                name, instance = target['source'].split(':')
+                media = {'tmdbId': payload['tmdb_id'], 'tvdbId': target['provider_id'],
+                    'serviceId4k' if payload['is4k'] else 'serviceId': int(instance)}
+                source, config, provider_id = deletion_service(self.api, row['kind'], media, payload['is4k'])
+                if (target['origin'] != self.config.seerr_url or source != target['source'] or config.url != target['url'] or
+                        provider_id != target['provider_id'] or name != config.name):
+                    raise UserError('The monitoring destination changed.')
+                ArrClient(config, self.config.timeout).unmonitor_deleted(provider_id, target['library_id'])
+        except Exception:
+            # No credentials/upstream errors in public action history. Preserve
+            # the checkpoint and retry only monitoring, with live authorization.
+            with self.store.connect() as db:
+                db.execute("UPDATE actions SET error='Files deleted; unmonitoring not confirmed. Cleanup will retry without deleting files again.' WHERE id=?", (row['id'],))
+            raise UserError('Files deleted; unmonitoring is pending. No file deletion will be repeated.') from None
         with self.store.connect() as db:
-            db.execute("UPDATE actions SET status='completed' WHERE id=?", (action_id,))
+            db.execute("UPDATE actions SET status='completed',error=NULL WHERE id=?", (row['id'],))
         try:
             self._refresh()
             return
         except UserError:
-            log.warning('Deletion completed but follow-up refresh failed (#%s)', action_id)
+            log.warning('Deletion and unmonitoring completed but follow-up refresh failed (#%s)', row['id'])
 
     def _invalidate(self, reason):
         with self.store.connect() as db:

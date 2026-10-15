@@ -27,10 +27,12 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
   let unavailable = false;
   const control = { delayBrowse: null, delayWrite: null, failWrite: false };
   const preferences = new Map(), stored = [];
-  const viewer = () => ({ account: isVerified ? { name: 'Private Viewer', opted_in: false } : null,
+  let optedIn = false;
+  const follows = new Map();
+  const viewer = () => ({ account: isVerified ? { name: 'Private Viewer', opted_in: optedIn } : null,
     devices: isVerified ? ['Secret Server'] : [], is_admin: isVerified && isAdmin, refresh_interval: 60, sync_interval: 300 });
   const context = vm.createContext({
-    document: dom.window.document, console, crypto: { randomUUID: () => 'state' },
+    document: dom.window.document, console, AbortController, DOMException, crypto: { randomUUID: () => 'state' },
     setInterval: () => 1, clearInterval: () => {},
     localStorage: { getItem: key => preferences.get(key), setItem: (key, value) => { preferences.set(key, value); stored.push({ key, value }); } },
     URL: { createObjectURL: () => 'blob:private-image', revokeObjectURL: () => {} },
@@ -41,7 +43,8 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
     },
     fetch: async (path, options) => {
       const args = options.body ? JSON.parse(options.body) : {};
-      calls.push({ path, ...args, headers: options.headers });
+      calls.push({ path, ...args, headers: options.headers, signal: options.signal });
+      if (control.reply) { const response = await control.reply(path, args, options); if (response) return response; }
       if (args.operation === 'browse' && control.delayBrowse) await control.delayBrowse;
       if (args.operation === 'request') {
         if (control.delayWrite) await control.delayWrite;
@@ -60,7 +63,13 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
       else if (args.operation === 'details') data = { result: { ...args.item, overview: 'Fresh live synopsis', available: true, poster_path: '/a.jpg' } };
       else if (args.operation === 'seerr_link') data = { result: 'https://seerr.example' };
       else if (args.operation === 'sync_watchlist') data = { result: 'Movie/series watchlists synced both ways. Music and books stay hub-only.' };
-      else if (args.operation === 'watch') data = { result: 'Added to watchlist.' };
+      else if (args.operation === 'watch') {
+        const key = `${args.item.kind}:${args.item.external_id}`;
+        if (args.remove) follows.delete(key); else follows.set(key, args.item);
+        data = { result: args.remove ? 'Removed from watchlist.' : 'Added to watchlist.' };
+      }
+      else if (args.operation === 'preferences') { if (args.enabled !== undefined) optedIn = args.enabled; data = { result: 'Preferences saved.' }; }
+      else if (args.operation === 'mute') { optedIn = false; data = { result: 'All personal updates muted.' }; }
       else if (args.operation === 'request') data = { result: 'Request recorded.' };
       else if (args.operation === 'dashboard') data = { result: { account: { name: 'Private Viewer', opted_in: false }, requests: 1, library: 1 } };
       else if (args.operation === 'status') data = { last_success: 1000 };
@@ -71,6 +80,11 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
       else if (args.operation === 'admin_prepare') data = { result: { plan: 'preview', channels: args.user_id ? 0 : 1, users: args.user_id ? 1 : 0, skipped: [], destinations: ['Cinema / #general'] } };
       else if (args.operation === 'admin_send') data = { result: { job: 1 } };
       else throw new Error(`Unexpected operation: ${args.operation}`);
+      if (args.return_state && args.operation !== 'mute') {
+        data.viewer = viewer();
+        if (['watch', 'sync_watchlist'].includes(args.operation)) data.watchlist = [...follows.values()];
+        if (args.operation === 'request') data.item = { ...args.item, requestable: false };
+      }
       return { ok: true, json: async () => data };
     },
   });
@@ -79,7 +93,7 @@ async function harness(isAdmin = true, received = inbox, verified = true, titles
   const main = (await readFile(new URL('../src/main.js', import.meta.url), 'utf8'))
     .replace(/^import .*;\r?\n/gm, '')
     .replace('boot().catch(error => showError(error));', 'globalThis.ready = boot();');
-  vm.runInContext(domSource + '\n' + main + '\nglobalThis.testUI = { openAdmin: async () => { page = "admin"; await loadPage(); }, openLibrary: async () => { page = "library"; await loadPage(); }, reload: loadPage };', context);
+  vm.runInContext(domSource + '\n' + main + '\nglobalThis.testUI = { openAdmin: async () => { page = "admin"; await loadPage(); }, openLibrary: async () => { page = "library"; await loadPage(); }, reload: loadPage, navigate, mutate };', context);
   await context.ready;
   const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
   return { document: dom.window.document, window: dom.window, calls, context, settle, control, stored,
@@ -312,15 +326,16 @@ test('empty collection filters give an actionable path to discovery', async () =
   } finally { h.close(); }
 });
 
-test('following gives an inline receipt without repeating the write or losing the gallery', async () => {
+test('following updates confirmed membership inline and lets the next click unfollow', async () => {
   const h = await harness();
   try {
     await h.context.testUI.openLibrary();
     click(h.document, '☆ Follow'); await h.settle();
     const followed = [...h.document.querySelectorAll('button')].find(button => button.textContent === '✓ Following');
-    assert.equal(followed.getAttribute('aria-pressed'), 'true'); assert.equal(followed.disabled, true);
+    assert.equal(followed.getAttribute('aria-pressed'), 'true'); assert.equal(followed.disabled, false);
     followed.click(); await h.settle();
-    assert.equal(h.calls.filter(call => call.operation === 'watch').length, 1);
+    assert.equal(h.calls.filter(call => call.operation === 'watch').length, 2);
+    assert.equal(h.calls.filter(call => call.operation === 'watch').at(-1).remove, true);
     assert.ok(h.document.querySelector('.media-card'));
   } finally { h.close(); }
 });
@@ -359,5 +374,155 @@ test('failed confirmations explain uncertainty and cannot silently replay a writ
     assert.equal(submit.hidden, true); assert.equal(submit.disabled, true);
     submit.click(); await h.settle(); assert.equal(h.calls.filter(call => call.operation === 'request').length, 1);
     click(h.document, 'Cancel'); await h.settle(); assert.equal(h.document.querySelector('dialog'), null);
+  } finally { h.close(); }
+});
+
+test('new navigation starts immediately and a superseded slow response cannot replace it', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async (path, args) => { if (args.operation === 'browse' && args.page === 'library') await delayed; };
+    const old = h.context.testUI.openLibrary(); await h.settle();
+    const oldCall = h.calls.filter(call => call.operation === 'browse').at(-1);
+    await h.context.testUI.navigate('settings');
+    assert.equal(oldCall.signal.aborted, true);
+    assert.equal(h.document.querySelector('.page-heading h1').textContent, 'Preferences');
+    release(); await old;
+    assert.equal(h.document.querySelector('.page-heading h1').textContent, 'Preferences');
+    assert.equal(h.document.querySelector('[data-page="settings"]').getAttribute('aria-current'), 'page');
+    assert.equal(h.document.querySelector('.content').hasAttribute('aria-busy'), false);
+  } finally { release?.(); h.close(); }
+});
+
+test('preferences render confirmed state with no second browse or artwork reload', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.navigate('settings');
+    const before = h.calls.filter(call => call.operation === 'browse').length;
+    click(h.document, 'Enable'); await h.settle();
+    assert.equal(h.document.querySelector('.setting .pill').textContent, 'On');
+    assert.equal(h.calls.filter(call => call.operation === 'browse').length, before);
+    assert.equal(h.calls.filter(call => call.operation === 'preferences').at(-1).return_state, true);
+  } finally { h.close(); }
+});
+
+test('confirmed requests update the current gallery immediately without re-fetching search', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.navigate('search');
+    const cover = h.document.querySelector('button.cover');
+    const before = h.calls.filter(call => call.operation === 'browse').length;
+    click(h.document, '＋ Request'); await h.settle(); click(h.document, 'Confirm'); await h.settle();
+    assert.equal(h.document.querySelector('button.cover'), cover);
+    assert.equal(h.document.querySelector('.request-control').disabled, true);
+    assert.equal(h.document.querySelector('.request-control').textContent, '✓ Requested');
+    assert.equal(h.calls.filter(call => call.operation === 'browse').length, before);
+  } finally { h.close(); }
+});
+
+test('older reads cannot undo a preference saved while the read was in flight', async () => {
+  const h = await harness(); let release;
+  try {
+    await h.context.testUI.navigate('settings');
+    const delayed = new Promise(resolve => { release = resolve; });
+    let intercept = true;
+    h.control.reply = async (path, args) => {
+      if (intercept && args.operation === 'browse') {
+        intercept = false; await delayed;
+        return { ok: true, json: async () => ({ viewer: { account: { name: 'Private Viewer', opted_in: false }, devices: [], is_admin: true }, result: null, meta: {} }) };
+      }
+    };
+    const old = h.context.testUI.reload(); await h.settle();
+    await h.context.testUI.mutate('preferences', { enabled: true });
+    release(); await old; await h.settle();
+    assert.equal(h.document.querySelector('.setting .pill').textContent, 'On');
+    assert.equal(h.document.querySelector('.content').hasAttribute('aria-busy'), false);
+  } finally { release?.(); h.close(); }
+});
+
+test('rapid watch actions are ordered and duplicate in-flight intent is not written twice', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    let first = true;
+    h.control.reply = async (path, args) => { if (first && args.operation === 'watch') { first = false; await delayed; } };
+    const item = { kind: 'movie', external_id: '10', title: 'Private Film' };
+    const a = h.context.testUI.mutate('watch', { item, remove: false });
+    const duplicate = h.context.testUI.mutate('watch', { item, remove: false });
+    const b = h.context.testUI.mutate('watch', { item, remove: true });
+    await h.settle(); assert.equal(h.calls.filter(call => call.operation === 'watch').length, 1);
+    release(); await Promise.all([a, duplicate, b]);
+    assert.deepEqual(h.calls.filter(call => call.operation === 'watch').map(call => call.remove), [false, true]);
+  } finally { release?.(); h.close(); }
+});
+
+test('poster I/O is bounded and disconnected queued images do not compete with navigation', async () => {
+  const titles = Array.from({ length: 12 }, (_, index) => ({ kind: 'movie', external_id: String(index + 1), title: `Film ${index}`, poster_path: `/poster${index}.jpg` }));
+  const h = await harness(true, inbox, true, titles); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async path => { if (path.includes('/poster/')) await delayed; };
+    await h.context.testUI.openLibrary(); await h.settle();
+    assert.equal(h.calls.filter(call => call.path.includes('/poster/')).length, 4);
+    await h.context.testUI.navigate('settings');
+    release(); await h.settle();
+    assert.equal(h.calls.filter(call => call.path.includes('/poster/')).length, 4);
+    assert.equal(h.document.querySelector('img'), null);
+  } finally { release?.(); h.close(); }
+});
+
+test('a superseded unauthorized read cannot clear a newer verified page', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async (path, args) => {
+      if (args.operation === 'browse' && args.page === 'library') {
+        await delayed; return { ok: false, status: 401, json: async () => ({ error: 'Old read rejected', private_data_blocked: true }) };
+      }
+    };
+    const old = h.context.testUI.openLibrary(); await h.settle();
+    await h.context.testUI.navigate('settings'); release(); await old;
+    assert.equal(h.document.querySelector('.page-heading h1').textContent, 'Preferences');
+    assert.equal(h.document.querySelector('.link-card'), null);
+  } finally { release?.(); h.close(); }
+});
+
+test('independent watch receipts cannot roll back a newer preference receipt', async () => {
+  const h = await harness(); let release;
+  try {
+    await h.context.testUI.navigate('settings');
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async (path, args) => {
+      if (args.operation === 'watch') {
+        await delayed; return { ok: true, json: async () => ({ viewer: { account: { name: 'Private Viewer', opted_in: false }, devices: [], is_admin: true }, result: 'Added', watchlist: [args.item] }) };
+      }
+    };
+    const watch = h.context.testUI.mutate('watch', { item: { kind: 'movie', external_id: '10', title: 'Film' } });
+    await h.context.testUI.mutate('preferences', { enabled: true });
+    release(); await watch;
+    assert.equal(vm.runInContext('profile.account.opted_in', h.context), true);
+    assert.equal(h.document.querySelector('.setting .pill').textContent, 'On');
+  } finally { release?.(); h.close(); }
+});
+
+test('Mute updates local confirmed preferences without another browse or upstream disclosure', async () => {
+  const h = await harness();
+  try {
+    await h.context.testUI.navigate('settings');
+    await h.context.testUI.mutate('preferences', { enabled: true });
+    const before = h.calls.filter(call => call.operation === 'browse').length;
+    click(h.document, 'Mute'); await h.settle();
+    assert.equal(h.document.querySelector('.setting .pill').textContent, 'Off');
+    assert.equal(h.calls.filter(call => call.operation === 'browse').length, before);
+  } finally { h.close(); }
+});
+
+test('gallery controls reflect already-followed membership from the verified browse result', async () => {
+  const h = await harness(true, inbox, true, [{ kind: 'movie', external_id: '10', title: 'Followed Film', followed: true }]);
+  try {
+    await h.context.testUI.openLibrary();
+    assert.equal(h.document.querySelector('.follow-control').textContent, '✓ Following');
+    click(h.document, '✓ Following'); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'watch').at(-1).remove, true);
   } finally { h.close(); }
 });

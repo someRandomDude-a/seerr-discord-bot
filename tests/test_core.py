@@ -447,7 +447,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_deletion_only_deletes_files_preserves_requests(self):
         action_id = await self.schedule()
         await self.make_due(action_id)
-        await self.service.process_due_deletions()
+        config = ArrConfig('radarr', 'http://radarr', 'arr-key')
+        with patch('media_bot.service.deletion_service', return_value=('radarr:0', config, 10)), \
+                patch('media_bot.service.ArrClient.monitoring_target', return_value=None), \
+                patch('media_bot.service.ArrClient.unmonitor_deleted') as unmonitor:
+            await self.service.process_due_deletions()
+        unmonitor.assert_called_once_with(10, None)
         self.service.api.delete_media_files.assert_called_once_with(3, False)
         self.service.api.delete_request.assert_not_called()
         self.assertEqual(self.action(action_id)['status'], 'completed')
@@ -490,8 +495,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         action_id = await self.schedule()
         await self.make_due(action_id)
         self.service.api.delete_media_files.side_effect = TimeoutError()
-        await self.service.process_due_deletions()
-        await self.service.process_due_deletions()
+        with patch.object(self.service, '_deletion_monitor_target', return_value={'source': 'radarr:0'}), \
+                patch('media_bot.service.ArrClient.unmonitor_deleted') as unmonitor:
+            await self.service.process_due_deletions()
+            await self.service.process_due_deletions()
+        unmonitor.assert_not_called()
         self.assertEqual(self.action(action_id)['status'], 'uncertain')
         self.service.api.delete_media_files.assert_called_once()
 

@@ -1,5 +1,6 @@
 import json
 import asyncio
+import threading
 import os
 import stat
 import tempfile
@@ -43,10 +44,11 @@ class SavedSettingsTests(unittest.TestCase):
 class DiscoveryTests(unittest.TestCase):
     def test_multiple_servers_ssl_base_paths_ipv6_and_secret_repr(self):
         api = MagicMock()
-        api._request.side_effect = [[
+        settings = {'/settings/radarr': [
             {'id': 0, 'hostname': 'radarr', 'port': 7878, 'apiKey': 'secret-a', 'baseUrl': '/movies'},
             {'id': 1, 'hostname': '::1', 'port': 443, 'apiKey': 'secret-b', 'useSsl': True, 'is4k': True},
-        ], [{'id': 4, 'hostname': 'sonarr', 'port': 8989, 'apiKey': 'secret-c'}]]
+        ], '/settings/sonarr': [{'id': 4, 'hostname': 'sonarr', 'port': 8989, 'apiKey': 'secret-c'}]}
+        api._request.side_effect = lambda method, path: settings[path]
         result = discover_arr(api)
         self.assertEqual(set(result), {'radarr:0', 'radarr:1', 'sonarr:4'})
         self.assertEqual(result['radarr:0'].url, 'http://radarr:7878/movies')
@@ -68,12 +70,11 @@ class ConnectionVerificationTests(unittest.TestCase):
         self.panel = ControlPanel(path=Path(self.temp.name) / 'settings.json')
 
     def test_discord_token_guilds_intents_and_human_exceptions(self):
-        responses = [
-            {'bot': True, 'username': 'Media'}, {'id': '123', 'flags': (1 << 15) | (1 << 19)},
-            [{'id': '456', 'name': 'Cinema'}], {'bot': False},
-        ]
+        responses = {'users/@me': {'bot': True, 'username': 'Media'},
+            'oauth2/applications/@me': {'id': '123', 'flags': (1 << 15) | (1 << 19)},
+            'users/@me/guilds?limit=200': [{'id': '456', 'name': 'Cinema'}], 'users/789': {'bot': False}}
         with patch('media_bot.panel.requests.get') as get:
-            get.side_effect = [MagicMock(status_code=200, json=MagicMock(return_value=row)) for row in responses]
+            get.side_effect = lambda url, **kwargs: MagicMock(status_code=200, json=MagicMock(return_value=responses[url.split('/v10/')[1]]))
             result = self.panel.verify('discord', {'DISCORD_TOKEN': 'private-token', 'ALLOWED_GUILD_IDS': '456',
                 'ENABLE_MEMBERS_INTENT': 'true', 'INBOX_MESSAGE_CONTENT': 'true', 'ADMIN_DISCORD_IDS': '789'})
         self.assertEqual(result['application_id'], '123')
@@ -86,8 +87,8 @@ class ConnectionVerificationTests(unittest.TestCase):
     def test_discord_rejects_user_tokens_and_unjoined_guilds(self):
         for identity, selected in [({'bot': False}, ''), ({'bot': True, 'username': 'Media'}, '999')]:
             with self.subTest(identity=identity), patch('media_bot.panel.requests.get') as get:
-                get.side_effect = [MagicMock(status_code=200, json=MagicMock(return_value=row))
-                    for row in (identity, {'id': '123'}, [])]
+                responses = {'users/@me': identity, 'oauth2/applications/@me': {'id': '123'}, 'users/@me/guilds?limit=200': []}
+                get.side_effect = lambda url, **kwargs: MagicMock(status_code=200, json=MagicMock(return_value=responses[url.split('/v10/')[1]]))
                 with self.assertRaises(UserError):
                     self.panel.verify('discord', {'DISCORD_TOKEN': 'token', 'ALLOWED_GUILD_IDS': selected})
 
@@ -95,8 +96,8 @@ class ConnectionVerificationTests(unittest.TestCase):
         with patch('media_bot.panel.SeerrAPI') as api_type, patch('media_bot.panel.ArrClient') as client_type:
             api = api_type.return_value
             api.get_current_user.return_value = {'id': 1}
-            api._request.side_effect = [[{'id': 0, 'hostname': 'radarr', 'port': 7878, 'apiKey': 'private-radarr'},
-                {'id': 1, 'hostname': 'radarr4k', 'port': 7878, 'apiKey': 'private-4k'}], []]
+            api._request.side_effect = lambda method, path: [{'id': 0, 'hostname': 'radarr', 'port': 7878, 'apiKey': 'private-radarr'},
+                {'id': 1, 'hostname': 'radarr4k', 'port': 7878, 'apiKey': 'private-4k'}] if path == '/settings/radarr' else []
             api.list_users.return_value = {'results': [{'id': 1, 'username': 'Owner'},
                 {'id': 2, 'permissions': 2, 'displayName': 'Admin'}, {'id': 3, 'permissions': 32}]}
             result = self.panel.verify('seerr', {'SEERR_URL': 'http://seerr', 'SEERR_ADMIN_KEY': 'private-key'})
@@ -168,6 +169,40 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post('/api/login', {'code': 'wrong'})).status, 401)
         await self.login()
         self.assertEqual((await self.post('/api/login', {'code': self.code})).status, 401)
+
+    async def test_independent_connection_tests_overlap_without_holding_the_settings_lock(self):
+        await self.login()
+        barrier = threading.Barrier(2, timeout=5)
+        def verify(operation, values):
+            barrier.wait()
+            return {'message': 'Verified'}
+        self.panel.verify.side_effect = verify
+        responses = await asyncio.gather(self.post('/api/action', {'operation': 'seerr'}), self.post('/api/action', {'operation': 'lidarr'}))
+        self.assertEqual([r.status for r in responses], [200, 200])
+        state = await (await self.client.get('/api/state')).json()
+        self.assertEqual(set(state['verified']), {'seerr', 'lidarr'})
+        self.assertGreaterEqual(state['revision'], 4)
+
+    async def test_settings_changed_during_slow_verification_are_not_marked_verified(self):
+        await self.login()
+        started, release = threading.Event(), threading.Event()
+        def verify(operation, values):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError('test timeout')
+            return {'message': 'Verified'}
+        self.panel.verify.side_effect = verify
+        pending = asyncio.create_task(self.post('/api/action', {'operation': 'seerr', 'changes': {'SEERR_URL': 'http://old-seerr'}}))
+        await asyncio.to_thread(started.wait, 5)
+        response = await self.post('/api/action', {'operation': 'generate_webhook', 'changes': {'SEERR_URL': 'http://new-seerr'}})
+        self.assertEqual(response.status, 200)
+        release.set()
+        response = await pending
+        self.assertEqual(response.status, 400)
+        self.assertIn('Settings changed', (await response.json())['error'])
+        state = await (await self.client.get('/api/state')).json()
+        self.assertEqual(state['values']['SEERR_URL'], 'http://new-seerr')
+        self.assertNotIn('seerr', state['verified'])
 
     async def test_panels_on_different_localhost_ports_do_not_overwrite_each_others_cookies(self):
         await self.login()

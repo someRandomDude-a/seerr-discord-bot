@@ -1,7 +1,7 @@
 import { mountMessenger } from './messenger.js';
 
 const root = document.querySelector('#app');
-let state, tab = 'setup', messenger, messengerGeneration = 0, authGeneration = 0;
+let state, tab = 'setup', messenger, messengerGeneration = 0, authGeneration = 0, stateEpoch = 0, statusBusy = false;
 const draft = new Map(), clear = new Set();
 const reports = new Map(), profileChoices = new Map();
 document.body.dataset.ui = 'panel';
@@ -24,6 +24,14 @@ function updateDraftIndicator() {
     indicator.dataset.dirty = String(Boolean(count));
   }
 }
+function acceptState(value) {
+  if (state && Number.isFinite(value.revision) && value.revision < state.revision) return false;
+  state = value; return true;
+}
+function updateRuntime() {
+  const status = root.querySelector('.panel-status');
+  if (status && state) { status.textContent = state.running ? '● Connected' : '● Setup pending'; status.dataset.connected = String(Boolean(state.running)); }
+}
 const labels = { DISCORD_TOKEN: 'Bot token', ALLOWED_GUILD_IDS: 'Allowed servers', ADMIN_DISCORD_IDS: 'Bot-only admin IDs',
   ENABLE_MEMBERS_INTENT: 'All-member DMs', INBOX_MESSAGE_CONTENT: 'Full inbox content', SEERR_URL: 'Seerr URL',
   SEERR_ADMIN_KEY: 'Seerr API key', JELLYFIN_DEVICE_URLS: 'Jellyfin links', ACTIVITY_ENABLED: 'Activity',
@@ -42,12 +50,13 @@ function node(tag, text, cls) {
   if (cls) element.className = cls;
   return element;
 }
-async function api(path, data) {
+async function api(path, data, signal) {
   const generation = authGeneration;
   const multipart = data instanceof FormData;
   const response = await fetch(path, { method: data ? 'POST' : 'GET', credentials: 'same-origin',
-    headers: data && !multipart ? { 'Content-Type': 'application/json' } : {}, body: multipart ? data : data ? JSON.stringify(data) : undefined });
+    headers: data && !multipart ? { 'Content-Type': 'application/json' } : {}, body: multipart ? data : data ? JSON.stringify(data) : undefined, signal });
   const body = await response.json();
+  if (signal?.aborted) throw new DOMException('Read superseded', 'AbortError');
   if (generation !== authGeneration) throw new Error('Panel session changed. Retry after signing in.');
   if (!response.ok) {
     let message = body.error || 'Not confirmed';
@@ -137,8 +146,11 @@ function field(key) {
 }
 function changes() { return { changes: Object.fromEntries(draft), clear: [...clear] }; }
 async function action(operation, output) {
-  const result = await api('/api/action', { operation, ...changes() });
-  state = result; draft.clear(); clear.clear();
+  const sent = changes();
+  const result = await api('/api/action', { operation, ...sent });
+  stateEpoch += 1; acceptState(result);
+  for (const [key, value] of Object.entries(sent.changes)) if (draft.get(key) === value) draft.delete(key);
+  for (const key of sent.clear) clear.delete(key);
   updateDraftIndicator();
   reports.set(operation, report(result.result));
   if (result.result?.choices) {
@@ -233,7 +245,7 @@ function render() {
     const fields = node('div', undefined, 'step-fields');
     for (const key of keys) fields.append(field(key)); section.append(fields);
     const output = node('div', reports.get(operation) || '', 'panel-report');
-    if (operation) section.append(button('Verify', async () => { await action(operation, output); render(); }));
+    if (operation) section.append(button('Verify', async () => { await action(operation, output); if (tab !== 'messages') render(); else updateRuntime(); }));
     else {
       section.append(node('p', 'Activity: enable Activities in Discord, add OAuth redirect https://127.0.0.1, and map / to your HTTPS hostname. Enter the shared backend hostname above for the external test. Never proxy this panel.', 'fine'));
       section.append(button('Generate webhook credential', async () => { await action('generate_webhook', output); }));
@@ -250,7 +262,11 @@ function saveControls() {
   controls.append(button('Save & apply', async () => {
     await action('save'); render();
     const notice = document.querySelector('#notice'); notice.hidden = false; notice.className = 'notice success'; notice.textContent = 'Saved. Bot is starting/restarting. Refresh status shortly.';
-  }, 'button primary'), button('Refresh status', async () => { state = await api('/api/state'); render(); }));
+  }, 'button primary'), button('Refresh status', async () => {
+    const epoch = stateEpoch;
+    const value = await api('/api/state');
+    if (epoch === stateEpoch && acceptState(value)) render();
+  }));
   controls.append(node('span', 'Saved settings survive restarts. Secrets are never read back into forms.', 'fine')); root.append(controls);
   updateDraftIndicator();
 }
@@ -284,3 +300,11 @@ renderLogin();
 api('/api/state').then(value => { state = value; render(); }).catch(exc => {
   if (exc.status !== 401 && exc.message !== 'Panel session changed. Retry after signing in.') error('Unable to reach the panel. Check the SSH tunnel and try connecting again.');
 });
+globalThis.setInterval?.(async () => {
+  if (!state || statusBusy || document.hidden) return;
+  statusBusy = true;
+  const epoch = stateEpoch;
+  try { const value = await api('/api/state'); if (epoch === stateEpoch && acceptState(value)) updateRuntime(); }
+  catch (exc) { if (exc.status !== 401 && state) updateRuntime(); }
+  finally { statusBusy = false; }
+}, 10000);

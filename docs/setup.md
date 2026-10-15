@@ -107,6 +107,8 @@ If configuration is incomplete, the bot waits while the separate panel is availa
 6. Test `/announce` with one private test channel/user, then `/deliveries` and `/deliveries job:ID`. Test multi-server broadcasts only after checking destination mappings and privileged intents.
 7. For deletion testing, use **disposable test media**: `/requests` → owned available request → Delete → confirmation; verify it appears in `/deletions`, then select it and Undo. Real deletion runs only after 24 hours and live revalidation. Undo cannot stop an already-started deletion.
 
+   After an actual test deletion, confirm the matching regular/4K Radarr/Sonarr entry is absent or unmonitored. Retained series also have seasons/episodes unmonitored and future-season monitoring disabled. Seerr request history stays intact. A monitoring-cleanup failure remains visible in `/deletions` and retries only cleanup, never file deletion; do not delete the action/database to force a retry.
+
 Slash commands and their private buttons/modals cover the hub without any hosted interface. Automated tests do not replace these checks against your actual service versions and Discord application.
 
 Discovery/details/links read their own upstream dependencies live rather than refreshing unrelated storage/library integrations. Opening or refreshing snapshot-backed collections still performs a fresh sync. Browsing controls reuse a clearly labelled, already-open gallery snapshot; native controls recheck the viewer's identity/permissions before redisplaying it, and all mutation endpoints perform their own live checks. A failed collection refresh never falls back to the old gallery.

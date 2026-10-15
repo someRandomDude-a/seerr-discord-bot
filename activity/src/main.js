@@ -8,10 +8,26 @@ let sdk, token, config, profile, content, health, page = 'home', category = 'all
 let searchQuery = '', searchKind = 'movie', searchPage = 1, linkGeneration, refreshTimer, linkTimer, loading = false;
 let inboxKind = 'all', inboxGuild = null, inboxUser = null, inboxChannel = null, inboxQuery = '', inboxPage = 1, inboxOrder = 'newest';
 let privacyGeneration = 0;
-let queuedDestination = null;
+let loadGeneration = 0, loadController, stateVersion = 0, preferenceVersion = 0, pendingMutations = 0;
+let currentResult, currentResultPage;
+let watchMembership;
+const pendingActions = new Map();
+const mutationQueues = new Map();
 const galleryState = new Map();
 const posterObservers = new Map();
 const posterUrls = new Map();
+let posterLoads = 0;
+const posterQueue = [];
+
+async function posterSlot(read) {
+  if (posterLoads >= 4) await new Promise(resolve => posterQueue.push(resolve));
+  else posterLoads += 1;
+  try { await Promise.resolve(); return await read(); }
+  finally {
+    const next = posterQueue.shift();
+    if (next) next(); else posterLoads -= 1;
+  }
+}
 let dialogSequence = 0;
 
 function setAppearance(value) {
@@ -50,13 +66,15 @@ function cleanupPosters() {
 }
 const compose = { initialized: false, message: '', guilds: new Set(), user: '', allUsers: false, channel: null };
 
-async function request(path, body) {
+async function request(path, body, signal) {
   const response = await fetch(path, {
     method: body ? 'POST' : 'GET',
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
   const data = await response.json();
+  if (signal?.aborted) throw new DOMException('Read superseded', 'AbortError');
   if (!response.ok) {
     const error = new Error(data.error || 'Unable to complete the action. Reopen the Activity if your session expired.');
     error.privateDataBlocked = data.private_data_blocked || response.status === 401;
@@ -66,10 +84,74 @@ async function request(path, body) {
   return data;
 }
 
-async function api(operation, args = {}) {
-  const data = await request('/api/activity/action', { operation, ...args });
+async function api(operation, args = {}, signal) {
+  const data = await request('/api/activity/action', { operation, ...args }, signal);
   if (operation === 'browse') return data;
   return Object.hasOwn(data, 'result') ? data.result : data;
+}
+
+const mediaKey = item => `${item.kind}:${item.external_id}`;
+
+async function mutate(operation, args = {}) {
+  const key = JSON.stringify([operation, args]);
+  if (pendingActions.has(key)) return pendingActions.get(key);
+  const domain = ['watch', 'sync_watchlist', 'import_watchlist'].includes(operation) ? 'watchlist' : operation === 'mute' ? 'preferences' : operation;
+  const previous = mutationQueues.get(domain);
+  const privacy = privacyGeneration;
+  pendingMutations += 1;
+  const task = (async () => {
+    if (previous) await previous.catch(() => {});
+    if (privacy !== privacyGeneration) throw new Error('Access changed. Verify again before retrying.');
+    const observedPreferences = preferenceVersion;
+    const bundle = await request('/api/activity/action', { operation, ...args, return_state: true });
+    if (privacy !== privacyGeneration) throw new Error('Access changed. Verify again to check the action state.');
+    stateVersion += 1;
+    if (domain === 'preferences') preferenceVersion += 1;
+    if (bundle.viewer) {
+      // Independent work may have captured preferences before a newer receipt.
+      if (domain !== 'preferences' && observedPreferences !== preferenceVersion && profile?.account && bundle.viewer.account) {
+        Object.assign(bundle.viewer.account, { opted_in: profile.account.opted_in, device: profile.account.device });
+      }
+      profile = bundle.viewer;
+      Object.assign(config, { refresh_interval: profile.refresh_interval, sync_interval: profile.sync_interval });
+    }
+    if (operation === 'mute' && profile?.account) profile.account.opted_in = false;
+    if (bundle.watchlist) {
+      watchMembership = new Set(bundle.watchlist.map(mediaKey));
+      for (const control of document.querySelectorAll('.follow-control')) updateFollow(control);
+      if (page === 'watches' && currentResultPage === page) {
+        currentResult = bundle.watchlist; content.replaceChildren(); renderItems(currentResult); cleanupPosters();
+      }
+    }
+    if (bundle.item) {
+      if (Array.isArray(currentResult)) for (const item of currentResult) if (mediaKey(item) === mediaKey(bundle.item)) Object.assign(item, bundle.item);
+      for (const control of document.querySelectorAll('.request-control')) if (control.dataset.mediaKey === mediaKey(bundle.item)) {
+        control.textContent = '✓ Requested'; control.disabled = true; control.dataset.blocked = 'true';
+      }
+    }
+    if (domain === 'preferences' && page === 'settings' && currentResultPage === page) {
+      content.replaceChildren(); renderSettings(profile);
+    }
+    if (bundle.deletions && page === 'deletions' && currentResultPage === page) {
+      currentResult = bundle.deletions; content.replaceChildren(); renderItems(currentResult);
+    }
+    return bundle.result;
+  })();
+  pendingActions.set(key, task);
+  mutationQueues.set(domain, task);
+  try { return await task; }
+  finally {
+    if (pendingActions.get(key) === task) pendingActions.delete(key);
+    if (mutationQueues.get(domain) === task) mutationQueues.delete(domain);
+    pendingMutations -= 1;
+  }
+}
+
+function updateFollow(control) {
+  const followed = watchMembership ? watchMembership.has(control.dataset.mediaKey) : control.dataset.followed === 'true';
+  control.dataset.followed = String(followed); control.setAttribute('aria-pressed', String(followed));
+  control.textContent = followed ? control.dataset.destination === 'watches' ? '☆ Unfollow' : '✓ Following' : '☆ Follow';
+  control.title = followed ? 'Remove from your watchlist' : 'Add to your watchlist';
 }
 
 function button(text, handler, className = 'button') {
@@ -101,7 +183,8 @@ function hidePrivateData(relink = false) {
   profile = { account: null, devices: [], is_admin: false };
   compose.initialized = false; compose.guilds.clear(); compose.message = ''; compose.user = '';
   page = 'home';
-  galleryState.clear(); queuedDestination = null;
+  galleryState.clear(); currentResult = undefined; currentResultPage = undefined; watchMembership = undefined;
+  loadController?.abort(); loadGeneration += 1; loading = false;
   buildShell();
   cleanupPosters();
   if (relink) renderLink();
@@ -158,7 +241,6 @@ function buildShell() {
 }
 
 async function navigate(destination) {
-  if (loading) { queuedDestination = destination; return; }
   page = destination;
   await loadPage();
 }
@@ -178,9 +260,15 @@ function updateHealth(meta) {
 }
 
 async function loadPage() {
-  if (loading) return;
+  loadController?.abort();
+  const controller = new AbortController(); loadController = controller;
+  const version = ++loadGeneration;
+  const observedState = stateVersion;
+  let destination = page;
+  const signal = controller.signal;
   loading = true;
   const generation = privacyGeneration;
+  const current = () => version === loadGeneration && generation === privacyGeneration;
   try {
     for (const tab of document.querySelectorAll('.nav-button')) {
       tab.classList.toggle('selected', tab.dataset.page === page);
@@ -191,31 +279,34 @@ async function loadPage() {
     cleanupPosters();
     const notice = document.querySelector('#notice'); notice.hidden = true;
     const wasLinked = Boolean(profile.account);
-    if (!wasLinked || page === 'admin') {
-      const freshProfile = await api('profile');
-      if (generation !== privacyGeneration) return;
+    if (!wasLinked) {
+      const freshProfile = await api('profile', {}, signal);
+      if (!current()) return;
       profile = freshProfile;
     }
     if (!profile.account) { hidePrivateData(true); return; }
-    if (page === 'admin' && !profile.is_admin) { page = 'home'; buildShell(); cleanupPosters(); }
+    if (page === 'admin' && !profile.is_admin) { page = 'home'; destination = page; buildShell(); cleanupPosters(); }
     if (!wasLinked) buildShell();
     Object.assign(config, { refresh_interval: profile.refresh_interval, sync_interval: profile.sync_interval });
     if (page === 'admin' && profile.is_admin) {
-      const [state, inbox] = await Promise.all([api('admin_state'), api('admin_inbox', {
+      const [state, inbox] = await Promise.all([api('admin_state', {}, signal), api('admin_inbox', {
         kind: inboxKind, guild_id: inboxGuild, user_id: inboxUser, channel_id: inboxChannel, query: inboxQuery, page: inboxPage, order: inboxOrder,
-      })]);
-      if (generation !== privacyGeneration) return;
+      }, signal)]);
+      if (!current()) return;
       content.replaceChildren(); renderAdmin(state, inbox); health.textContent = '● Operator'; health.className = 'health'; return;
     }
     if (!profile.account) { content.replaceChildren(); renderLink(); return; }
-    const bundle = await api('browse', { page, kind: page === 'search' ? searchKind : 'all',
-      query: searchQuery, result_page: searchPage, all_requests: allRequests });
-    if (generation !== privacyGeneration) return;
+    const bundle = await api('browse', { page: destination, kind: destination === 'search' ? searchKind : 'all',
+      query: searchQuery, result_page: searchPage, all_requests: allRequests }, signal);
+    if (!current()) return;
+    if (observedState !== stateVersion) { void loadPage(); return; }
     const wasAdmin = profile.is_admin;
     profile = bundle.viewer;
     if (wasAdmin !== profile.is_admin) { buildShell(); cleanupPosters(); }
     Object.assign(config, { refresh_interval: profile.refresh_interval, sync_interval: profile.sync_interval });
     const result = bundle.result;
+    currentResult = result; currentResultPage = page;
+    watchMembership = page === 'watches' ? new Set((result || []).map(mediaKey)) : undefined;
     content.replaceChildren();
     if (page === 'home') renderHome(result);
     else if (page === 'settings') renderSettings(profile);
@@ -225,15 +316,11 @@ async function loadPage() {
     if (['home', 'library', 'requests', 'storage'].includes(page)) updateHealth(bundle.meta);
     else { health.textContent = '● Account verified · Live access'; health.className = 'health'; }
   } catch (error) {
+    if (!current() || error.name === 'AbortError') return;
     if (!error.privateDataBlocked) content.replaceChildren(emptyState(page === 'admin' ? 'Messages unavailable' : 'Live data unavailable', 'Nothing private is shown until access can be checked. Try again when the connection is available.', button('Try again', loadPage, 'button primary')));
     showError(error);
   } finally {
-    loading = false;
-    content?.removeAttribute('aria-busy');
-    if (queuedDestination !== null) {
-      const destination = queuedDestination; queuedDestination = null;
-      if (destination !== page) void navigate(destination);
-    }
+    if (version === loadGeneration) { loading = false; content?.removeAttribute('aria-busy'); }
   }
 }
 
@@ -312,14 +399,17 @@ function attachPoster(cover, item) {
   if (item.poster_path && /^\/[A-Za-z0-9_-]+\.(jpg|png|webp)$/.test(item.poster_path)) {
     const image = node('img'); image.alt = ''; image.width = 342; image.height = 513; image.decoding = 'async'; cover.append(image);
     // Image fetches carry the bearer session in headers, never in URLs or cookies.
-    const load = () => fetch('/api/activity/poster' + item.poster_path, { headers: { Authorization: `Bearer ${token}` } }).then(async response => {
+    const load = () => posterSlot(async () => {
+      if (!image.isConnected) return;
+      const generation = privacyGeneration;
+      const response = await fetch('/api/activity/poster' + item.poster_path, { headers: { Authorization: `Bearer ${token}` } });
       if (!response.ok) {
         const data = await response.json();
         if (data.private_data_blocked || response.status === 401) hidePrivateData(data.verification_required);
         throw new Error('Image unavailable');
       }
       const blob = await response.blob();
-      if (!image.isConnected) return;
+      if (!image.isConnected || generation !== privacyGeneration) return;
       const url = URL.createObjectURL(blob);
       posterUrls.set(url, image);
       image.addEventListener('load', () => releasePoster(url), { once: true });
@@ -363,18 +453,23 @@ function itemActions(item, destination = page, close = () => {}) {
     if (item.status === 'pending') actions.append(button('Undo', async () => { const result = await api('undo', { id: item.id }); close(); await loadPage(); toast(result); }, 'button primary'));
     return actions;
   }
-  if (destination === 'search' && item.requestable !== false) actions.append(button('＋ Request', () => {
-    close(); confirm('Request this item?', `${item.title}. TV: all seasons. Music/books: configured profiles.`, async () => { const result = await api('request', { item: reference(item), confirmed: true }); await loadPage(); toast(result); });
-  }, 'button primary'));
+  if (destination === 'search') {
+    const requestControl = button(item.requestable === false ? 'Already requested' : '＋ Request', () => {
+      close(); confirm('Request this item?', `${item.title}. TV: all seasons. Music/books: configured profiles.`, async () => { toast(await mutate('request', { item: reference(item), confirmed: true })); });
+    }, 'button primary request-control');
+    requestControl.dataset.mediaKey = mediaKey(item); requestControl.disabled = item.requestable === false;
+    actions.append(requestControl);
+  }
   const follow = button(destination === 'watches' ? '☆ Unfollow' : '☆ Follow', async () => {
-    const result = await api('watch', { item: reference(item), remove: destination === 'watches' });
-    if (destination === 'watches') { close(); await loadPage(); }
-    else { follow.textContent = '✓ Following'; follow.setAttribute('aria-pressed', 'true'); follow.dataset.blocked = 'true'; }
+    const result = await mutate('watch', { item: reference(item), remove: follow.dataset.followed === 'true' });
+    if (destination === 'watches') close();
     toast(result);
-  }, 'button subtle'); actions.append(follow);
+  }, 'button subtle follow-control');
+  follow.dataset.mediaKey = mediaKey(item); follow.dataset.destination = destination; follow.dataset.followed = String(destination === 'watches' || item.followed === true);
+  updateFollow(follow); actions.append(follow);
   if (['movie', 'tv'].includes(item.kind) && item.available) actions.append(button('▶ Jellyfin', async () => { const url = await api('open', { item: reference(item) }); await sdk.commands.openExternalLink({ url }); }, 'button subtle'));
   if (destination === 'requests' && item.available && item.deletable) actions.append(button('Delete files…', () => {
-    close(); confirm('Delete files in 24 hours?', `${item.title}${item.is4k ? ' (4K)' : ''}. Removes the entire movie/series, including shared files. Request history stays. Undo in Deletions until execution begins.`, async () => { const result = await api('delete', { id: item.id, confirmed: true }); await loadPage(); toast(result); });
+    close(); confirm('Delete files in 24 hours?', `${item.title}${item.is4k ? ' (4K)' : ''}. Removes the entire movie/series, including shared files, then stops monitoring it. Request history stays. Undo in Deletions until execution begins.`, async () => { const result = await mutate('delete', { id: item.id, confirmed: true }); await loadPage(); toast(result); });
   }, 'button danger'));
   return actions;
 }
@@ -455,15 +550,15 @@ function renderSettings(data) {
   const settings = node('div', 'settings-list');
   const notifications = node('article', 'setting');
   notifications.append(node('h2', '', 'Notifications'), node('p', '', 'DMs for requests and watched items'), node('span', 'pill', profile.account.opted_in ? 'On' : 'Off'));
-  notifications.append(button('Enable', async () => { await api('preferences', { enabled: true }); await loadPage(); }, 'button primary'), button('Mute', async () => { await api('mute'); await loadPage(); }, 'button subtle'));
+  notifications.append(button('Enable', async () => { toast(await mutate('preferences', { enabled: true })); }, 'button primary'), button('Mute', async () => { toast(await mutate('mute')); }, 'button subtle'));
   const devices = node('article', 'setting');
   devices.append(node('h2', '', 'Jellyfin device'));
-  if (data.devices.length) devices.append(select(data.devices.map(name => [name, name]), profile.account.device || data.devices[0], async (device) => { const result = await api('preferences', { device }); await loadPage(); toast(result); }, 'Jellyfin destination'));
+  if (data.devices.length) devices.append(select(data.devices.map(name => [name, name]), profile.account.device || data.devices[0], async (device) => { toast(await mutate('preferences', { device })); }, 'Jellyfin destination'));
   else devices.append(node('p', 'fine', 'Configure JELLYFIN_DEVICE_URLS in the bot environment.'));
   const watchlist = node('article', 'setting');
   watchlist.append(node('h2', '', 'Two-way watchlist sync'),
     node('p', '', 'Movies and series sync with Seerr automatically, including removals. Music/books stay here. Following does not request media.'),
-    button('Sync now', async () => { const result = await api('sync_watchlist'); await loadPage(); toast(result); }, 'button subtle'));
+    button('Sync now', async () => { toast(await mutate('sync_watchlist')); }, 'button subtle'));
   settings.append(notifications, devices, watchlist); content.append(settings);
 }
 
@@ -627,7 +722,7 @@ function startRefresh() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
     const editing = content?.contains(document.activeElement) && document.activeElement.matches('input,textarea,select');
-    if (!document.hidden && !editing && !document.querySelector('dialog[open]') && (profile?.account || profile?.is_admin && page === 'admin') && !loading && page !== 'search') void loadPage();
+    if (!document.hidden && !editing && !pendingMutations && !document.querySelector('dialog[open]') && (profile?.account || profile?.is_admin && page === 'admin') && !loading && page !== 'search') void loadPage();
   }, config.refresh_interval * 1000);
 }
 

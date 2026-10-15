@@ -24,7 +24,7 @@ async function harness({ privateHTTP = false, expireUploads = false, signedIn = 
   const control = { authenticated: signedIn, networkFailure: false, serverFailure: false, delayChat: null };
   const stored = [];
   let nonce = 0;
-  const context = vm.createContext({ document: dom.window.document, FormData: dom.window.FormData, console,
+  const context = vm.createContext({ document: dom.window.document, FormData: dom.window.FormData, console, AbortController, DOMException,
     URL, crypto: privateHTTP ? { getRandomValues: values => { values.fill(++nonce); return values; } } : { randomUUID: () => `nonce-${String(++nonce).padStart(20, '0')}` },
     localStorage: { getItem: () => null, setItem: (key, value) => stored.push({ key, value }) },
     EventSource: class {
@@ -37,6 +37,7 @@ async function harness({ privateHTTP = false, expireUploads = false, signedIn = 
     fetch: async (path, options = {}) => {
       const args = options.body instanceof dom.window.FormData ? { file: options.body.get('file').name } : options.body ? JSON.parse(options.body) : {};
       calls.push({ path, ...args });
+      if (control.reply) { const response = await control.reply(path, args, options); if (response) return response; }
       if (args.operation === 'chat' && control.delayChat) await control.delayChat;
       if (control.networkFailure && path === '/api/state') throw new Error('Network unavailable');
       if (control.serverFailure && path === '/api/state') return { ok: false, status: 503, json: async () => ({ error: 'Temporarily unavailable' }) };
@@ -375,5 +376,118 @@ test('composer counts text, blocks empty sends and avoids duplicate sends during
     assert.equal(h.document.querySelector('.panel-draft'), textarea);
     assert.equal(h.calls.filter(call => call.operation === 'chat').length, 1);
     release(); await h.settle(); assert.equal(h.document.querySelector('.chat-compose-count').textContent, '0 / 2,000');
+  } finally { release?.(); h.close(); }
+});
+
+test('opening Messages loads state and transcript once, in parallel', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async (path, args) => { if (path === '/api/admin' && args.operation === 'state') await delayed; };
+    h.click('Messages'); await h.settle();
+    assert.equal(h.calls.filter(call => call.path === '/api/admin' && call.operation === 'state').length, 1);
+    assert.equal(h.calls.filter(call => call.operation === 'inbox').length, 1); // Does not wait for state.
+    release(); await h.settle(); assert.ok(h.document.querySelector('.chat-message'));
+    assert.equal(h.calls.filter(call => call.path === '/api/admin' && call.operation === 'state').length, 1);
+  } finally { release?.(); h.close(); }
+});
+
+test('a slow live refresh cannot hold up a new conversation or overwrite it later', async () => {
+  const h = await harness(); let release;
+  try {
+    h.click('Messages'); await h.settle();
+    const delayed = new Promise(resolve => { release = resolve; }); let oldSignal;
+    h.control.reply = async (path, args, options) => {
+      if (args.operation === 'inbox' && args.kind === 'all') {
+        oldSignal = options.signal; await delayed;
+        return { ok: true, json: async () => ({ result: { messages: [], total: 0 } }) };
+      }
+    };
+    h.events[0].emit('update'); await h.settle();
+    h.click('Viewer'); await h.settle();
+    assert.equal(oldSignal.aborted, true);
+    assert.equal(h.document.querySelector('.chat-header h2').textContent, 'Viewer');
+    assert.ok(h.document.querySelector('.chat-message'));
+    release(); await h.settle(); assert.ok(h.document.querySelector('.chat-message'));
+    assert.equal(h.document.querySelector('.chat-timeline').hasAttribute('aria-busy'), false);
+  } finally { release?.(); h.close(); }
+});
+
+test('unchanged SSE reads do not rebuild the transcript, date dividers, or sidebar controls', async () => {
+  const h = await harness();
+  try {
+    h.click('Messages'); await h.settle();
+    const message = h.document.querySelector('.chat-message'), date = h.document.querySelector('.chat-date');
+    const theme = h.document.querySelector('[aria-label="Chat theme"]'); theme.focus();
+    h.events[0].emit('update'); await h.settle();
+    assert.equal(h.document.querySelector('.chat-message'), message);
+    assert.equal(h.document.querySelector('.chat-date'), date);
+    assert.equal(h.document.querySelector('[aria-label="Chat theme"]'), theme);
+    assert.equal(h.document.activeElement, theme);
+  } finally { h.close(); }
+});
+
+test('typing newer settings during verification preserves the new draft on completion', async () => {
+  const h = await harness(); let release;
+  try {
+    const token = h.document.querySelector('[data-key="DISCORD_TOKEN"]');
+    token.value = 'first-token'; token.dispatchEvent(new h.window.Event('input'));
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async (path) => { if (path === '/api/action') await delayed; };
+    h.click('Verify'); await h.settle();
+    token.value = 'newer-token'; token.dispatchEvent(new h.window.Event('input'));
+    release(); await h.settle();
+    assert.equal(h.document.querySelector('[data-key="DISCORD_TOKEN"]').value, 'newer-token');
+    assert.match(h.document.querySelector('#draft-status').textContent, /1 unsaved change/);
+  } finally { release?.(); h.close(); }
+});
+
+test('redrawing the composer during a pending chat cannot duplicate the send', async () => {
+  const h = await harness(); let release;
+  try {
+    h.click('Messages'); await h.settle(); h.click('Viewer'); await h.settle();
+    const textarea = h.document.querySelector('.panel-draft'); textarea.value = 'Hello'; textarea.dispatchEvent(new h.window.Event('input'));
+    h.control.delayChat = new Promise(resolve => { release = resolve; });
+    h.click('Send'); await h.settle();
+    const mode = h.document.querySelector('[aria-label="Message mode"]');
+    mode.value = 'announcement'; mode.dispatchEvent(new h.window.Event('change'));
+    const nextMode = h.document.querySelector('[aria-label="Message mode"]'); nextMode.value = 'normal'; nextMode.dispatchEvent(new h.window.Event('change'));
+    h.click('Send'); await h.settle();
+    assert.equal(h.calls.filter(call => call.operation === 'chat').length, 1);
+    release(); await h.settle();
+    assert.equal(h.document.querySelector('.panel-draft').value, '');
+    assert.equal(h.document.querySelector('.chat-send').disabled, false);
+  } finally { release?.(); h.close(); }
+});
+
+test('an older settings revision cannot replace a completed save', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    let old;
+    h.control.reply = async path => {
+      if (path === '/api/state') { await delayed; return { ok: true, json: async () => old }; }
+    };
+    h.click('Refresh status'); await h.settle();
+    old = structuredClone(vm.runInContext('state', h.context));
+    const token = h.document.querySelector('[data-key="DISCORD_TOKEN"]'); token.value = 'saved-token'; token.dispatchEvent(new h.window.Event('input'));
+    h.click('Save & apply'); await h.settle();
+    const notice = h.document.querySelector('#notice'); assert.match(notice.textContent, /Saved/);
+    release(); await h.settle();
+    assert.equal(h.document.querySelector('#notice'), notice);
+    assert.match(notice.textContent, /Saved/);
+  } finally { release?.(); h.close(); }
+});
+
+test('finishing setup verification after entering Messages does not dispose the conversation', async () => {
+  const h = await harness(); let release;
+  try {
+    const delayed = new Promise(resolve => { release = resolve; });
+    h.control.reply = async path => { if (path === '/api/action') await delayed; };
+    h.click('Verify'); await h.settle(); h.click('Messages'); await h.settle();
+    const timeline = h.document.querySelector('.chat-timeline');
+    release(); await h.settle();
+    assert.equal(h.document.querySelector('.chat-timeline'), timeline);
+    assert.equal(h.events[0].closed, false);
   } finally { release?.(); h.close(); }
 });

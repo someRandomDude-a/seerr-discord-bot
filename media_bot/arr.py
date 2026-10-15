@@ -1,5 +1,6 @@
 import requests
 import re
+from seerr.concurrency import parallel
 from .security import UserError
 
 
@@ -20,11 +21,60 @@ class ArrClient:
 
     def snapshot(self):
         resource = {'radarr': 'movie', 'sonarr': 'series', 'lidarr': 'album', 'readarr': 'book'}[self.config.name]
-        return {'items': self.request('GET', resource), 'disks': self.request('GET', 'diskspace')}
+        items, disks = parallel(lambda path: self.request('GET', path), [resource, 'diskspace'], workers=2)
+        return {'items': items, 'disks': disks}
 
     def search(self, query):
         resource = 'album' if self.config.name == 'lidarr' else 'book'
         return self.request('GET', resource + '/lookup', params={'term': query})
+
+    def monitoring_target(self, provider_id):
+        """Live library records only; lookup results can describe absent media."""
+        resource, provider = ('movie', 'tmdbId') if self.config.name == 'radarr' else ('series', 'tvdbId')
+        if self.config.name not in ('radarr', 'sonarr'):
+            raise UserError('Unmonitoring is only supported for movies and series.')
+        rows = self.request('GET', resource, params={provider: provider_id})
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or type(row.get(provider)) is not int or
+                row[provider] <= 0 or type(row.get('id')) is not int or row['id'] <= 0 for row in rows):
+            raise UserError('The service returned an invalid monitoring target.')
+        matches = [row for row in rows if row[provider] == provider_id]
+        if len(matches) > 1:
+            raise UserError('The monitoring target is ambiguous.')
+        return matches[0] if matches else None
+
+    def _series_episodes(self, library_id):
+        episodes = self.request('GET', 'episode', params={'seriesId': library_id})
+        if not isinstance(episodes, list) or any(not isinstance(ep, dict) or type(ep.get('seriesId')) is not int or
+                ep['seriesId'] != library_id or type(ep.get('id')) is not int or ep['id'] <= 0 for ep in episodes):
+            raise UserError('The service returned invalid episodes; monitoring cleanup is pending.')
+        return episodes
+
+    def unmonitor_deleted(self, provider_id, library_id):
+        item = self.monitoring_target(provider_id)
+        if item is None:
+            return  # Seerr normally removes the Arr entry; never recreate it.
+        if library_id is None or item['id'] != library_id:
+            raise UserError('Files were deleted, but the library entry changed. Verify monitoring in the service.')
+        if arr_item(self.config.name, item)['available']:
+            raise UserError('Files are still reported by the service. Monitoring cleanup is pending; file deletion will not be repeated.')
+        if self.config.name == 'radarr':
+            if item.get('monitored') is not False:
+                self.request('PUT', 'movie/editor', json={'movieIds': [library_id], 'monitored': False})
+        else:
+            # Clear season/episode flags as well, including future seasons.
+            body = {**item, 'monitored': False, 'monitorNewItems': 'none',
+                'seasons': [{**season, 'monitored': False} for season in item.get('seasons', [])]}
+            self.request('PUT', f'series/{library_id}', json=body)
+            episodes = self._series_episodes(library_id)
+            ids = [ep['id'] for ep in episodes if ep.get('monitored') is not False]
+            for start in range(0, len(ids), 500):
+                self.request('PUT', 'episode/monitor', json={'episodeIds': ids[start:start + 500], 'monitored': False})
+            if ids and any(ep.get('monitored') is not False for ep in self._series_episodes(library_id)):
+                raise UserError('Episode unmonitoring was not confirmed; monitoring cleanup is pending.')
+        fresh = self.monitoring_target(provider_id)
+        if fresh is not None and (fresh['id'] != library_id or fresh.get('monitored') is not False or
+                self.config.name == 'sonarr' and (fresh.get('monitorNewItems') != 'none' or any(season.get('monitored') is not False for season in fresh.get('seasons', [])))):
+            raise UserError('Unmonitoring was not confirmed; monitoring cleanup is pending.')
 
     def validate_config(self):
         c = self.config

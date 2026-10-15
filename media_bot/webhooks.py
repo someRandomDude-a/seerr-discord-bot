@@ -2,9 +2,11 @@
 import base64
 import secrets
 import time
+import asyncio
 
 from aiohttp import web
 from .security import RateLimiter, UserError, VerificationRequired, VerificationUnavailable
+from .timing import VERIFIED_TIMING
 
 
 class WebhookServer:
@@ -17,6 +19,7 @@ class WebhookServer:
 
     @web.middleware
     async def errors(self, request, handler):
+        started = asyncio.get_running_loop().time()
         try:
             response = await handler(request)
         except UserError as exc:
@@ -30,6 +33,8 @@ class WebhookServer:
         except Exception:
             response = web.json_response({'error': 'Invalid notification payload'}, status=400)
         response.headers.update({'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+        if response.status == 200 and request.get(VERIFIED_TIMING):
+            response.headers['Server-Timing'] = f'app;dur={(asyncio.get_running_loop().time() - started) * 1000:.1f}'
         return response
 
     def authenticate(self, header):

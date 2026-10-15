@@ -14,6 +14,7 @@ import requests
 from aiohttp import web
 
 from seerr import SeerrAPI
+from seerr.concurrency import parallel
 from .arr import ArrClient
 from .config import ArrConfig, Config, http_url, integer
 from .discovery import discover_arr
@@ -64,6 +65,7 @@ class ControlPanel:
 
     @web.middleware
     async def guard(self, request, handler):
+        started = asyncio.get_running_loop().time()
         try:
             # Reject DNS-rebinding hosts. Private IP access is allowed for explicitly published LAN panels.
             hostname = urlsplit('http://' + request.host).hostname
@@ -96,6 +98,8 @@ class ControlPanel:
             'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"})
         if request.path.startswith(('/api/admin/media/', '/api/admin/files/')):
             response.headers['Content-Security-Policy'] = "sandbox; default-src 'none'; frame-ancestors 'none'"
+        if response.status == 200 and request.path.startswith('/api/') and request.path != '/api/login' and not response.prepared:
+            response.headers['Server-Timing'] = f'app;dur={(asyncio.get_running_loop().time() - started) * 1000:.1f}'
         return response
 
     @staticmethod
@@ -138,7 +142,7 @@ class ControlPanel:
         self.code = ''  # One exchange per console code; restart the panel if the session is lost.
         token = secrets.token_urlsafe(32)
         self.sessions[token] = {'expires': time.monotonic() + 8 * 3600, 'host': request.host,
-            'draft': draft, 'verified': {}}
+            'draft': draft, 'verified': {}, 'revision': 0}
         response = web.json_response({'ok': True})
         response.set_cookie(self.cookie_name(request), token, httponly=True, samesite='Strict', max_age=8 * 3600, path='/')
         return response
@@ -158,7 +162,7 @@ class ControlPanel:
             'activity_authenticated': bool(self.bot and self.bot.activity and any(
                 item['expires'] > time.monotonic() for item in list(self.bot.activity.sessions.values()))),
             'webhook_tests': self.bot.webhooks.last_tests if self.bot else {},
-            'saved': self.path.exists()}
+            'saved': self.path.exists(), 'revision': session.get('revision', 0)}
 
     async def state(self, request):
         return web.json_response(self.public(self.session(request)))
@@ -183,6 +187,7 @@ class ControlPanel:
                 raise UserError(f'{key} is overridden by the environment')
             draft[key] = ''
         session['draft'] = draft
+        session['revision'] = session.get('revision', 0) + 1
 
     @staticmethod
     def digest(values, keys):
@@ -210,10 +215,9 @@ class ControlPanel:
                 if response.status_code != 200:
                     raise UserError('Discord rejected the bot credentials or test request')
                 return response.json()
-            user = discord_get('users/@me')
+            user, application = parallel(discord_get, ['users/@me', 'oauth2/applications/@me'], workers=2)
             if not user.get('bot'):
                 raise UserError('Use a bot token, not a user token')
-            application = discord_get('oauth2/applications/@me')
             if values.get('DISCORD_APPLICATION_ID') and values['DISCORD_APPLICATION_ID'] != application['id']:
                 raise UserError('Application ID does not match the bot token')
             flags = int(application.get('flags', 0))
@@ -254,10 +258,10 @@ class ControlPanel:
                 if values.get('SEERR_DISCOVERY', 'true').strip().lower() == 'false':
                     configs = {name: config for name in ('radarr', 'sonarr')
                         if (config := self.direct_config(name, values))}
-                for config in configs.values():
+                def check_service(config):
                     client = ArrClient(config, 15)
-                    client.request('GET', 'system/status')
-                    client.request('GET', 'diskspace')
+                    parallel(lambda path: client.request('GET', path), ['system/status', 'diskspace'], workers=2)
+                parallel(check_service, list(configs.values()))
                 users, skip = [], 0
                 while True:
                     batch = api.list_users(take=100, skip=skip)['results']
@@ -279,8 +283,9 @@ class ControlPanel:
                 return {'disabled': True}
             config = self.direct_config(operation, values)
             client = ArrClient(config, integer('API_TIMEOUT_SECONDS', 15, values=values))
-            client.request('GET', 'system/status')
-            choices = {path: client.request('GET', path) for path in ('qualityprofile', 'metadataprofile', 'rootfolder')}
+            paths = ('system/status', 'qualityprofile', 'metadataprofile', 'rootfolder')
+            results = parallel(lambda path: client.request('GET', path), paths)
+            choices = dict(zip(paths[1:], results[1:]))
             for suffix, collection, key in (('_QUALITY_PROFILE_ID', 'qualityprofile', 'id'),
                 ('_METADATA_PROFILE_ID', 'metadataprofile', 'id'), ('_ROOT_FOLDER', 'rootfolder', 'path')):
                 value = values.get(prefix + suffix, '')
@@ -303,17 +308,31 @@ class ControlPanel:
         data = await request.json()
         if not isinstance(data, dict):
             raise web.HTTPBadRequest()
+        operation = data.get('operation')
+        if operation in ('discord', 'seerr', 'lidarr', 'readarr'):
+            async with self.operation_lock:
+                self.update(session, data)
+                values = self.values(session)
+                keys = self.verification_keys(operation)
+                tested = self.digest(values, keys)
+            # Independent connection tests need not hold the settings/save lock.
+            result = await asyncio.to_thread(self.verify, operation, values)
+            self.session(request)
+            async with self.operation_lock:
+                if self.digest(self.values(session), keys) != tested:
+                    raise UserError('Settings changed while verification was running. Verify the current values again.')
+                if operation == 'discord' and not values.get('DISCORD_APPLICATION_ID'):
+                    session['draft']['DISCORD_APPLICATION_ID'] = result['application_id']
+                    values = self.values(session)
+                session['verified'][operation] = (self.digest(values, keys), time.monotonic())
+                session['revision'] += 1
+                response = self.public(session); response['result'] = result
+                return web.json_response(response)
         async with self.operation_lock:
             self.update(session, data)
             values = self.values(session)
             operation = data.get('operation')
-            if operation in ('discord', 'seerr', 'lidarr', 'readarr'):
-                result = await asyncio.to_thread(self.verify, operation, values)
-                if operation == 'discord' and not values.get('DISCORD_APPLICATION_ID'):
-                    session['draft']['DISCORD_APPLICATION_ID'] = result['application_id']
-                    values = self.values(session)
-                session['verified'][operation] = (self.digest(values, self.verification_keys(operation)), time.monotonic())
-            elif operation == 'save':
+            if operation == 'save':
                 config = Config.from_values(values)
                 required = ['discord', 'seerr'] + [name for name in ('lidarr', 'readarr') if name in config.arr]
                 for step in required:

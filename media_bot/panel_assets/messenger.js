@@ -3,6 +3,7 @@ import { chatMessage, chatAttachments, discordContent } from './chat.js';
 export async function mountMessenger(host, api, reportError) {
   let disposed = false, source, admin, generation = 0, page = 1, query = '', active = { kind: 'all', name: 'Inbox' };
   let mode = 'normal', recipients = { guilds: [], user: null, channel: null, all: false }, refreshBusy = false, refreshAgain = false;
+  let refreshController, refreshSequence = 0, refreshPending, sidebarSignature;
   const drafts = new Map();
   // getRandomValues also works on private HTTP origins where randomUUID may not.
   const nonce = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() :
@@ -24,7 +25,7 @@ export async function mountMessenger(host, api, reportError) {
   main.append(header, paging, timeline, composer); shell.append(sidebar, main); host.append(shell);
   const key = () => `${active.kind}:${active.id || ''}:${active.channel || ''}`;
   const draft = () => { if (!drafts.has(key())) drafts.set(key(), { text: '', files: [], nonce: nonce() }); return drafts.get(key()); };
-  const request = async (operation, args = {}) => (await api('/api/admin', { operation, ...args })).result;
+  const request = async (operation, args = {}, signal) => (await api('/api/admin', { operation, ...args }, signal)).result;
 
   function modal(title, build) {
     const trigger = document.activeElement;
@@ -41,7 +42,7 @@ export async function mountMessenger(host, api, reportError) {
       channel: selection.channel || null, all: false };
     timeline.replaceChildren(el('p', 'Loading conversation…', 'loading'));
     timeline.setAttribute('aria-busy', 'true');
-    drawHeader(); drawComposer(); await refresh();
+    drawHeader(); drawComposer(); await refresh(true);
   }
   function drawSidebar() {
     const scroll = sidebar.scrollTop;
@@ -93,7 +94,7 @@ export async function mountMessenger(host, api, reportError) {
     const search = el('form', undefined, 'chat-search');
     const input = el('input'); input.type = 'search'; input.maxLength = 100; input.value = query; input.placeholder = 'Search this conversation'; input.setAttribute('aria-label', 'Search conversation');
     search.append(input); search.hidden = active.kind === 'history';
-    search.addEventListener('submit', async event => { event.preventDefault(); query = input.value.trim(); page = 1; generation += 1; await refresh(); });
+    search.addEventListener('submit', async event => { event.preventDefault(); query = input.value.trim(); page = 1; generation += 1; await refresh(true); });
     const status = el('span', 'Connecting…', 'chat-live'); status.id = 'chat-live';
     header.append(search, status, btn('Refresh', refresh));
   }
@@ -161,24 +162,27 @@ export async function mountMessenger(host, api, reportError) {
         }
       } catch (error) { reportError(error.message); } finally { current.uploading = false; input.value = ''; }
     });
-    let sending = false;
     const send = async () => {
-      if (sending) return;
+      if (current.sending) return;
       if (current.uploading) throw new Error('Wait for attachments to finish uploading before sending.');
       current.text = textarea.value; // Also supports autofill/test inputs without an input event.
       if (!current.text.trim() && !current.files.length) throw new Error('Write a message or attach a file first.');
-      sending = true;
+      current.sending = true;
       try {
         const uploads = current.files.map(file => file.id);
         const sentFiles = current.files.map(file => ({ ...file })), sentNonce = current.nonce;
         const clearSent = () => {
           if (current.nonce !== sentNonce) return;
           current.text = ''; current.files = []; current.nonce = nonce(); textarea.value = ''; counter.textContent = '0 / 2,000'; resize(); drawFiles();
+          if (draft() === current && composer.querySelector('textarea') !== textarea) {
+            const focused = composer.contains(document.activeElement);
+            drawComposer(); if (focused) composer.querySelector('textarea')?.focus();
+          }
         };
         if (mode === 'normal') {
           await request('chat', { message: current.text, uploads, request_id: current.nonce,
             user_id: active.kind === 'dm' ? active.id : null, guild_id: active.kind === 'guild' ? active.id : null, channel_id: active.channel || null });
-          clearSent(); await refresh();
+          clearSent(); generation += 1; await refresh(true);
         } else {
           const plan = await request('prepare', { message: current.text, uploads, guild_ids: recipients.guilds,
             user_id: recipients.user, channel_id: recipients.channel, all_users: recipients.all });
@@ -189,25 +193,40 @@ export async function mountMessenger(host, api, reportError) {
             dialog.append(btn('Cancel', close), btn('Confirm', async () => { await request('send', { plan: plan.plan, confirmed: true }); close(); clearSent(); await refresh(); }, 'button primary'));
           });
         }
-      } finally { sending = false; }
+      } finally {
+        current.sending = false;
+        if (draft() === current) {
+          const control = composer.querySelector('.chat-send');
+          if (control) { control.disabled = false; control.removeAttribute('aria-busy'); }
+        }
+      }
     };
-    const sendButton = btn(mode === 'normal' ? 'Send' : 'Preview announcement', send, 'button primary');
+    const sendButton = btn(mode === 'normal' ? 'Send' : 'Preview announcement', send, 'button primary chat-send');
+    sendButton.disabled = Boolean(current.sending);
+    if (current.sending) sendButton.setAttribute('aria-busy', 'true');
     textarea.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && mode === 'normal') { event.preventDefault(); sendButton.click(); } });
     tools.append(btn('＋ Attach files', () => input.click()), counter, sendButton);
     composer.append(attachments, textarea, tools, input, el('small', 'Enter to send · Shift+Enter for a new line · Up to 4 files, 8 MiB each / 16 MiB total', 'fine'));
     resize();
   }
-  async function refresh() {
+  async function refresh(supersede = false) {
     if (disposed) return;
-    if (refreshBusy) { refreshAgain = true; return; }
+    if (refreshBusy && !supersede) { refreshAgain = true; await refreshPending?.catch(() => {}); return; }
+    refreshController?.abort();
+    const controller = new AbortController(); refreshController = controller;
+    const sequence = ++refreshSequence;
+    refreshAgain = false;
     refreshBusy = true;
     const version = generation;
     try {
-      const [nextAdmin, result] = await Promise.all([request('state'), active.kind === 'history' ? request('history', { page }) : request('inbox', {
+      refreshPending = Promise.all([request('state', {}, controller.signal), active.kind === 'history' ? request('history', { page }, controller.signal) : request('inbox', {
         kind: active.kind === 'all' ? 'all' : active.kind === 'dm' ? 'dm' : 'guild', guild_id: active.kind === 'guild' ? active.id : null,
-        user_id: active.kind === 'dm' ? active.id : null, channel_id: active.channel || null, page, query, order: 'newest' })]);
-      if (disposed || version !== generation) { refreshAgain = true; return; }
-      admin = nextAdmin; drawSidebar();
+         user_id: active.kind === 'dm' ? active.id : null, channel_id: active.channel || null, page, query, order: 'newest' }, controller.signal)]);
+      const [nextAdmin, result] = await refreshPending;
+      if (disposed || controller.signal.aborted || sequence !== refreshSequence || version !== generation) return;
+      admin = nextAdmin;
+      const signature = JSON.stringify([key(), admin.guilds, admin.threads, admin.retention_days, admin.all_users_enabled]);
+      if (signature !== sidebarSignature) { drawSidebar(); sidebarSignature = signature; }
       if (active.kind === 'dm') {
         const thread = admin.threads.find(item => item.kind === 'dm' && item.id === active.id);
         if (thread) { active.name = thread.name; header.querySelector('h2').textContent = thread.name; }
@@ -223,7 +242,10 @@ export async function mountMessenger(host, api, reportError) {
       let lastDay;
       for (const item of messages) {
         const day = new Date(item.created_at * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
-        if (day !== lastDay) { const divider = el('div', day, 'chat-date'); nodes.push(divider); lastDay = day; }
+        if (day !== lastDay) {
+          const id = `date-${day}`; const divider = old.get(id) || el('div', day, 'chat-date'); divider.dataset.message = id;
+          nodes.push(divider); lastDay = day;
+        }
         const signature = JSON.stringify([key(), item]); let node = old.get(item.message_id);
         if (!node || node.dataset.signature !== signature) {
           node = chatMessage(item); node.dataset.signature = signature;
@@ -251,26 +273,28 @@ export async function mountMessenger(host, api, reportError) {
         }
         nodes.push(node);
       }
-      timeline.replaceChildren(...nodes);
+      const retained = new Set(nodes);
+      for (const child of [...timeline.children]) if (!retained.has(child)) child.remove();
+      for (let index = 0; index < nodes.length; index++) if (timeline.children[index] !== nodes[index]) timeline.insertBefore(nodes[index], timeline.children[index] || null);
       if (!messages.length) timeline.append(el('p', active.kind === 'history' ? 'No announcements yet. Compose one below.' : 'This is the start of the retained conversation. Replies appear here as the bot.', 'chat-empty'));
       timeline.scrollTop = nearBottom ? timeline.scrollHeight : scroll;
-      const older = btn('Older messages', async () => { page += 1; generation += 1; await refresh(); }); older.disabled = page * (active.kind === 'history' ? 25 : 50) >= result.total;
-      const newer = btn('Newer messages', async () => { page = Math.max(1, page - 1); generation += 1; await refresh(); }); newer.disabled = page === 1;
+       const older = btn('Older messages', async () => { page += 1; generation += 1; await refresh(true); }); older.disabled = page * (active.kind === 'history' ? 25 : 50) >= result.total;
+       const newer = btn('Newer messages', async () => { page = Math.max(1, page - 1); generation += 1; await refresh(true); }); newer.disabled = page === 1;
       paging.replaceChildren(older, el('small', `Page ${page} · ${result.total} retained`, 'fine'), newer);
       const status = header.querySelector('.chat-live'); if (status) status.textContent = source?.readyState === 1 ? '● Live' : '● Reconnecting';
     } catch (error) {
-      if (!disposed) {
+      if (!disposed && !controller.signal.aborted && sequence === refreshSequence) {
         reportError(error.message);
         if (version === generation && timeline.querySelector('.loading')) timeline.replaceChildren(el('p', 'Conversation unavailable. Use Refresh to try again.', 'chat-empty'));
       }
     } finally {
-      if (version === generation) timeline.removeAttribute('aria-busy');
-      refreshBusy = false; if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); }
+      if (sequence === refreshSequence) {
+        if (version === generation) timeline.removeAttribute('aria-busy');
+        refreshBusy = false; if (refreshAgain && !disposed) { refreshAgain = false; void refresh(); }
+      }
     }
   }
-  admin = await request('state');
-  if (disposed || !host.isConnected) return { dispose() {} };
-  drawSidebar(); drawHeader(); drawComposer(); await refresh();
+  drawHeader(); drawComposer(); await refresh();
   if (!host.isConnected) { shell.remove(); drafts.clear(); return { dispose() {} }; }
   if (typeof EventSource === 'function') {
     source = new EventSource('/api/admin/events', { withCredentials: true });
@@ -286,5 +310,5 @@ export async function mountMessenger(host, api, reportError) {
     });
     source.addEventListener('open', () => { const status = header.querySelector('.chat-live'); if (status) status.textContent = '● Live'; });
   }
-  return { dispose() { disposed = true; generation += 1; source?.close(); drafts.clear(); shell.remove(); host.querySelectorAll('.chat-dialog').forEach(dialog => dialog.remove()); } };
+  return { dispose() { disposed = true; generation += 1; refreshController?.abort(); source?.close(); drafts.clear(); shell.remove(); host.querySelectorAll('.chat-dialog').forEach(dialog => dialog.remove()); } };
 }
