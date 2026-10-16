@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" ExcludeAssets="runtime" />
+    <PackageReference Include="Discord.Net.WebSocket" Version="3.20.2" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <EmbeddedResource Include="Web/*" />
+    <AssemblyMetadata Include="PluginGuid" Value="c70297bf-77bd-4ad4-93c9-f67598519777" />
+    <AssemblyMetadata Include="JellyfinVersion" Value="$(JellyfinVersion)" />
+    <InternalsVisibleTo Include="MediaHub.Tests" />
+  </ItemGroup>
+  <Target Name="ValidateActivityBundle" BeforeTargets="BeforeBuild" Condition="'$(RequireActivityBundle)' == 'true'">
+    <Error Condition="!Exists('Web/activity.bundle.js')" Text="Build the bundled Activity with npm ci --ignore-scripts and npm run build in plugin/activity before packaging." />
+  </Target>
+</Project>

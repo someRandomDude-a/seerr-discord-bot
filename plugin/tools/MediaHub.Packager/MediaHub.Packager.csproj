@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../LICENSE" LogicalName="LICENSE" />
+    <EmbeddedResource Include="../../THIRD_PARTY_NOTICES.md" LogicalName="THIRD_PARTY_NOTICES.md" />
+  </ItemGroup>
+</Project>

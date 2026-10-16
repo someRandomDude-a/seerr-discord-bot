@@ -1,0 +1,9 @@
+:root { color-scheme: dark; --hub-background: #101010; --hub-text: #eeeeee; --hub-accent: #00a4dc; }
+body { margin: 0; background: var(--hub-background); color: var(--hub-text); font-family: system-ui, sans-serif; }
+main { padding: 1rem; max-width: 80rem; margin: auto; }
+input, button, textarea, select { font: inherit; margin: .3rem; max-width: 100%; }
+button, a { color: var(--hub-accent); }
+section { margin-block: 1.5rem; }
+label, .inputContainer { display: block; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }

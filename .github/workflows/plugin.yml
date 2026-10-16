@@ -1,0 +1,35 @@
+name: Media Hub plugin CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        jellyfin: ['12.0.0', '12.2.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release --nologo -p:JellyfinVersion=${{ matrix.jellyfin }}
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: plugin/web/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: plugin/web
+      - run: npm test
+        working-directory: plugin/web
+      - run: npm ci --ignore-scripts
+        working-directory: plugin/activity
+      - run: npm run build
+        working-directory: plugin/activity

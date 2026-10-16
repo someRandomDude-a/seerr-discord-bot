@@ -1,0 +1,10 @@
+{
+  "name": "jellyfin-mediahub-activity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "@discord/embedded-app-sdk": "2.4.0" },
+  "devDependencies": { "esbuild": "0.25.10" }
+}

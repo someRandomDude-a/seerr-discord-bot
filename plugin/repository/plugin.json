@@ -1,0 +1,8 @@
+{
+  "guid": "c70297bf-77bd-4ad4-93c9-f67598519777",
+  "name": "Media Hub (Preview)",
+  "overview": "In-process media and Discord integration for Jellyfin 12. Preview; not production-ready.",
+  "description": "Media Hub runs inside Jellyfin with an integrated, restartable setup tutorial. It provides verified account linking, scoped movie/TV discovery and confirmed requests, native libraries, personal watchlists and Seerr reconciliation, selected music/book requests, notifications, operator messaging and a bundled optional Discord Activity. Shared deletion requires requester ownership, current viewer consent, a full delay and approved Arr destinations; automatic removal defaults off. SyncPlay invitations remain blocked without exact creator-session proof. Feature completion and live provider/client acceptance remain outstanding.",
+  "category": "General",
+  "targetAbi": "12.0.0"
+}

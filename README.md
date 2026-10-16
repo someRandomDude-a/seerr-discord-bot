@@ -1,226 +1,94 @@
-# Seerr Discord Bot
+# Media Hub for Jellyfin 12
 
-A Discord bot that links Jellyfin users to Seerr and lets them view/remove their media requests directly from Discord – all through private slash commands.
+Media Hub is an **in-process .NET 10 plugin** for Jellyfin 12. Discord commands, media services,
+background work, configuration and the optional Discord web Activity run through Jellyfin.
+No separate application server, admin listener or runtime service is installed.
 
----
+> **Preview, not production-ready.** Use a test Jellyfin and test Discord application.
+> Automatic deletion defaults off. SyncPlay invitations remain blocked without exact
+> creator-session proof. Provider/client acceptance and several features are still incomplete.
+> See the [feature checklist](plugin/FEATURES.md) and [security review](plugin/SECURITY_REVIEW.md).
+
+## Install and set up
+
+1. Use an installable, version-matched plugin ZIP on Jellyfin **12.x**. Source files alone do not
+   install a plugin. The package references Jellyfin API **12.0.0** and is also tested against **12.2.0**.
+2. When the catalog has been published, add its HTTPS manifest under
+   **Dashboard → Plugins → Repositories**:
+
+   ```text
+   https://somerandomdude-a.github.io/seerr-discord-bot/manifest.json
+   ```
+
+   **This URL is the publication target, not a claim that the catalog is live.** The owner must
+   run the [release workflow](plugin/README.md#publish-the-repository), then verify the manifest,
+   downloadable ZIP and catalog installation. Do not add the Git clone URL as a repository.
+3. Install **Media Hub (Preview)** and restart Jellyfin. For ordinary-user navigation and login
+   resume, install compatible Jellyfin-12 **Plugin Pages** and **File Transformation** versions.
+4. Sign in as the Jellyfin administrator, open **Dashboard → Plugins → Media Hub → settings**,
+   and follow **Set up Media Hub**. It opens automatically for a new configuration.
+
+The integrated tutorial walks through Discord app creation, least-privilege permissions,
+IDs/secrets, the actual configuration forms, account linking and optional Activity setup.
+Use **Back / Next / Pause / Resume / Restart tutorial** at any time. Restart does not reset
+settings or links. Only explicit Save actions change configuration; tutorial progress stores no
+credentials or drafts. The [onboarding reference](plugin/ONBOARDING.md) is optional extra detail.
 
 ## Features
 
-- **Secure Jellyfin linking** – users authenticate once via a private modal; credentials are never stored.
-- **Persistent user mapping** – Discord ID → Seerr user saved in JSON (or easily swappable to a database).
-- **Local request cache** – all Seerr requests are synced every hour into a SQLite database for instant access.
-- **Paginated request viewer** – browse your requests with page buttons.
-- **Full media removal** – remove the entire media entry from Seerr (and optionally from Radarr/Sonarr) with one click.
-- **Ephemeral responses** – all bot messages and modals are visible only to the interacting user.
-- **Hash‑based change detection** – sync only runs when something actually changed, reducing API load.
-- **Exponential backoff** – gracefully retries TMDB lookups for media details if the API is slow.
+- Native Jellyfin account/session verification, current library visibility, separate administrator
+  integration settings and personal preferences; no administrator impersonation of viewers.
+- User-scoped Seerr discovery, movie/TV request previews and confirmation, permissions/quotas,
+  request history and two-way watchlist membership. Seerr remains authoritative for those requests.
+- Accessible movie/TV/music/book libraries, selected Lidarr/Readarr requests, service/storage
+  projections, personal subscriptions, status feed and opt-in Discord notifications.
+- Discord media commands and separately authorized operator inbox, messages, attachments and
+  previewed announcements. Ambiguous requests/messages are not automatically resent.
+- Anonymous shared deletion queue, owner-only Undo, current recent-viewer consent and a full
+  delay. Removal is through verified Arr file APIs only; no direct media filesystem deletion.
+- Bundled optional Discord web Activity using the same application services and permission checks.
+  It cannot configure the host or impersonate a native player. Launch it through Discord's App Launcher.
 
----
+This list describes implemented preview functionality, not completed live-provider acceptance.
+See [FEATURES.md](plugin/FEATURES.md) for supported paths and remaining work.
 
-## Prerequisites
+## Safety and state
 
-- **Python 3.10+** (tested up to 3.14)
-- **Seerr instance** (Jellyseerr works too)
-- **Jellyfin server** (or Emby – just change `server_type`)
-- **Discord Bot Token** – [create one here](https://discord.com/developers/applications)
-- **Seerr Admin API key** – obtain from Seerr *Settings → General → API Key*
-- **pip** and `git` for installation
+The plugin owns only **`<Jellyfin data>/media-hub/`**. It does not directly open/migrate Jellyfin's
+databases, persist web-file edits or change host/network settings. Uninstall retains plugin
+state. Corrupt, foreign, incompatible or unverifiable state is not silently reset or approved.
+Back up the full plugin directory consistently with its matching encryption key.
 
----
+Configuration, user data and external responses are untrusted. Integration settings are
+authenticated; discovered Arr destinations additionally require independent administrator
+approval. In-process resource/provider/filesystem risks and unresolved release blockers remain;
+unit tests cannot establish absolute host immunity or production safety.
 
-## Docker Installation
+## Develop and release
 
-1. **Create a `docker-compose.yaml` file:**
+Requires **.NET 10 SDK** and **Node 22.12+** for development only. Run from the repository root:
 
-   ```yaml
-   services:
-   discord-bot:
-      image: ghcr.io/somerandomdude-a/seerr-discord-bot:latest
-      volumes:
-         - ./data:/data
-      environment:
-         - SEERR_URL=https://movies.neblo.in/
-         - SEERR_ADMIN_KEY=your-seerr-key
-         - DISCORD_TOKEN=your-discord-bot-token
-      restart: unless-stopped
-   ```
-
-2. **Create a folder `./data` in your installation location** 
-      You can configure this by mounting your own volume in `/data` inside the container
-
-3. run `docker compose up -d` (you may need to use `sudo` depending on your environment)
-
-## Python Installation
-
-1. **Clone the repository**
-
-   ```bash
-   git clone https://github.com/someRandomDude-a/seerr-discord-bot.git
-   cd seerr-discord-bot
-   ```
-
-2. **Create a virtual environment (recommended)**
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate      # Linux/macOS
-   venv\Scripts\activate         # Windows
-   ```
-
-3. **Install dependencies**
-
-   ```bash
-   pip install uv
-   uv pip install -r requirements.txt
-   ```
-
-4. **Copy the environment template**
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   Then fill in the `.env` file with your actual data (see [Configuration](#configuration)).
-
----
-
-## Configuration
-
-The bot uses a `.env` file for all settings. Example:
-
-```ini
-SEERR_URL=http://localhost:5055
-SEERR_ADMIN_KEY=your-seerr-admin-api-key
-DISCORD_TOKEN=your-discord-bot-token
-DATABASE_PATH=seerr_cache.db   # optional, default is "seerr_cache.db"
+```sh
+dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.0.0
+dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.2.0
+npm ci --prefix plugin/web
+npm test --prefix plugin/web
+npm ci --ignore-scripts --prefix plugin/activity
+npm run build --prefix plugin/activity
 ```
 
-| Variable | Required | Description |
-| ---------- | ---------- | ------------- |
-| `SEERR_URL` | Yes | Full URL of your Seerr instance (e.g., `http://192.168.1.100:5055`) |
-| `SEERR_ADMIN_KEY` | Yes | Admin API key from Seerr *Settings → General* |
-| `DISCORD_TOKEN` | Yes | Discord bot token (from [Discord Developer Portal](https://discord.com/developers/applications)) |
-| `DATABASE_PATH` | No | Path to the SQLite cache database (default: `seerr_cache.db`) |
+Code and resources live in `plugin/src/`; native tests in `plugin/tests/`; browser tests in
+`plugin/web/`; the bundled Activity source in `plugin/activity/`; packaging and guarded disposable
+Jellyfin acceptance tools in `plugin/tools/`. CI tests these plugin components; release tooling
+builds an allowlisted ZIP, checksums and `manifest.json`, then publishes immutable preview assets
+and the catalog only when explicitly run.
 
----
+### Documentation
 
-## Running the Bot
+- [Setup](docs/setup.md) · [Tutorial controls](docs/onboarding.md) · [Detailed plugin reference](plugin/README.md)
+- [Activity configuration](plugin/ACTIVITY.md) · [Implementation plan](plugin/IMPLEMENTATION_PLAN.md)
+- [Feature checklist](plugin/FEATURES.md) · [Safety boundaries](plugin/SAFETY.md)
+- [Security findings](plugin/SECURITY_REVIEW.md) · [Acceptance evidence](plugin/ACCEPTANCE.md)
+- [Packaging and publishing](plugin/README.md#build-and-test) · [Release notes](plugin/repository/RELEASE_NOTES.md)
 
-Start the bot with:
-
-```bash
-python bot.py
-```
-
-### The bot will
-
-- Synchronise all Seerr requests into a local SQLite database (first run takes longer; subsequent syncs are instant if no changes).
-- Start a background sync every hour.
-- Log in to Discord and register the slash commands `/link` and `/requests`.
-
----
-
-## Usage (Slash Commands)
-
-All commands are private (ephemeral) – only you can see the responses.
-
-### `/link`
-
-#### Linking your Jellyfin account for the first time
-
-1. Type `/link` in any channel the bot can see.
-2. A **modal** will appear (only visible to you) asking for your Jellyfin username and password.
-3. On success, your Discord ID is permanently linked to your Seerr/Jellyfin user.
-4. You only need to do this once – future uses of `/requests` will automatically identify you.
-
-### `/requests`
-
-#### View and manage your Seerr media requests
-
-- Shows a paginated list of all your requests (sorted by last update).
-- Each request has a **Remove** button.
-- Clicking **Remove** will:
-  1. Delete the media from Seerr (`DELETE /api/v1/media/{media_id}`).
-  2. (If configured in Seerr’s settings) also delete it from Radarr/Sonarr.
-  3. Remove the request from your list instantly.
-- The list updates live after removal, and you can navigate pages with ◀ ▶ buttons.
-
----
-
-## How It Works
-
-### 1. Sync Engine (`sync.py`)
-
-- Fetches **all** Seerr requests paginated every hour.
-- Computes a SHA‑256 hash of the sorted list; if unchanged, skips syncing.
-- Stores requests in `requests` table (SQLite), enriched with TMDB metadata (title, poster, etc.) in `media_details`.
-- Uses a single database connection per cycle to avoid locks, with WAL mode enabled.
-- Exponential backoff (up to 5 retries) when fetching media details from TMDB.
-
-### 2. User Linking
-
-- Discord user IDs are mapped to Seerr user IDs in `linked_users.json`.
-- The `/link` modal authenticates against Jellyfin via Seerr’s `POST /auth/jellyfin` using a temporary client – no API key or password storage.
-
-### 3. Request Removal
-
-- The **Remove** button calls Seerr’s `DELETE /api/v1/media/{media_id}` endpoint.
-- This removes the entire media record from Seerr (and optionally files if `DELETE /media/{media_id}/file` is enabled).
-- To also delete from Radarr/Sonarr, ensure **Media Deletion** is turned on in Seerr’s *Settings → Services*.
-
-### 4. Privacy & Security
-
-- The Discord token, Seerr admin key, and all credentials stay in `.env`.
-- User passwords are discarded immediately after verification.
-- All bot replies are ephemeral (visible only to the command caller).
-
----
-
-## FAQ
-
-**Can I approve/decline requests from the bot?**  
-Not yet – this version focuses on removal. Adding `/approve` and `/decline` is trivial and can be added on request.
-
-**Will my Jellyfin password be exposed?**  
-No. The modal is temporary and the password is used only once to authenticate against Seerr. It is never stored, logged, or transmitted outside that single API call.
-
-**Does the bot support Emby or Plex?**  
-Currently only Jellyfin (due to `login_with_jellyfin` with `server_type=0`). To use Emby, change `server_type=1`. Plex would require a token, which isn’t currently implemented in the modal.
-
-**Are request IDs ever reused?**  
-No. Seerr uses auto‑increment IDs that are never recycled, so your local database remains consistent.
-
----
-
-## Project Structure
-
-```dir
-.
-├── bot.py               # Discord bot with slash commands & UI
-├── seerr/               # Seerr API Python client (your package)
-│   ├── __init__.py
-│   ├── client.py
-│   ├── sync.py
-│   └── exceptions.py
-├── .env                 # Your secrets (not committed)
-├── .env.example         # Template for .env
-├── linked_users.json    # Discord↔Seerr user mapping (auto-created)
-├── seerr_cache.db       # Local request database (auto-created)
-└── README.md
-```
-
----
-
-## License
-
-This project is open‑source under the [MIT License](LICENSE). Feel free to use, modify, and distribute it.
-
----
-
-## Acknowledgements
-
-- Built on top of [Seerr](https://github.com/seerr-team/seerr) API.
-- Uses [discord.py](https://github.com/Rapptz/discord.py) for the bot framework.
-- Icons & inspiration from the Jellyfin/Emby community.
-
----
+MIT licensed. See [LICENSE](LICENSE) and [third-party notices](plugin/THIRD_PARTY_NOTICES.md).
