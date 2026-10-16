@@ -1,0 +1,118 @@
+name: Publish Jellyfin plugin repository
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New immutable four-part preview version, e.g. 0.1.0.0'
+        required: true
+        default: '0.1.0.0'
+  push:
+    tags: ['plugin-v*']
+permissions:
+  contents: read
+concurrency:
+  group: media-hub-plugin-repository
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: plugin/web/package-lock.json
+      - name: Validate release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#plugin-v}}"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - run: dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release --nologo -p:JellyfinVersion=12.0.0
+      - run: dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release --nologo -p:JellyfinVersion=12.2.0
+      - run: npm ci --ignore-scripts
+        working-directory: plugin/web
+      - run: npm test
+        working-directory: plugin/web
+      - run: npm ci --ignore-scripts
+        working-directory: plugin/activity
+      - run: npm run build
+        working-directory: plugin/activity
+      - name: Build release assembly
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release --nologo -p:JellyfinVersion=12.0.0 -p:RequireActivityBundle=true -p:Version="$RELEASE_VERSION" -p:AssemblyVersion="$RELEASE_VERSION" -p:FileVersion="$RELEASE_VERSION" -p:InformationalVersion="$RELEASE_VERSION" -p:ContinuousIntegrationBuild=true -o plugin/artifacts/build
+      - name: Build ZIP and preserve repository history
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # Release assets are authoritative even if a previous Pages deployment failed.
+          # API/download errors fail closed instead of silently replacing history.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.tag_name | startswith("plugin-v")) | .tag_name' > release-tags.txt
+          previous=()
+          if [[ -s release-tags.txt ]]; then
+            latest=$(sort -V release-tags.txt | tail -n 1)
+            gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir previous
+            previous=(--previous previous/manifest.json)
+          fi
+          dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --input plugin/artifacts/build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --repository "$GITHUB_REPOSITORY" --version "$RELEASE_VERSION" "${previous[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-repository
+          path: plugin/artifacts/repository
+          if-no-files-found: error
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-repository
+          path: repository
+      - name: Publish immutable preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.package.outputs.version }}
+        run: gh release create "plugin-v${RELEASE_VERSION}" "repository/Jellyfin.Plugin.MediaHub_${RELEASE_VERSION}.zip" repository/manifest.json repository/SHA256SUMS --target "$GITHUB_SHA" --title "Media Hub plugin preview ${RELEASE_VERSION}" --notes-file plugin/repository/RELEASE_NOTES.md --prerelease --latest=false
+      - name: Download the published ZIP and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.package.outputs.version }}
+        run: gh release download "plugin-v${RELEASE_VERSION}" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --pattern SHA256SUMS --dir published
+      - name: Verify downloaded release bytes before catalog deployment
+        run: sha256sum --check SHA256SUMS
+        working-directory: published
+  repository:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-repository
+          path: repository
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repository
+      - uses: actions/deploy-pages@v4
+        id: deployment

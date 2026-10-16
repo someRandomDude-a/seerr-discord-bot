@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en"><head><title>Media Hub</title></head><body>
+<div id="mediaHubPage" data-role="page" class="page type-interior pluginConfigurationPage"
+     data-require="emby-input,emby-button,emby-checkbox,emby-select">
+  <div data-role="content"><div class="content-primary">
+    <h1 class="sectionTitle">Media Hub</h1>
+    <p class="fieldDescription">Preview · Not feature-complete. Use a test Discord application.</p>
+    <section class="verticalSection" data-tutorial-section hidden aria-label="Setup tutorial">
+      <h2 class="sectionTitle">Set up Media Hub</h2>
+      <p>New installation? The tutorial opens automatically for the Jellyfin administrator. You can pause, resume or restart it here at any time without resetting saved settings.</p>
+      <button is="emby-button" class="raised emby-button" type="button" data-tutorial-start>Start setup tutorial</button>
+      <button is="emby-button" class="raised emby-button" type="button" data-tutorial-restart>Restart tutorial</button>
+      <p data-tutorial-result role="status" aria-live="polite"></p>
+      <div data-onboarding hidden>
+        <p data-tutorial-progress role="status" aria-live="polite"></p>
+        <p>No bot experience needed. Follow one step at a time, using the real settings forms inside the relevant steps. Back/Next never save or enable an integration: only the labelled Save buttons do that.</p>
+        <p><strong>Test preview only:</strong> use a new test Discord application/server and leave automatic deletion off. Live provider/Activity acceptance is incomplete. Ordinary users link their own accounts from the main Media Hub page; the administrator completes this server-setup tutorial.</p>
+        <p>A Discord <strong>application</strong> holds your bot and optional <strong>Activity</strong> (the web interface inside Discord). A Discord <strong>server</strong> is also called a guild. A <strong>slash command</strong> starts by typing / in a server's message box. An <strong>intent</strong> selects events sent to the bot; it is not a server-role permission.</p>
+        <article data-setup-step="page" hidden>
+          <h3 tabindex="-1">Welcome · your plugin setup</h3>
+          <ol>
+            <li>Sign into Jellyfin Web as its administrator. Open Dashboard → Plugins → installed/My Plugins → Media Hub (Preview) → settings. An installed plugin ZIP and host restart are needed; source files alone do not install it.</li>
+            <li>This tutorial will guide you through creating a Discord application, permissions, server IDs, connection settings, optional messaging/Activity and your first account link. Your preferences remains personal; this tutorial configures the plugin's server integration.</li>
+            <li>The real configuration forms appear as you reach their steps. <strong>Save plugin settings</strong> saves the connection form; <strong>Save integrations</strong> saves optional integrations. A saved notice does not prove that an external service works.</li>
+            <li>Ordinary users need compatible Jellyfin-12 Plugin Pages and File Transformation for the user-facing page/login resume. Open Jellyfin's main menu (usually three lines at top left) → Media Hub. If missing, ask the owner to install compatible companions; do not make a viewer an administrator to let them link.</li>
+          </ol>
+          <p><strong>Check:</strong> you are signed in as the Jellyfin administrator. The plugin runs inside Jellyfin and uses its existing authenticated settings page and listener; no extra admin port or runtime is needed. Tutorial progress stays in this browser for this user/server; credentials never go into tutorial storage.</p>
+        </article>
+        <article data-setup-step="application" hidden>
+          <h3 tabindex="-1">Create the Discord app and keep its secrets private</h3>
+          <ol>
+            <li>Open <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal</a>, sign in, click New Application, enter a test name such as Media Hub Test, and click Create.</li>
+            <li>In its left sidebar, General Information → copy Application ID. Then Bot → use the existing bot user, or Add Bot if offered → Token → Reset Token if needed. Complete Discord's security prompt and store the token in a password manager. Resetting it invalidates the old token.</li>
+            <li>Leave Requires OAuth2 Code Grant and all privileged intents off for now. Leave Interactions Endpoint URL blank: this plugin connects outward to Discord's Gateway, not an incoming interaction webhook.</li>
+          </ol>
+          <dl>
+            <dt>Bot token — secret</dt><dd>Bot → Token. Goes only in Discord bot token below. Not an Application ID or OAuth client secret.</dd>
+            <dt>Application ID / Client ID — not a password</dt><dd>General Information / OAuth2. Identifies this app; used for optional OAuth and Activity.</dd>
+            <dt>OAuth client secret — a different secret</dt><dd>OAuth2 → Client Secret. Used in the Activity step, not in the bot-token field.</dd>
+            <dt>Server ID / user ID / channel ID — different numbers</dt><dd>Copied from the Discord client in step 4. A name, invite link or Application ID is not your Server ID.</dd>
+          </dl>
+          <p><strong>Check:</strong> you know which app the token belongs to. Never put secrets in chat, screenshots, support issues, URLs, Activity mappings or frontend files. If leaked, rotate the affected provider secret and update its native password field; do not delete plugin state.</p>
+        </article>
+        <article data-setup-step="permissions" hidden>
+          <h3 tabindex="-1">Invite the bot and set limited permissions</h3>
+          <ol>
+            <li>Developer Portal → your app → Installation → enable <strong>Guild Install</strong>. Choose Discord Provided Link and, under Guild Install defaults, select scopes <code>bot</code> and <code>applications.commands</code>. A user-only installation is not sufficient.</li>
+            <li>For the bot, allow <strong>View Channels, Send Messages, Embed Links, Read Message History</strong>. Add <strong>Attach Files</strong> only for attachments and <strong>Send Messages in Threads</strong> only for threads. Start in a normal text channel.</li>
+            <li>Save, copy Install Link, open it, choose Add to Server → your test server → Continue → Authorize. The installing person needs Manage Server; the bot does not. If your Portal uses OAuth2 → URL Generator, select the same scopes/permissions there instead.</li>
+            <li>In Discord create #media-hub-test. Right-click it → Edit Channel → Permissions; check the bot's role and inherited category overrides allow the chosen permissions. Also let human testers view/send and Use Application Commands. Server Settings → Integrations → your app can restrict commands further.</li>
+          </ol>
+          <p><strong>Do not grant Administrator</strong>, Manage Server/Roles/Channels/Messages/Webhooks, mass mentions, or voice Connect/Speak to the bot. It is not a voice-streaming bot. Human Activity users later need Use Activities (Use Embedded Activities), plus normal voice-channel access if testing in voice.</p>
+          <p><strong>Check:</strong> the bot appears in your test server; offline is normal until step 5. Do not fix a denied channel by granting Administrator or moving the role above everyone.</p>
+        </article>
+        <article data-setup-step="ids" hidden>
+          <h3 tabindex="-1">Copy the correct Discord IDs</h3>
+          <ol>
+            <li>In the Discord client click the gear beside your username → User Settings → Advanced → Developer Mode → on. Close Settings.</li>
+            <li>Right-click the test server's icon in the leftmost column → Copy Server ID. This goes in Allowed Discord server IDs below.</li>
+            <li>Right-click your own avatar/user → Copy User ID. Use it for your account link and, only if wanted, Operator Discord IDs. Right-click the test channel → Copy Channel ID for optional inbox retention.</li>
+          </ol>
+          <p><strong>Check:</strong> label each number. Never substitute the application's ID, a server name or an invite link for a Server ID. A blank server allowlist does not mean allow everyone.</p>
+        </article>
+        <article data-setup-step="configure" hidden>
+          <h3 tabindex="-1">Save the connection settings, then connect the bot</h3>
+          <ol>
+            <li>In Plugin settings below, leave automatic deletion off and keep the default 14-day activity window / 2-day deletion delay. Leave Discord integration off for the first save.</li>
+            <li>Public Jellyfin URL is your existing user-facing HTTPS base, for example <code>https://media.example/jellyfin</code>. Replace the example. Include your host's real base path, not <code>/web</code>, a login page, query or token. The plugin does not create HTTPS hosting; ask the hosting administrator if it is missing. No VPN/DNS/network reassignment is needed.</li>
+            <li>Paste the explicit test Server ID and the bot token. For movie/TV discovery/requests enter Seerr's reachable base URL (no <code>/api/v1</code>) and its administrator API key, normally Seerr → Settings → General. Jellyfin's process/container must reach it; localhost inside a container means that container.</li>
+            <li>In Seerr, use its supported user-import/account workflow so each viewer maps to exactly their Jellyfin user. Manage request permissions/quotas in Seerr; a similar name does not prove identity. Existing Seerr requests and service routing stay in place.</li>
+            <li>Use the form in this step and click Save plugin settings. Blank password fields after saving intentionally keep the saved secrets. Once ready, ensure this application token is used by only this plugin instance, tick Enable Discord integration, and Save plugin settings again.</li>
+            <li>In #media-hub-test type <code>/</code>, choose your test app, then <code>/hub-link</code>. The plugin registers server commands on connection; you do not run a registration script.</li>
+          </ol>
+          <p><strong>Check:</strong> /hub-link replies privately with your Discord ID and a short-lived fallback code. That proves the command path, not Seerr access. Do not send requests, broadcasts or deletions to test basic connectivity.</p>
+          <div data-tutorial-slot="config"></div>
+        </article>
+        <article data-setup-step="link" hidden>
+          <h3 tabindex="-1">Link your own account and try a safe read</h3>
+          <ol>
+            <li>Request your own /hub-link or /link in the allowed server. In your own browser sign into your own Jellyfin account, open Media Hub, and paste the private fallback code and displayed Discord ID into Link Discord below. Click Link account. Codes expire after five minutes.</li>
+            <li>If Link in Jellyfin is offered after OAuth setup, open it, choose Verify Discord in this browser, check both identities on return, then explicitly Confirm these accounts. Opening a link or its callback alone does not approve it. Never ask an administrator to approve your code while signed into their account.</li>
+            <li>Try /dashboard and /library in Discord. Use Discover or Your requests to test the viewer's Seerr mapping. An empty test library is allowed. Prepare request is only a preview; Confirm request actually sends it, so skip confirmation for a read-only test.</li>
+            <li>Your preferences controls personal notifications; Discord DMs need opt-in and Mute wins. Save preferences does not configure integrations. Opening media Details is an explicit interaction that may update last-played time, not completion/progress/favorites.</li>
+          </ol>
+          <p><strong>Check:</strong> a linked ordinary user sees only permitted media and cannot configure the server. Only approve codes/links you requested yourself. Watch-party invitations remain blocked without exact creator-player proof; do not bypass that safety gate. Activity is not the native player.</p>
+          <div data-tutorial-slot="link"></div>
+        </article>
+        <article data-setup-step="intents" hidden>
+          <h3 tabindex="-1">Optional operator inbox, intents and announcements</h3>
+          <p>Slash commands/buttons and Activity sign-in do not require privileged intents. Leave them off unless you choose the matching messaging feature.</p>
+          <ul>
+            <li><strong>Full non-mention server-message content:</strong> Developer Portal → Bot → Privileged Gateway Intents → Message Content Intent on, and Media Hub → Message Content Intent on.</li>
+            <li><strong>All-member announcement DMs:</strong> Portal → Server Members Intent on, and Media Hub → Members Intent on. Keep the announcement's all-member option off for your first test. Presence Intent stays off.</li>
+            <li>Both sides must match; larger/verified apps may require Discord approval. Channel permissions still apply. The inbox retains eligible incoming events, not a complete channel history.</li>
+            <li>Operator Discord IDs should start empty, or contain only your own user ID for a test. Operators can read the bot's shared private DM inbox. A Jellyfin admin/Discord moderator role alone does not grant this access; a live linked identity is still required. Leave Also allow verified Seerr administrators off unless intentionally wanted.</li>
+            <li>Choose retained channel IDs, explain retention to members, and start with a small recipient limit. Click Save integrations. Test just one intended channel/recipient; announcements require a preview and confirmation. A blocked DM can be the recipient's privacy choice.</li>
+          </ul>
+          <p><strong>Check:</strong> an unassigned ordinary user cannot open Operator messenger. Never grant Administrator to repair message-content or file-permission problems. An uncertain delivery/request may already have happened: check its receipt/upstream state, do not automatically resend.</p>
+          <div data-tutorial-slot="messaging"></div>
+        </article>
+        <article data-setup-step="activity" hidden>
+          <h3 tabindex="-1">Optional web Activity · OAuth, mapping and first launch</h3>
+          <p>You can leave Activity off and use native pages/slash commands. Activity uses the bundled frontend/API on Jellyfin's existing listener; no separate backend or new port. The existing HTTPS hostname must be reachable by Discord's proxy with a trusted certificate and correct base-path routing. Do not expose Seerr/Arr, disable authentication/certificate/frame checks, or change working networks to make it load; ask the hosting administrator.</p>
+          <ol>
+            <li>In the <strong>same</strong> Developer Portal application → OAuth2, get Client ID/Application ID and Client Secret. Under Redirects add your exact linking callback: for base <code>https://media.example/jellyfin</code> use <code>https://media.example/jellyfin/MediaHub/Link/OAuth/Callback</code>. Replace the hostname/path; no extra trailing slash.</li>
+            <li>Also add <code>https://127.0.0.1</code>, Discord Embedded App SDK's documented placeholder redirect, and save. Keep the real linking callback too. The placeholder is not your hosting address and needs no exposed loopback service.</li>
+            <li>Activities → Settings → Enable Activities; enable the supported web/desktop platform you are testing. Activities → URL Mappings → prefix <code>/</code> → target <code>media.example/jellyfin/MediaHub/Activity/</code> → save. With no Jellyfin base path use <code>jellyfin.example/MediaHub/Activity/</code>. <strong>No https:// in Target; map the directory, not /App, an HTML file, /web or a media service.</strong></li>
+            <li>In Music, books and messaging below, enter the matching application ID and OAuth client secret together, leave OAuth PKCE checked, tick Enable optional Discord Activity, and Save integrations. A missing bundle requires a corrected plugin ZIP from the maintainer, not a new frontend server.</li>
+            <li>In Discord as the app owner/trusted team tester, enable Developer Mode, open the allowed test server, use its App Launcher (or Activities/rocket in voice), find the app by name and choose <strong>Launch</strong>. Enabling Activities normally creates Discord's managed Launch Entry Point; keep that behavior. <strong>The native plugin does not register /activity.</strong></li>
+            <li>Approve <code>identify</code> and <code>guilds</code> to verify your Discord identity/server membership. If shown Link Jellyfin, open it and finish the native same-browser verification and explicit account confirmation. Return to Activity and choose Check link. Then browse permitted media.</li>
+          </ol>
+          <p>Human launchers need Use Activities / Use Application Commands. Unpublished Activity testing may be owner/developer-team only; bot installation does not publish it. Do not add ordinary viewers to the developer team to bypass distribution restrictions. DMs/group DMs are not supported Activity contexts here.</p>
+          <p><strong>Check:</strong> launch and authenticate inside Discord through the real mapping. Opening /Activity/App in a normal browser only shows an SDK-dependent app, not proof of working sign-in. Reopen when verification expires. Activity cannot configure the server or impersonate a player; Open in Jellyfin uses the native client. Use this host's colors in Activity in personal preferences copies only four validated colors, not arbitrary CSS or the full theme.</p>
+          <div data-tutorial-slot="activity"></div>
+        </article>
+        <article data-setup-step="optional-services" hidden>
+          <h3 tabindex="-1">Optional media services · leave deletion off</h3>
+          <p>Movie/TV requests retain Seerr's permissions, quotas and routing. For storage inspection or eventual deletion, Approved Arr destinations needs independent approval of each service, <strong>Seerr's instance ID</strong> and exact URL. Instance is not the port, profile or list position. Leave <code>[]</code> until the administrator has verified those values; do not guess or share settings responses containing keys. The form currently has no instance-discovery picker.</p>
+          <p>Optional Lidarr/Readarr need their own URL/key pair and existing root-folder, quality-profile ID and metadata-profile ID. Leave both URL/key blank and requests off if unused. These values come from that service, not your Jellyfin media path. Do not create/delete host folders as setup.</p>
+          <p><strong>Keep automatic deletion off in this preview.</strong> Original-requester ownership, current recent-viewer consent and a full delay are mandatory; administrators cannot bypass ownership. Arr performs file removal, not this plugin's filesystem. No setup step needs to delete media.</p>
+          <div data-tutorial-slot="services"></div>
+        </article>
+        <article data-setup-step="troubleshooting" hidden>
+          <h3 tabindex="-1">Review your setup and finish the tutorial</h3>
+          <ul>
+            <li><strong>Offline or no commands:</strong> correct bot token, saved enable switch, Guild Install + bot + applications.commands, explicit Server ID, actual channel/Integrations command permissions, existing outbound connectivity. No incoming Interactions Endpoint or registration script is needed.</li>
+            <li><strong>Seerr mapping/permission error:</strong> reachable base URL/key, exactly one imported native user, current Seerr permissions/quotas. Do not substitute an administrator identity.</li>
+            <li><strong>Saved password field is empty:</strong> expected; blank keeps it. <strong>Settings changed:</strong> reload and review before resaving. <strong>Unsigned old settings:</strong> explicitly review/save elevated settings and reopen; never edit the key/signature.</li>
+            <li><strong>OAuth mismatch:</strong> same app ID/secret, exact HTTPS callback/base path, same browser/device/cookie and correct trusted-proxy scheme. Request a fresh own link; never disable state/cookie checks.</li>
+            <li><strong>Activity missing:</strong> owner/team test access, platform enabled, installed in the allowed server, human Use Activities permission. <strong>Blank/verifying:</strong> correct directory mapping, built bundle, enabled/saved in both places, trusted HTTPS/proxy reachability; test inside Discord.</li>
+            <li><strong>DM/file denied:</strong> actual operator and bot channel permissions, Attach Files, allowed-server membership, recipient privacy; no Administrator workaround. <strong>Uncertain send:</strong> check its receipt, do not blindly retry.</li>
+          </ul>
+          <p><strong>Finish:</strong> own link works, an ordinary viewer sees only allowed media and no integration/unassigned messenger access, one safe read succeeds, and automatic deletion is still off. For Activity also verify real launch/OAuth/link/browse. Back up plugin state and its matching key consistently. Setup success does not mean production readiness.</p>
+          <p data-tutorial-review></p>
+          <p>Finish tutorial remembers only your walkthrough progress in this browser. It does not verify a connection, save settings or enable a feature. Pause/resume/restart remains available here whenever you need it.</p>
+          <p>Portal labels can change. Official references: <a href="https://docs.discord.com/developers/quick-start/getting-started" target="_blank" rel="noopener noreferrer">app installation</a> and <a href="https://docs.discord.com/developers/activities/building-an-activity" target="_blank" rel="noopener noreferrer">Activity setup</a>. The repository's plugin/ONBOARDING.md is a supplementary reference; you do not need to leave setup to follow this tutorial.</p>
+        </article>
+        <p data-tutorial-notice role="status" aria-live="polite"></p>
+        <button is="emby-button" class="raised emby-button" type="button" data-tutorial-back>Back</button>
+        <button is="emby-button" class="raised button-submit emby-button" type="button" data-tutorial-next>Next</button>
+        <button is="emby-button" class="raised emby-button" type="button" data-tutorial-pause>Pause tutorial</button>
+      </div>
+    </section>
+    <div data-hub-workspace>
+    <p data-notice role="status" aria-live="polite"></p>
+    <div data-tutorial-home="link"><section class="verticalSection" data-link-section>
+      <h2 class="sectionTitle">Link Discord</h2>
+      <p data-handoff-notice role="status"></p><div data-handoff-controls></div>
+      <p>Run /hub-link in Discord. Check your Discord ID and approve only codes you requested.</p>
+      <form data-link>
+        <div class="inputContainer"><label class="inputLabel" for="hubCode">Approval code</label><input is="emby-input" id="hubCode" name="code" autocomplete="off" required /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubDiscord">Your Discord user ID</label><input is="emby-input" id="hubDiscord" name="discord" inputmode="numeric" required /></div>
+        <button is="emby-button" class="raised button-submit emby-button" type="submit">Link account</button>
+      </form>
+    </section></div>
+    <section class="verticalSection" data-catalog>
+      <h2 class="sectionTitle">Media</h2>
+      <form data-catalog-query>
+        <div class="selectContainer"><label for="hubCatalogSource">Browse</label><select is="emby-select" id="hubCatalogSource" name="source"><option value="library">Your library</option><option value="browse">Discover</option><option value="requests">Your requests</option><option value="allRequests">All requests · permission required</option></select></div>
+        <div class="selectContainer"><label for="hubCatalogKind">Media type</label><select is="emby-select" id="hubCatalogKind" name="kind"><option value="movie">Movies</option><option value="tv">Series</option><option value="music">Music · library</option><option value="book">Books · library</option><option value="all">Everything · library</option></select></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubCatalogQuery">Search</label><input is="emby-input" id="hubCatalogQuery" name="query" maxlength="100" /></div>
+        <button is="emby-button" class="raised emby-button" type="submit">Browse</button>
+      </form>
+      <button is="emby-button" class="raised emby-button" type="button" data-storage>Storage</button><div data-storage-results></div>
+      <p data-catalog-notice role="status" aria-live="polite"></p>
+      <ul data-catalog-list></ul><div data-catalog-paging></div><div data-media-details></div>
+    </section>
+    <section class="verticalSection" data-personal hidden>
+      <h2 class="sectionTitle">Your preferences</h2>
+      <p>Saved for your account. Discord DMs require your opt-in.</p>
+      <form data-preferences>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="jellyfin" /><span>Jellyfin notifications</span></label></div>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="discord" /><span>Allow Discord direct messages</span></label></div>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="muted" /><span>Mute notifications</span></label></div>
+        <p data-personal-notice role="status" aria-live="polite"></p>
+        <div class="inputContainer"><label class="inputLabel" for="hubPersonalDelay">Deletion delay (days)</label><input is="emby-input" id="hubPersonalDelay" name="deletionDelay" type="number" min="2" max="14" step="1" required /></div>
+        <p>Longer delays extend pending queues. Existing deadlines are never shortened.</p>
+        <button is="emby-button" class="raised button-submit emby-button" type="submit">Save preferences</button>
+        <button is="emby-button" class="raised emby-button" type="button" data-reload-preferences>Reload saved preferences</button>
+        <button is="emby-button" class="raised emby-button" type="button" data-sync-activity-theme>Use this host's colors in Activity</button>
+      </form>
+      <h2 class="sectionTitle">Your watchlist and subscriptions</h2>
+      <p>Separate from Jellyfin favorites. Turning notifications off keeps the title saved; Remove takes it off your watchlist.</p>
+      <form data-follow>
+        <div class="inputContainer"><label class="inputLabel" for="hubItem">Jellyfin item ID (from the item's details URL)</label><input is="emby-input" id="hubItem" name="item" autocomplete="off" required /></div>
+        <button is="emby-button" class="raised button-submit emby-button" type="submit">Save and subscribe</button>
+      </form>
+      <p data-watchlist-empty>No accessible saved titles.</p>
+      <ul data-watchlist></ul>
+      <button is="emby-button" class="raised emby-button" type="button" data-watch-sync>Sync movie/series watchlist with Seerr</button>
+      <p data-sync-status role="status" aria-live="polite"></p>
+      <h3>Your updates</h3><ul data-notification-feed></ul>
+    </section>
+    <section class="verticalSection">
+      <h2 class="sectionTitle">Watch together</h2>
+      <p>Use Jellyfin's player for synchronized playback.</p>
+      <form data-create><div class="inputContainer"><label class="inputLabel" for="hubPartyName">Private party name</label><input is="emby-input" id="hubPartyName" name="name" maxlength="80" value="Watch party" required /></div>
+        <button is="emby-button" class="raised button-submit emby-button" type="submit">Create in this player</button></form>
+      <p>Create a party and start playback. Invite with /watchparty, or /watchparty recipient:USER for a DM.</p>
+      <p data-party aria-live="polite"></p>
+      <button is="emby-button" class="raised emby-button" type="button" data-close hidden>Close party invitations</button>
+    </section>
+    <section class="verticalSection" data-deletions hidden>
+      <h2 class="sectionTitle">Deletion queue</h2>
+      <p>Only propose your own requests. Recent viewers must agree or age out. Radarr/Sonarr handles file removal.</p>
+      <form data-propose>
+        <div class="inputContainer"><label class="inputLabel" for="hubDeleteRequest">Seerr request ID</label><input is="emby-input" id="hubDeleteRequest" name="requestId" type="number" min="1" step="1" required /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubDeleteItem">Jellyfin movie or show ID</label><input is="emby-input" id="hubDeleteItem" name="mediaId" required /></div>
+        <button is="emby-button" class="raised emby-button" type="submit">Propose deletion</button>
+      </form>
+      <button is="emby-button" class="raised emby-button" type="button" data-review-deletions>Refresh queue</button>
+      <ul data-deletion-list></ul>
+      <h3>Deletion notifications</h3>
+      <ul data-consent-list></ul>
+    </section>
+    <section class="verticalSection" data-messenger hidden>
+      <h2 class="sectionTitle">Operator messenger</h2>
+      <p data-message-status role="status" aria-live="polite"></p>
+      <form data-message-filters>
+        <label for="hubInboxKind">Inbox</label><select is="emby-select" id="hubInboxKind" name="kind"><option value="all">All</option><option value="dm">DMs</option><option value="guild">Servers</option></select>
+        <label for="hubInboxQuery">Search</label><input is="emby-input" id="hubInboxQuery" name="query" maxlength="100" />
+        <button is="emby-button" class="raised emby-button" type="submit">Refresh inbox</button>
+      </form>
+      <div data-message-inbox></div><div data-message-paging></div>
+      <form data-message-compose>
+        <div class="selectContainer"><label for="hubMessageMode">Send as</label><select is="emby-select" id="hubMessageMode" name="mode"><option value="normal">Normal message · one destination</option><option value="announcement">Announcement · preview required</option></select></div>
+        <div class="selectContainer"><label for="hubMessageChannels">Server channels (multiple only for announcements)</label><select is="emby-select" id="hubMessageChannels" name="channels" multiple></select></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubMessageUser">Or one Discord user ID</label><input is="emby-input" id="hubMessageUser" name="recipient" inputmode="numeric" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubMessageGuild">DM recipient's allowed server ID</label><input is="emby-input" id="hubMessageGuild" name="guild" inputmode="numeric" /></div>
+        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" name="members" /> Also DM all human members of the selected servers · announcements only</label></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubMessageText">Message</label><textarea is="emby-textarea" id="hubMessageText" name="content" maxlength="2000" rows="4"></textarea></div>
+        <div class="inputContainer"><label for="hubMessageFiles">Attachments · up to four, 8 MiB each / 16 MiB total</label><input id="hubMessageFiles" type="file" name="files" multiple /></div>
+        <button is="emby-button" class="raised emby-button" type="submit">Send / preview announcement</button>
+      </form>
+      <div data-message-preview></div><h3>Deliveries</h3><div data-message-deliveries></div>
+    </section>
+    <section class="verticalSection" data-settings hidden>
+      <h2 class="sectionTitle">Plugin settings · Jellyfin administrators only</h2>
+      <p>Changes restart the Discord connection, not Jellyfin.</p>
+      <div data-tutorial-home="config"><form data-config>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="automaticDeletion" /><span>Enable automatic deletion through Radarr/Sonarr</span></label></div>
+        <p>When enabled, due approved proposals with verified Arr targets are removed automatically.</p>
+        <div class="inputContainer"><label class="inputLabel" for="hubRecentDays">Recent activity window (days)</label><input is="emby-input" id="hubRecentDays" name="recentDays" type="number" min="1" max="3650" step="1" required /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubDeletionDays">Default deletion delay (days)</label><input is="emby-input" id="hubDeletionDays" name="deletionDays" type="number" min="1" max="3650" step="1" required /></div>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="enabled" /><span>Enable Discord integration</span></label></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubPublic">Public Jellyfin URL (HTTPS, including any base path)</label><input is="emby-input" id="hubPublic" name="public" type="url" aria-describedby="hubPublicHelp" /><p class="fieldDescription" id="hubPublicHelp">Your existing user-facing base, for example https://media.example/jellyfin. No /web, login page, query or token. The tutorial's connection step explains this field.</p></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubGuilds">Allowed Discord server IDs, comma separated</label><input is="emby-input" id="hubGuilds" name="guilds" aria-describedby="hubGuildsHelp" /><p class="fieldDescription" id="hubGuildsHelp">Discord → User Settings → Advanced → Developer Mode, then right-click the server icon → Copy Server ID. Blank is not allow-all; enabling Discord needs an explicit list.</p></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubToken">Discord bot token · blank keeps saved token</label><input is="emby-input" id="hubToken" name="token" type="password" autocomplete="new-password" aria-describedby="hubTokenHelp" /><p class="fieldDescription" id="hubTokenHelp">Developer Portal → your app → Bot → Token. Secret: not the Application ID or OAuth client secret. The saved token is never shown back.</p></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubSeerr">Seerr URL</label><input is="emby-input" id="hubSeerr" name="seerr" type="url" aria-describedby="hubSeerrHelp" /><p class="fieldDescription" id="hubSeerrHelp">Base address reachable from Jellyfin's process/container; no /api/v1. The matching Seerr key comes from its administrator settings. Each viewer needs a unique imported Jellyfin mapping.</p></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubSeerrKey">Seerr key · blank keeps saved key</label><input is="emby-input" id="hubSeerrKey" name="key" type="password" autocomplete="new-password" /></div>
+        <button is="emby-button" class="raised button-submit emby-button" type="submit">Save plugin settings</button>
+      </form></div>
+        <h3>Music, books and messaging</h3>
+        <p>Optional settings. Save the first form before editing this one; Save integrations does not apply unsaved edits above. Leave unused services and privileged intents off.</p>
+      <div data-tutorial-home="features"><form data-features>
+        <p>Save integrations saves this whole integrations form, including any drafts from another tutorial step. Use Back to review those drafts first. Tutorial navigation never saves them automatically.</p>
+        <fieldset data-feature-group="services"><legend>Music and books</legend>
+        <div class="inputContainer"><label class="inputLabel" for="hubLidarrUrl">Lidarr URL</label><input is="emby-input" id="hubLidarrUrl" name="lidarrUrl" type="url" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubLidarrKey">Lidarr key · blank keeps saved key</label><input is="emby-input" id="hubLidarrKey" name="lidarrKey" type="password" autocomplete="new-password" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubLidarrRoot">Lidarr root folder</label><input is="emby-input" id="hubLidarrRoot" name="lidarrRoot" /></div>
+        <label for="hubLidarrQuality">Quality profile ID</label><input is="emby-input" id="hubLidarrQuality" name="lidarrQuality" type="number" min="0" value="0" />
+        <label for="hubLidarrMetadata">Metadata profile ID</label><input is="emby-input" id="hubLidarrMetadata" name="lidarrMetadata" type="number" min="0" value="0" />
+        <label for="hubLidarrLimit">Daily requests per user</label><input is="emby-input" id="hubLidarrLimit" name="lidarrLimit" type="number" min="1" max="100" value="10" />
+        <label><input is="emby-checkbox" name="lidarrRequests" type="checkbox" /> Allow selected-album requests</label>
+        <div class="inputContainer"><label class="inputLabel" for="hubReadarrUrl">Readarr URL</label><input is="emby-input" id="hubReadarrUrl" name="readarrUrl" type="url" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubReadarrKey">Readarr key · blank keeps saved key</label><input is="emby-input" id="hubReadarrKey" name="readarrKey" type="password" autocomplete="new-password" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubReadarrRoot">Readarr root folder</label><input is="emby-input" id="hubReadarrRoot" name="readarrRoot" /></div>
+        <label for="hubReadarrQuality">Quality profile ID</label><input is="emby-input" id="hubReadarrQuality" name="readarrQuality" type="number" min="0" value="0" />
+        <label for="hubReadarrMetadata">Metadata profile ID</label><input is="emby-input" id="hubReadarrMetadata" name="readarrMetadata" type="number" min="0" value="0" />
+        <label for="hubReadarrLimit">Daily requests per user</label><input is="emby-input" id="hubReadarrLimit" name="readarrLimit" type="number" min="1" max="100" value="10" />
+        <label><input is="emby-checkbox" name="readarrRequests" type="checkbox" /> Allow selected-book requests</label>
+        </fieldset>
+        <fieldset data-feature-group="messaging"><legend>Operator messaging</legend>
+        <div class="inputContainer"><label class="inputLabel" for="hubOperators">Operator Discord IDs, comma separated · can read the bot's private inbox</label><input is="emby-input" id="hubOperators" name="operators" aria-describedby="hubOperatorsHelp" /><p class="fieldDescription" id="hubOperatorsHelp">Use trusted people's user IDs, not role/server/app IDs. Operators can read the shared bot DM inbox and still need verified links. Jellyfin administration alone does not grant this access.</p></div>
+        <label><input is="emby-checkbox" name="seerrOperators" type="checkbox" /> Also allow verified Seerr administrators to operate messaging</label>
+        <label><input is="emby-checkbox" name="messageContent" type="checkbox" aria-describedby="hubIntentsHelp" /> Message Content Intent · enable in Discord's Developer Portal too</label>
+        <label><input is="emby-checkbox" name="membersIntent" type="checkbox" aria-describedby="hubIntentsHelp" /> Members Intent · required for all-member announcements</label>
+        <p class="fieldDescription" id="hubIntentsHelp">Match Bot → Privileged Gateway Intents in Developer Portal: Message Content for ordinary server-message content; Server Members for all-member DMs. Neither is required for slash commands or Activity login. Keep Presence off. See the tutorial's messaging step.</p>
+        <div class="inputContainer"><label class="inputLabel" for="hubInboxChannels">Retained inbox channel IDs, comma separated</label><input is="emby-input" id="hubInboxChannels" name="inboxChannels" /></div>
+        <label for="hubMessageRetention">Message retention (days)</label><input is="emby-input" id="hubMessageRetention" name="retention" type="number" min="1" max="365" value="7" />
+        <label for="hubMessageRecipients">Maximum announcement recipients</label><input is="emby-input" id="hubMessageRecipients" name="maxRecipients" type="number" min="1" max="1000" value="100" />
+        </fieldset>
+        <fieldset data-feature-group="activity"><legend>Discord OAuth and Activity</legend>
+        <div class="inputContainer"><label class="inputLabel" for="hubDiscordApplication">Discord application ID · linking and Activity</label><input is="emby-input" id="hubDiscordApplication" name="applicationId" inputmode="numeric" aria-describedby="hubOAuthHelp" /></div>
+        <div class="inputContainer"><label class="inputLabel" for="hubDiscordSecret">OAuth client secret · blank keeps saved secret</label><input is="emby-input" id="hubDiscordSecret" name="clientSecret" type="password" autocomplete="new-password" aria-describedby="hubOAuthHelp" /><p class="fieldDescription" id="hubOAuthHelp">OAuth2 → Client ID and Client Secret from the same test app as the bot. Configure both together. Secret is not the bot token. The tutorial's Activity step explains the callback, SDK placeholder and directory mapping.</p></div>
+        <label><input is="emby-checkbox" name="oauthPkce" type="checkbox" checked /> Use OAuth PKCE when supported</label>
+        <label><input is="emby-checkbox" name="activityEnabled" type="checkbox" /> Enable optional Discord Activity</label>
+        </fieldset>
+        <fieldset data-feature-group="services"><legend>Approved Arr destinations</legend>
+        <label class="inputLabel" for="hubArrDestinations">Approved Arr destinations · JSON array of Service (radarr/sonarr), Instance (Seerr ID), Url (exact HTTP(S) base address)</label>
+        <textarea id="hubArrDestinations" name="arrDestinations" rows="5" maxlength="32000" spellcheck="false">[]</textarea>
+        <p>Seerr discovery cannot approve new addresses. Unapproved destinations are never contacted. Review addresses independently before saving.</p>
+        </fieldset>
+        <button is="emby-button" class="raised emby-button" type="submit">Save integrations</button>
+      </form></div>
+    </section>
+    </div>
+  </div></div>
+  <script>
+  (function () {
+      const page = document.querySelector('#mediaHubPage');
+      if (!page || page.dataset.hubMounted) return;
+      page.dataset.hubMounted = 'true';
+      const hash = new URLSearchParams(window.location.hash.split('?')[1] || '');
+      const params = { hubTicket: hash.get('hubTicket'), hubLink: hash.get('hubLink') };
+      const mount = function () {
+          if (!page.isConnected) return;
+          window.JellyfinMediaHub(page, params);
+          // Plugin Pages inserts a fragment into its own user-facing page;
+          // it does not instantiate configuration-page controllers for it.
+          const parent = page.parentElement.closest('[data-role="page"]');
+          if (parent) {
+              parent.addEventListener('viewshow', () => page.dispatchEvent(new Event('viewshow')));
+              parent.addEventListener('viewhide', () => page.dispatchEvent(new Event('viewhide')));
+          }
+          page.dispatchEvent(new Event('viewshow'));
+      };
+      const load = function (name, ready) { return ready ? Promise.resolve() : new Promise((resolve, reject) => { const script = document.createElement('script'); script.src = ApiClient.getUrl('web/ConfigurationPage', { name: name }); script.onload = resolve; script.onerror = reject; document.head.append(script); }); };
+      Promise.all([load('mediahub.js', window.JellyfinMediaHub), load('mediahub.messenger.js', window.JellyfinMediaMessenger)]).then(mount).catch(() => { page.querySelector('[data-notice]').textContent = 'Unable to load Media Hub. Refresh the page.'; });
+  })();
+  </script>
+</div></body></html>

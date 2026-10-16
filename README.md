@@ -1,247 +1,94 @@
-# Media · Discord Activity & Bot
+# Media Hub for Jellyfin 12
 
-Browse media, requests, storage and watchlists inside Discord. A cinematic **liquid-glass Activity** is available through `/activity`; private slash commands work independently of Activity hosting.
+Media Hub is an **in-process .NET 10 plugin** for Jellyfin 12. Discord commands, media services,
+background work, configuration and the optional Discord web Activity run through Jellyfin.
+No separate application server, admin listener or runtime service is installed.
 
-**New installation:** use the [integrated onboarding/admin panel](docs/onboarding.md). It runs on a separate private HTTP port, verifies connections, and saves configuration. The [detailed setup guide](docs/setup.md) covers Discord permissions and first-run checks. Activity hosting is optional.
+> **Preview, not production-ready.** Use a test Jellyfin and test Discord application.
+> Automatic deletion defaults off. SyncPlay invitations remain blocked without exact
+> creator-session proof. Provider/client acceptance and several features are still incomplete.
+> See the [feature checklist](plugin/FEATURES.md) and [security review](plugin/SECURITY_REVIEW.md).
+
+## Install and set up
+
+1. Use an installable, version-matched plugin ZIP on Jellyfin **12.x**. Source files alone do not
+   install a plugin. The package references Jellyfin API **12.0.0** and is also tested against **12.2.0**.
+2. When the catalog has been published, add its HTTPS manifest under
+   **Dashboard → Plugins → Repositories**:
+
+   ```text
+   https://somerandomdude-a.github.io/seerr-discord-bot/manifest.json
+   ```
+
+   **This URL is the publication target, not a claim that the catalog is live.** The owner must
+   run the [release workflow](plugin/README.md#publish-the-repository), then verify the manifest,
+   downloadable ZIP and catalog installation. Do not add the Git clone URL as a repository.
+3. Install **Media Hub (Preview)** and restart Jellyfin. For ordinary-user navigation and login
+   resume, install compatible Jellyfin-12 **Plugin Pages** and **File Transformation** versions.
+4. Sign in as the Jellyfin administrator, open **Dashboard → Plugins → Media Hub → settings**,
+   and follow **Set up Media Hub**. It opens automatically for a new configuration.
+
+The integrated tutorial walks through Discord app creation, least-privilege permissions,
+IDs/secrets, the actual configuration forms, account linking and optional Activity setup.
+Use **Back / Next / Pause / Resume / Restart tutorial** at any time. Restart does not reset
+settings or links. Only explicit Save actions change configuration; tutorial progress stores no
+credentials or drafts. The [onboarding reference](plugin/ONBOARDING.md) is optional extra detail.
 
 ## Features
 
-- Passwordless Jellyfin **Quick Connect**, in Discord or the Activity. Verified Discord IDs are saved in Seerr’s `discordIds`; encrypted Jellyfin user tokens are checked live before private data is shown.
-- Movies/TV through Seerr; albums through Lidarr; books through compatible Readarr v1 installations.
-- Seerr-derived admins after verified linking, optional bot-only exceptions, and automatic import of all Seerr Radarr/Sonarr instances, including 4K.
-- Responsive liquid-glass Activity and private admin panel, dark/light appearances, searchable settings, verified steps and deployment presets.
-- Live dependency checks before upstream reads/actions. Snapshot reads refresh first; discovery/details query Seerr directly without refreshing unrelated services. Failures never fall back to old state.
-- Poster galleries, popular-title discovery, searchable collections, quick details and navigation that preserves your place.
-- **24-hour file deletion delay**, with owner-only Undo. No approval queue, and no Seerr request/media-record deletion.
-- Seerr-discovered Jellyfin browser/item links, optional device destinations, opt-in DMs, automatic two-way movie/series watchlist sync and authenticated service webhooks.
-- Discord OAuth, verified guild membership, ownership checks, rate limits, scoped Seerr permissions and CSRF support. Service API keys stay out of the frontend/SQLite; encrypted Jellyfin user credentials persist in SQLite.
+- Native Jellyfin account/session verification, current library visibility, separate administrator
+  integration settings and personal preferences; no administrator impersonation of viewers.
+- User-scoped Seerr discovery, movie/TV request previews and confirmation, permissions/quotas,
+  request history and two-way watchlist membership. Seerr remains authoritative for those requests.
+- Accessible movie/TV/music/book libraries, selected Lidarr/Readarr requests, service/storage
+  projections, personal subscriptions, status feed and opt-in Discord notifications.
+- Discord media commands and separately authorized operator inbox, messages, attachments and
+  previewed announcements. Ambiguous requests/messages are not automatically resent.
+- Anonymous shared deletion queue, owner-only Undo, current recent-viewer consent and a full
+  delay. Removal is through verified Arr file APIs only; no direct media filesystem deletion.
+- Bundled optional Discord web Activity using the same application services and permission checks.
+  It cannot configure the host or impersonate a native player. Launch it through Discord's App Launcher.
 
-## Start
+This list describes implemented preview functionality, not completed live-provider acceptance.
+See [FEATURES.md](plugin/FEATURES.md) for supported paths and remaining work.
 
-The Docker image uses Python **3.14**, the only supported/tested Python version. CI runs on Linux with Python 3.14; functional/security regression tests are retained. Requires current Seerr supporting Jellyfin Quick Connect and Quick Connect enabled in Jellyfin. Older Jellyseerr versions without these auth endpoints must be upgraded. Basic operation needs neither Message Content intent nor Administrator permission; optional admin features may require privileged intents below.
+## Safety and state
 
-```sh
-python -m pip install -r requirements.txt
-python bot.py
-```
+The plugin owns only **`<Jellyfin data>/media-hub/`**. It does not directly open/migrate Jellyfin's
+databases, persist web-file edits or change host/network settings. Uninstall retains plugin
+state. Corrupt, foreign, incompatible or unverifiable state is not silently reset or approved.
+Back up the full plugin directory consistently with its matching encryption key.
 
-Open the private panel URL printed at startup and enter its one-time console code. Choose a preset, verify Discord/Seerr, then **Save & apply**. No `.env` is required; [`.env.example`](.env.example) contains optional panel/data bootstrap settings only.
+Configuration, user data and external responses are untrusted. Integration settings are
+authenticated; discovered Arr destinations additionally require independent administrator
+approval. In-process resource/provider/filesystem risks and unresolved release blockers remain;
+unit tests cannot establish absolute host immunity or production safety.
 
-`/link` displays a private code. Approve it in an already signed-in Jellyfin client under **Settings → Quick Connect**. The bot verifies the Jellyfin identity and matching Seerr account, saves the Discord ID, and encrypts the resulting Jellyfin access token. The temporary code/cookie session is discarded. Verification persists across restarts with no arbitrary identity TTL; before private disclosures the bot checks the retained token against Jellyfin `/Users/Me`. Rejected tokens or deleted/disabled accounts require `/link` again. Outages hide private data without discarding credentials.
+## Develop and release
 
-Jellyfin user authentication uses the native `Authorization: MediaBrowser …, Token="…"` header, including the first check immediately after Quick Connect approval. This works with Jellyfin 10.11's legacy authentication disabled; no token goes in a URL. If an older bot image immediately reports “Verification expired or was revoked” after approval, deploy an image containing this header fix before retrying `/link`. Do not delete the database/key or weaken identity checks to bypass the failure.
-
-Unverified viewers receive only generic verification instructions—no server/device labels, operational metadata, server links, media records or images. Discord OAuth alone is not sufficient. Old links need one new `/link` because the previous implementation did not retain Jellyfin tokens. Back up and protect the database **and its sibling `jellyfin.key`**; Unix key mode is `0600` (protect Windows ACLs too). Losing the key requires users to reverify. The console-code-authenticated private operator panel remains a separate administration trust path.
-
-## Enable the Discord Activity
-
-### Slash-only toggle
-
-```dotenv
-ACTIVITY_ENABLED=false
-WEBHOOK_SECRET=
-```
-
-Choose **Slash only** in the panel, or use the settings above. This disables the embedded dashboard and bot backend HTTP listener. The separate **private admin panel** stays available unless `PANEL_ENABLED=false`. No public hostname, tunnel, OAuth client secret, frontend build or public incoming port is needed. Discord and configured media APIs must still be reachable outbound. Keep `WEBHOOK_SECRET` only for optional webhook reception; polling works without it. Save & apply changes. If Activity hosting fails, all slash commands remain available; `/activity` cannot launch without its HTTPS backend.
-
-| Feature | Slash-command access (private components included) |
-| --- | --- |
-| Connect account | `/link` |
-| Overview, library, popular titles, search/request movies/TV/music/books | `/dashboard`, `/library`, `/discover`, `/search` |
-| Request status and file deletion | `/requests` → select item → confirm deletion |
-| Deletion history and Undo | `/deletions` → select item → Undo |
-| Storage, Jellyfin links | `/storage`, item details → Open in Jellyfin |
-| Watch/follow/unfollow/two-way sync | Item details, `/watchlist`, `/notifications` → Sync watchlists now |
-| Opt-in/mute and device choice | `/notifications` |
-| Health / Seerr link | `/status`, `/seerr` |
-| Admin selected/multiple/all-server or user messages | `/announce`, `server_ids` accepts comma-separated IDs |
-| Normal bot chat to one DM/channel, optional file | `/chat` (or inline panel conversation composer) |
-| Admin server destinations | `/servers` |
-| Admin inbox/filter/read/reply | `/inbox` → select message → Reply → confirmation |
-| Admin announcement results | `/deliveries`, `/deliveries job:ID` |
-
-`/inbox` supports `kind`, `server_id`, `channel_id`, `user_id`, `query`, `order` and `page`. It shows five messages per page, with Next/Previous/Refresh. `/servers` lists joined guild IDs for targeting; `/announce channel_id:...` optionally overrides a channel within one selected server. Discord admin tools require Jellyfin verification, plus a live Seerr admin role or a bot-only role exception. Exceptions do not bypass identity checks. Operator-authored announcements still use explicitly confirmed destinations; URL previews are suppressed. Do not broadcast private server information to unverified audiences. Liquid-glass CSS applies to Activity/local panel; Discord controls native component appearance.
-
-`/library`, `/requests`, `/watchlist` and `/deletions` accept an optional `query` title filter. Media-backed lists refresh before filtering; opening the watchlist reconciles with Seerr first. Watchlist/history require live Jellyfin identity verification. Owner-only Undo/mute remain available through existing controls during outages and return only generic safety receipts.
-
-### Browsing and discovery
-
-- **Activity:** Home shortcuts lead to Discover or Library. Discover opens with popular movies/series, not an empty search form. Click a poster/title for a live synopsis and actions; Back preserves your gallery, filter and position. Library/request/watchlist galleries show 12 cards per page, with sorting and saved title filters. Category/filter/page changes within that gallery use its labelled snapshot rather than re-syncing everything. Poster downloads are lazy, authenticated and bounded; unavailable artwork has a category fallback.
-- **Slash commands:** `/discover` browses popular movies/series. Five numbered poster cards appear per gallery page. Select a title for details, use Back/Home, Filter titles, Search new titles, category selection or the My/All request toggle. Next/Previous automatically cross search-result batches. Paging/back/filtering revalidate identity and request-view permissions without refreshing every integration.
-- **Native message updates:** navigation, selections and submitted search/filter forms update the same private message. Live loads show **Updating…** immediately and remove old controls until the result arrives. Overlapping clicks are acknowledged without queuing duplicate actions; replaced controls/forms cannot overwrite a newer view. Follow/unfollow, requests, deletion confirmations/Undo, preferences and watchlist sync update that message instead of leaving stale buttons behind. Mutation receipts offer Back/Home; Back reloads the affected collection. Errors replace loading with a safe explanation, not cached private data. Opening a Jellyfin browser link is a separate private reply because it does not change the source view. Quick Connect cancellation preserves the polling worker's result if approval wins the race.
-- **Freshness:** opening/refreshing a library/request/storage collection still refreshes upstream snapshots and fails closed on errors. New searches, popular feeds, item details and Jellyfin links fetch their own live dependencies and do not wait on unrelated snapshot writers. Mutations continue to check ownership, permissions, quotas and current availability before execution. An already-open gallery is explicitly a browsing snapshot, never a fallback after a failed refresh.
-
-Both web interfaces offer a saved **dark/light appearance**, readable responsive layouts, keyboard focus indicators and reduced-motion support. The Activity provides generic loading placeholders, contextual empty states and inline Follow receipts. Setup includes collapsible optional integrations, an unsaved-change indicator and **Advanced** setting search that preserves hidden drafts. Credentials and drafts are never saved in browser storage.
-
-Discovery runs through the verified user's Seerr API context (`X-API-User`), so Seerr remains responsible for that user's permissions and request limits. **Open Seerr** is available after verification in Discover and via `/seerr`. It opens the real site with the user's own browser session; it does not transfer bot credentials or automatically sign them in. The raw Seerr UI is deliberately **not** iframe-proxied: its browser session cookies/CSRF protections and the Discord Activity origin require a separate supported SSO/session integration. A Jellyfin token is not a Seerr browser login. Do not disable cookie/CSRF/frame safeguards or expose API keys to make embedding work.
-
-Activities are embedded web views **inside Discord**, not ordinary bot embeds. They require an HTTPS backend and Discord Developer Portal configuration.
-
-1. Use the **same application** as the bot. Choose **Activity** in the panel and configure these fields (environment overrides remain supported):
-
-   ```dotenv
-   ACTIVITY_ENABLED=true
-   DISCORD_APPLICATION_ID=your-application-id
-   DISCORD_CLIENT_SECRET=your-oauth-client-secret
-   BOT_HOST=0.0.0.0
-   BOT_PORT=8080
-   ```
-
-2. Build the interface with Node 22+:
-
-   ```sh
-   cd activity
-   npm ci
-   npm run build
-   ```
-
-3. Serve the Python backend on a dedicated HTTPS hostname through a reverse proxy. In **Developer Portal → Activities**, enable Activities and map prefix `/` to that hostname.
-4. Under **OAuth2 → Redirects**, add `https://127.0.0.1` as the SDK’s placeholder redirect. The embedded SDK handles the actual return to Discord.
-5. Enable Developer Mode in Discord. Launch with `/activity` or the application’s **Launch** entry point in the App Launcher. Development Activities may be limited to application-team members until Discord distribution is configured.
-
-Discord OAuth uses `identify` and `guilds`. The backend verifies identity and configured guild membership with Discord’s API, never a frontend-provided user ID. Every viewer has private data and independent preferences, even in a shared Activity. Activity session/OAuth tokens are memory-only and expire; reopen the Activity to reauthenticate. Jellyfin verification is a separate, persistent token check. Keep the OAuth client secret strictly server-side.
-
-The Activity shows a live verification timestamp and refreshes every 60 seconds while visible. Local collection filtering does not contact upstream services; actions always revalidate. Slash commands cannot be CSS-themed. Never route the private setup/admin panel through the public Activity hostname.
-
-### UI responsiveness and state updates
-
-- Independent service checks and metadata reads run in bounded parallel batches. Each Seerr worker uses its own connection pool and retains the correct user scope; writes and watchlist reconciliation keep their required ordering.
-- Overlapping collection loads share only a successful refresh completed after those loads started, not a timed/stale cache. New navigation supersedes obsolete reads immediately, and late results cannot overwrite the current page or newer mutation state.
-- Activity requests, follows and preference changes return confirmed state with their receipts rather than reloading the entire page. Requests wake background library sync; library-backed pages remain blocked until fresh sync succeeds. Follow controls reflect saved membership and support immediate Unfollow.
-- The private messenger loads conversation/state reads concurrently and applies incremental transcript updates without rebuilding unchanged messages or losing drafts. Independent setup verification can run concurrently; changed settings must be verified again before saving.
-- To diagnose remaining latency, inspect the authenticated API's **Server-Timing** `app` duration in browser Network tools. It measures server-side work including upstream waits, not browser rendering or tunnel latency. Timing is not exposed to unverified Activity viewers. Live upstream verification remains mandatory; outages are not bypassed for speed.
-
-## Docker
-
-The Dockerfile builds the Activity automatically and runs Python as UID `10001`.
+Requires **.NET 10 SDK** and **Node 22.12+** for development only. Run from the repository root:
 
 ```sh
-docker compose -f templates/compose.slash.yml up -d --build
-docker compose -f templates/compose.slash.yml port media 8787
-docker compose -f templates/compose.slash.yml logs media
+dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.0.0
+dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.2.0
+npm ci --prefix plugin/web
+npm test --prefix plugin/web
+npm ci --ignore-scripts --prefix plugin/activity
+npm run build --prefix plugin/activity
 ```
 
-Open the reported host-loopback panel port and use the console code in the logs. For Activity/webhooks use [templates/compose.activity.yml](templates/compose.activity.yml), which also publishes the bot backend on host-loopback `8080`. See [presets and secure access](docs/onboarding.md#start-with-a-preset).
+Code and resources live in `plugin/src/`; native tests in `plugin/tests/`; browser tests in
+`plugin/web/`; the bundled Activity source in `plugin/activity/`; packaging and guarded disposable
+Jellyfin acceptance tools in `plugin/tools/`. CI tests these plugin components; release tooling
+builds an allowlisted ZIP, checksums and `manifest.json`, then publishes immutable preview assets
+and the catalog only when explicitly run.
 
-Named volumes handle writable permissions; bind mounts must be writable by UID `10001`. Run **one instance per database**. Proxy HTTPS traffic only to the bot backend, never the panel. Do not share access-code logs or log Authorization headers, OAuth POST bodies, or Quick Connect secrets. With Activity/webhooks disabled, only the private admin panel listens; set `PANEL_ENABLED=false` for a listener-free headless install.
+### Documentation
 
-For `attempt to write a readonly database`, follow [SQLite storage permissions](docs/setup.md#sqlite-storage-permissions). Existing volumes may retain ownership from an older image; mount `/data` read-write and set `DATA_DIR=/data` explicitly. Do not delete the database or run the bot permanently as root.
+- [Setup](docs/setup.md) · [Tutorial controls](docs/onboarding.md) · [Detailed plugin reference](plugin/README.md)
+- [Activity configuration](plugin/ACTIVITY.md) · [Implementation plan](plugin/IMPLEMENTATION_PLAN.md)
+- [Feature checklist](plugin/FEATURES.md) · [Safety boundaries](plugin/SAFETY.md)
+- [Security findings](plugin/SECURITY_REVIEW.md) · [Acceptance evidence](plugin/ACCEPTANCE.md)
+- [Packaging and publishing](plugin/README.md#build-and-test) · [Release notes](plugin/repository/RELEASE_NOTES.md)
 
-## Configuration
-
-Configure routine settings in the panel; they persist in private `DATA_DIR/settings.json`. Environment values override saved settings and appear read-only in the panel. [`.env.example`](.env.example) contains bootstrap options; [`.env.advanced.example`](.env.advanced.example) retains every advanced setting's description, units, dependencies and defaults. Never commit secrets; protect data/backups. Boolean typos and invalid Discord IDs fail validation instead of silently changing security settings.
-
-| Variables | Purpose/default |
-| --- | --- |
-| `SEERR_URL`, `SEERR_ADMIN_KEY`, `DISCORD_TOKEN` | Required backend credentials |
-| `ALLOWED_GUILD_IDS` | Comma-separated allowed guilds; empty allows all guilds/DMs |
-| `DATA_DIR`, `DATABASE_PATH` | Persistent SQLite; `./data/seerr_cache.db` |
-| `PANEL_ENABLED`, `PANEL_HOST`, `PANEL_PORT` | Private panel; `true`, `127.0.0.1`, `0` (random) |
-| `SEERR_DISCOVERY`, `SEERR_ADMINS` | Import Radarr/Sonarr and infer verified admins; both `true` |
-| `ADMIN_DISCORD_IDS` | Explicit bot-only operator exceptions; does not modify Seerr roles |
-| `SYNC_INTERVAL_SECONDS`, `API_TIMEOUT_SECONDS` | `300` background refresh/deletion check; `15` per API call |
-| `LINK_TTL_SECONDS`, `LINK_POLL_INTERVAL_SECONDS` | Quick Connect lifetime, at most `300`; poll every `5` seconds |
-| `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS` | `15` user interactions per `60` seconds, shared by commands/Activity |
-| `LOGIN_RATE_LIMIT_COUNT`, `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `5` connection starts per user per `600` seconds |
-| `ACTIVITY_ENABLED`, `DISCORD_APPLICATION_ID`, `DISCORD_CLIENT_SECRET` | Enable the embedded dashboard and OAuth |
-| `ACTIVITY_SESSION_TTL_SECONDS`, `ACTIVITY_REFRESH_INTERVAL_SECONDS` | `900` session lifetime; `60` UI refresh (minimum `30`) |
-| `BOT_HOST`, `BOT_PORT` | HTTP backend bind, `127.0.0.1:8080` |
-| `JELLYFIN_DEVICE_URLS` | Optional JSON device labels → base URLs; Browser is discovered from Seerr |
-| `{LIDARR,READARR}_URL`, `*_API_KEY` | Enable a direct music/book integration with both values |
-| `{RADARR,SONARR}_URL`, `*_API_KEY` | Legacy overrides only when `SEERR_DISCOVERY=false` |
-| `{LIDARR,READARR}_ROOT_FOLDER`, `*_QUALITY_PROFILE_ID`, `*_METADATA_PROFILE_ID` | Defaults for direct album/book additions |
-| `ARR_REQUEST_LIMIT_PER_DAY` | `10` album/book requests per user per rolling 24 hours |
-| `WEBHOOK_SECRET`, `WEBHOOK_RATE_LIMIT_COUNT` | Optional 32+ character secret; `60` notifications/minute per source/client |
-| `WEBHOOK_PUBLIC_URL` | Optional receiver hostname for deployment configuration |
-
-Service URLs omit `/api/v1` and `/api/v3`. Seerr routes movies/TV and file deletion through its own configured Radarr/Sonarr instances; the bot imports every instance before each refresh. Lidarr/Readarr remain direct. Seerr CSRF protection is supported with its XSRF cookie/header; use an **HTTPS `SEERR_URL`** when secure cookies are enabled.
-
-```dotenv
-JELLYFIN_DEVICE_URLS={"Browser":"https://jellyfin.example.com","Home":"http://192.168.1.10:8096"}
-```
-
-Choose a device in Activity **Preferences** or `/notifications`. Item links use Seerr’s Jellyfin IDs, without tokens in URLs. All URLs must point to the same Jellyfin server. This opens its web client, **not remote playback**. Music/books and items without a Seerr-synced Jellyfin ID do not receive fabricated links.
-
-## Commands
-
-`/activity` · `/dashboard` · `/link` · `/requests` · `/search` · `/library` · `/storage` · `/watchlist` · `/notifications` · `/deletions` · `/status` · `/seerr`
-
-Operators: `/announce` · `/servers` · `/inbox` · `/deliveries`
-
-All command responses are private. `/requests all_requests:true` requires Seerr `REQUEST_VIEW`, `MANAGE_REQUESTS` or `ADMIN`. Movies/TV run as the linked user via `X-API-User`, preserving Seerr quotas and approval policy. TV requests include all seasons; use Seerr for individual seasons/4K. Album/book requests use configured service profiles and a separate daily limit; they are not Seerr requests.
-
-## Admin messages & inbox
-
-Verified linked Seerr owners/Administrators receive **global** bot messaging/inbox access by default, rechecked against live Seerr on each admin operation and queued delivery. `ADMIN_DISCORD_IDS` adds explicit **bot-only role exceptions**, without modifying Seerr roles; they still require verified `/link` identity. Discord server roles alone do not grant bot-admin access. Disable `SEERR_ADMINS` and clear exceptions to disable Discord/Activity operator access and collection; authenticated local-panel operators can still manage the service. With `ALLOWED_GUILD_IDS`, launch commands/Activity from an allowed server; operators may explicitly target any joined server.
-
-```dotenv
-ADMIN_DISCORD_IDS=123456789012345678,234567890123456789
-ADMIN_ANNOUNCEMENT_CHANNELS={"345678901234567890":"456789012345678901"}
-```
-
-`/announce message:...` defaults to the invoking server/channel. Optional `server_id` targets another server's configured announcement channel (or system channel); `recipient` targets one user by DM. `all_servers:true` explicitly selects every joined server, and `all_users:true` additionally DMs their non-bot members, deduplicated across servers. No target in DMs means **no send**, not a global broadcast. Announcements require a private, two-minute recipient preview/confirmation; optional `attachment` adds a file. `/chat` sends a normal message to one explicit DM or selected/current server channel, with an optional attachment, without a broadcast confirmation. Both are durably audited and suppress mentions/URL unfurls.
-
-The private panel → **Messages** is a Discord-style messenger: DM conversations, a categorized server/channel sidebar with unavailable destinations disabled, inline Normal chat/Announcement composers, chronological transcripts with date dividers, search, older/newer pages, bot and delivery badges, and a mini **# announcements** history channel with recipient delivery details. Use **Conversations** on mobile to open the sidebar. The composer grows with your message and shows a character count. Liquid glass, Midnight, Amethyst and Light themes are available; only cosmetic preferences are stored in browser storage, never drafts or credentials. Replies and uploads stay in their conversation. Announcements use a destination picker and explicit preview/confirmation; normal chat is strictly one destination and uses durable send IDs to deduplicate an HTTP retry. Sent operator messages appear beside incoming messages. Local-panel sends are audited as `local-panel`.
-
-Messaging updates subscribe to cookie-authenticated **server-sent events** on the private panel port. Events contain revision numbers only; the browser reloads authorized transcripts/delivery states on arrivals, edits, deletes and channel changes, preserving the focused draft and scroll position. Sessions are rechecked on updates and every 15-second heartbeat, and subscriptions close when leaving Messages. No extra public listener or token-in-URL is needed. The Activity retains its existing verified admin tools and grouped inbox; slash tools remain available without Activity hosting.
-
-- Captures new DMs, direct bot mentions, resolved replies to the bot, explicitly configured `INBOX_CHANNEL_IDS`, and channels where an operator sent normal bot chat within the retention window. It does **not** backfill Discord history or read unrelated channels by default. Operator-authored outgoing messages are recorded; automated bot registration/notification messages are not copied into the inbox. Edits/deletes update retained conversations. Historical count-only attachments cannot be reconstructed automatically.
-- Discord formatting is rendered as safe DOM text/markup: bold/italic/underline/strike, code, quotations, headings, spoilers, links, resolved user/role/channel tags, timestamps and custom emoji. Attachment images, file downloads, avatars and Discord-hosted embed images use authenticated same-origin routes; signed CDN URLs never enter API responses. Arbitrary external embed image URLs are not automatically fetched. HTML/SVG/other active files are downloads, never inline documents. Expired Discord asset URLs are refreshed from the retained message's known channel/ID when possible; deleted/expired messages cannot expose their media.
-- Panel uploads allow **4 files / 8 MiB per file / 16 MiB per message**, subject to Discord/channel limits and Attach Files permission. Uploads are actor-bound, expire after **15 minutes** if unused, and are claimed only at send confirmation/direct chat submission. Claimed bytes are kept for the inbox retention period in SQLite; all retained uploads are capped at **64 MiB**. Protect database/backups, which now include file contents. Previewing an upload does not send it.
-- DMs/direct mentions do not require Message Content intent. Full non-mention reply/selected-channel content requires `INBOX_MESSAGE_CONTENT=true` **and** Message Content Intent in Developer Portal. Without it, Discord may provide no text. Inferred admin access needs reachable Seerr; explicit exceptions/local-panel inbox access work during media-service outages.
-- Retention defaults to **7 days / 10,000 messages**, whichever limit is reached first (`INBOX_RETENTION_DAYS`, `INBOX_MAX_MESSAGES`). Stored content is private operator data; protect database/backups and tell users who can read bot DMs. Pruning runs on receipt/inbox access.
-- All-member DMs require `ENABLE_MEMBERS_INTENT=true` **and** Server Members Intent in Developer Portal. Discord can deny DMs; use broad sends only for expected, relevant announcements, never unsolicited promotion.
-- Sends are paced (`ADMIN_SEND_INTERVAL_SECONDS=1`), limited to `ADMIN_MAX_RECIPIENTS=1000`, and announcements are rate-limited to five previews per five minutes per operator. Normal chat has a separate 30 messages/minute operator limit. Mentions cannot ping users/roles/everyone. Audit records persist sender, mode, content, destination and confirmed/failed/uncertain delivery. Unconfirmed sends are **never automatically replayed**; pending sends resume after restart. Inspect uncertain results in Discord before deliberately sending a new message.
-
-## Deletion safety
-
-Only the original requester can schedule removal of their available files. The deadline persists across restarts and is **24 hours after confirmation**. Undo in Activity **Deletions** or `/deletions` while pending, including during upstream outages. No administrator review is required.
-
-After the deadline, the bot refreshes everything and checks the account link, live owner, exact media ID, 4K variant and availability before calling **only** `/media/{id}/file`. Seerr request/media records remain intact. Seerr can remove the whole movie/series from Radarr/Sonarr while deleting files, including shared files; confirmation warns about this.
-
-After confirmed deletion, the bot verifies that monitoring has stopped in the exact Seerr-selected Radarr/Sonarr instance and regular/4K edition. If Seerr removed the entry, nothing is recreated. If the original entry remains without files, the bot unmonitors the movie or the whole series, including its seasons, episodes and future seasons. It never unmonitors a replacement entry or another instance. Hub/Seerr watchlist membership is unchanged.
-
-Confirmed file deletion is checkpointed before monitoring cleanup. If cleanup fails, `/deletions` shows a processing action with a cleanup-pending explanation; live-authorized cleanup retries survive restarts and **never repeat file deletion**. A changed destination, owner, identity or library entry blocks cleanup rather than targeting something else. Undo is unavailable once file deletion has started.
-
-Outages postpone execution. Changed ownership/target or a revoked link cancels it. Undo cannot stop a deletion already in flight. Ambiguous timeouts/interrupted writes become `uncertain` and are **not automatically retried**; verify the upstream outcome before correcting the local action record.
-
-## Notifications
-
-DMs are **off by default**. Enable them in Preferences or `/notifications`; mute works during outages. Movie/series watchlists sync with Seerr automatically, independently of DM opt-in. Notifications describe verified request/file-availability changes, not raw webhook text or every download-progress event.
-
-### Automatic two-way watchlists
-
-- **Movies/series:** Follow/Unfollow in the hub writes membership to the linked Seerr user's native watchlist. Seerr additions/removals flow back to the hub. Opening `/watchlist` or the Activity watchlist syncs first; a separate background worker also syncs every `SYNC_INTERVAL_SECONDS` (default 300), even when unrelated library/storage refreshes fail. Preferences provides **Sync now**; the old import API remains a compatibility alias for full two-way sync.
-- **First sync:** safely merge both lists, preserving existing entries. After that, a persisted per-user baseline tracks removals so deleted entries do not get resurrected. A disappearance on either side removes the item; an explicit pending hub Follow/Unfollow wins a simultaneous conflict. The most recent hub choice supersedes earlier pending choices.
-- **Outages/restarts:** save outbound membership changes before sending them. Retries first read complete live membership and acknowledge only confirmed results; an ambiguous response never triggers blind replay. Incomplete, inconsistent, unsupported or inaccessible watchlist responses never count as an empty list. Pending changes and baselines persist in SQLite. Failed watchlist reads do not return a cached fallback.
-- **Boundaries:** Jellyfin verification and the live Seerr/Discord identity binding gate synchronization, including background writes. Requests use `X-API-User`, never the administrator's watchlist. A persisted destination/account pin blocks silently sending old intents to a different Seerr URL or account; operators must resolve a deliberate migration. This targets Seerr's native Jellyfin/non-Plex watchlist API, not a Plex-hosted watchlist.
-- **Limits:** the combined hub watchlist stays capped at 200 entries. An oversized merge stops without truncating/replacing either list; remove entries before trying again. Music/books stay hub-only. Watching never calls a media-request, file-deletion or Seerr request-deletion endpoint, and never enables DMs automatically.
-
-For each configured service, use **Settings → Connect → Webhook**:
-
-- URL: `https://your-backend/webhooks/radarr` (or `sonarr`, `lidarr`, `readarr`)
-- POST; username `bot`; password `WEBHOOK_SECRET`
-- Enable relevant import/upgrade/rename/deletion events and **Test**.
-
-For Seerr, use **Settings → Notifications → Webhook**, URL `/webhooks/seerr`, Authorization `Bearer <WEBHOOK_SECRET>`, and payload `{"notification_type":"{{notification_type}}"}`. Custom clients can also use Bearer auth. Webhooks only trigger a verified refresh. Polling catches missed events. Seerr’s native Discord notifications are separate from the bot’s opt-in DMs.
-
-## Persistence & limits
-
-- Atomic snapshots reject failed/incomplete pages; valid empty results clear the cache. Request and media status are separate. Cached title/poster metadata is descriptive; live state controls decisions.
-- Freshness means the **latest API-reported state**, not an instantaneous filesystem scan. Keep native Jellyfin/Seerr/*arr scan jobs enabled. An enabled service outage blocks upstream-data operations; local Undo, mute, unfollow and history remain usable.
-- SQLite persists mappings, follows, deadlines, state observations and the notification outbox. Back it up securely. Old `linked_users.json` mappings are not silently trusted; users must relink. The old file is not deleted.
-- Notifications retry with deduplication/backoff. Closed DMs/revoked links mute delivery. A crash after Discord accepts a DM but before delivery is recorded can produce a duplicate.
-- Readarr support requires a compatible installation and working upstream metadata services.
-
-## Tests
-
-```sh
-python -m unittest discover -s tests -v
-# In activity/:
-npm test
-npm run build
-```
-
-Tests use mocks/local HTTP servers, never production media. OAuth/SDK launch, Quick Connect and your service versions still need live Discord deployment testing before real file deletion.
-
-[MIT License](LICENSE)
+MIT licensed. See [LICENSE](LICENSE) and [third-party notices](plugin/THIRD_PARTY_NOTICES.md).
