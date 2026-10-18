@@ -11,7 +11,7 @@ process.on('unhandledRejection', () => { console.error('Native UI acceptance fai
 const [stateFile, playwrightModule, screenshot, axeFile] = process.argv.slice(2);
 if (!stateFile || !playwrightModule || !screenshot) throw new Error('Provide owned fixture state, playwright-core module and screenshot path.');
 const state = JSON.parse(await readFile(stateFile, 'utf8'));
-if (!(state.Name === 'mediahub-test-settings' && state.Port === 18296 && !state.BasePath || state.Name === 'mediahub-test-completion' && state.Port === 18396 && state.BasePath === '/mediahub' || state.Name === 'mediahub-test-split' && state.Port === 18596 && !state.BasePath)) throw new Error('Only specifically owned native UI fixtures are authorized by this tool.');
+if (!(state.Name === 'mediahub-test-settings' && state.Port === 18296 && !state.BasePath || state.Name === 'mediahub-test-completion' && state.Port === 18396 && state.BasePath === '/mediahub' || state.Name === 'mediahub-test-split' && state.Port === 18596 && !state.BasePath || state.Name === 'mediahub-test-release-diag' && state.Port === 18896 && !state.BasePath)) throw new Error('Only specifically owned native UI fixtures are authorized by this tool.');
 const basePath = state.BasePath || '', origin = 'http://127.0.0.1:' + state.Port, server = origin + basePath;
 const { chromium } = await import(pathToFileURL(resolve(playwrightModule)).href);
 stage = 'browser launch';

@@ -99,7 +99,15 @@ jobs:
           MEDIAHUB_BROWSER_CHANNEL: chromium
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
+          ./plugin/tools/Test-StartupDiagnostic.ps1
           ./plugin/tools/Test-ReleaseSmoke.ps1 -Package "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub_$env:RELEASE_VERSION.zip" -Version $env:RELEASE_VERSION -PlaywrightModule "$env:RUNNER_TEMP/mediahub-browser/node_modules/playwright-core/index.mjs" -AxeFile "$env:RUNNER_TEMP/mediahub-browser/node_modules/axe-core/axe.min.js" -ProviderZip "$env:RUNNER_TEMP/PrivateSyncPlay-0.1.5.zip"
+      - name: Retain sanitized startup diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: plugin-startup-diagnostics
+          path: ${{ runner.temp }}/mediahub-acceptance/Temp/opencode/*.startup-diagnostic.json
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plugin-repository

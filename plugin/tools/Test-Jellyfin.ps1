@@ -6,6 +6,7 @@ param(
     [ValidateSet('Core', 'LegacyMonolith')][string]$PackageKind = 'Core',
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$PackageVersion = '0.1.0.0',
     [ValidatePattern('^(|/[a-z0-9-]{1,32})$')][string]$BasePath = '',
+    [ValidateRange(10, 300)][int]$StartupTimeoutSeconds = 180,
     [string]$Image = 'jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037'
 )
 $ErrorActionPreference = 'Stop'
@@ -42,22 +43,43 @@ function Api($path, $body = $null, $token = $null, $device = 'mediahub-acceptanc
     try { $result = Invoke-RestMethod @arguments; return $result }
     catch {
         $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'unreachable' }
+        $script:lastApiFailure = @{ Path = ($path -split '\?')[0]; Status = $status }
         throw ('Disposable Jellyfin API failed: ' + $path + ' (' + $status + '). Credentials and response content withheld.')
     }
 }
-function Ready {
-    $deadline = [DateTime]::UtcNow.AddSeconds(60)
-    while ([DateTime]::UtcNow -lt $deadline) {
+function Ready([string]$phase = 'check') {
+    Write-Host ('Waiting for disposable Jellyfin: ' + $phase + ' (budget ' + $StartupTimeoutSeconds + ' seconds).')
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $sawPublicInfo = $false; $sawHealthyResponse = $false
+    $script:lastApiFailure = $null
+    while ($watch.Elapsed.TotalSeconds -lt $StartupTimeoutSeconds) {
         try {
             $info = Api 'System/Info/Public' $null $null 'mediahub-acceptance-admin' 2
+            $sawPublicInfo = $sawPublicInfo -or [bool]$info.Version
             # Jellyfin 12 exposes public info on a temporary setup listener before
             # the real application takes over the port. Do not mistake that for ready.
             $health = Api 'health' $null $null 'mediahub-acceptance-admin' 2
-            if ($info.Version -and $health -eq 'Healthy') { return $info }
+            $healthy = $health -is [string] -and $health.Trim() -ceq 'Healthy'
+            $sawHealthyResponse = $sawHealthyResponse -or $healthy
+            if ($info.Version -and $healthy) { return $info }
         } catch { }
         [Threading.Tasks.Task]::Delay(1000).GetAwaiter().GetResult()
     }
-    throw 'The disposable Jellyfin did not become ready within 60 seconds.'
+    try {
+        $diagnostic = & (Join-Path $PSScriptRoot 'Get-TestStartupDiagnostic.ps1') -Name $Name -Phase $phase
+        $diagnostic | Add-Member -NotePropertyName PublicInfoObserved -NotePropertyValue $sawPublicInfo
+        $diagnostic | Add-Member -NotePropertyName HealthyResponseObserved -NotePropertyValue $sawHealthyResponse
+        $diagnostic | Add-Member -NotePropertyName BudgetSeconds -NotePropertyValue $StartupTimeoutSeconds
+        $diagnostic | Add-Member -NotePropertyName ElapsedSeconds -NotePropertyValue ([int]$watch.Elapsed.TotalSeconds)
+        if ($script:lastApiFailure.Path -in @('System/Info/Public', 'health')) {
+            $diagnostic | Add-Member -NotePropertyName LastProbe -NotePropertyValue $script:lastApiFailure.Path
+            $diagnostic | Add-Member -NotePropertyName LastProbeStatus -NotePropertyValue $script:lastApiFailure.Status
+        }
+        $encoded = $diagnostic | ConvertTo-Json -Depth 4
+        Write-Host $encoded
+        [IO.File]::WriteAllText((Join-Path $root ($Name + '.startup-diagnostic.json')), $encoded, (New-Object Text.UTF8Encoding($false)))
+    } catch { Write-Host 'Sanitized startup diagnostics could not be retained; the readiness failure is still fatal. Raw diagnostic content withheld.' }
+    throw ('Disposable Jellyfin readiness failed during ' + $phase + ' within ' + $StartupTimeoutSeconds + ' seconds. See the sanitized startup diagnostic; no reset or automatic write retry was performed.')
 }
 function Expect-Status($path, $expected, $token = $null, $device = 'mediahub-acceptance-viewer') {
     try { $result = Invoke-WebRequest -UseBasicParsing -Uri ($url + '/' + $path) -Headers (Header $token $device) -TimeoutSec 15; $actual = [int]$result.StatusCode }
@@ -78,7 +100,7 @@ function Reject-MalformedJson($state) {
         }
         if ($actual -notin @(400, 413) -or ($content -and $content.Contains($marker))) { throw 'Malformed plugin JSON was not rejected safely. Request and response content withheld.' }
     }
-    $null = Ready # The host remains usable after all rejected plugin requests.
+    $null = Ready 'request-rejection' # The host remains usable after all rejected plugin requests.
     return $cases.Count
 }
 function Save($state) {
@@ -144,7 +166,7 @@ function Configure-Fixture($info) {
         $null = Api 'System/Configuration/network' $networkConfig $state.AdminToken
         $script:url = 'http://127.0.0.1:' + $Port + $state.BasePath
         $null = Docker @('restart', '--time', '20', $Name)
-        $null = Ready
+        $null = Ready 'base-path-restart'
     }
     if (!$state.Snapshot) { $state.Snapshot = Snapshot $state } else { $state.Snapshot = Normalize-Snapshot $state.Snapshot }
     Save $state
@@ -164,7 +186,7 @@ if ($Mode -eq 'Start') {
     $null = Docker @('run', '-d', '--name', $Name, '--label', ('org.mediahub.acceptance=' + $Name), '--network', $network,
         '--publish', ('127.0.0.1:' + $Port + ':8096'), '--mount', ('type=volume,source=' + $Name + '-config,target=/config'), '--mount', ('type=volume,source=' + $Name + '-cache,target=/cache'),
         '--read-only', '--tmpfs', '/tmp:rw,size=268435456', '--memory', '2g', '--cpus', '2', '--pids-limit', '512', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', $Image)
-    Configure-Fixture (Ready)
+    Configure-Fixture (Ready 'fresh-start')
     exit
 }
 OwnContainer
@@ -174,7 +196,7 @@ if ($state.Name -ne $Name -or $state.Port -ne $Port) { throw 'Test state does no
 if ($state.BasePath -and $state.BasePath -notmatch '^/[a-z0-9-]{1,32}$') { throw 'Unrecognized fixture base path.' }
 if ($BasePath -and $BasePath -ne $state.BasePath) { throw 'Refusing to change a retained fixture base path.' }
 $url += $state.BasePath
-if ($Mode -eq 'Configure') { Configure-Fixture (Ready); exit }
+if ($Mode -eq 'Configure') { Configure-Fixture (Ready 'configure'); exit }
 $state.Snapshot = Normalize-Snapshot $state.Snapshot
 if ($Mode -eq 'Stop') { $null = Docker @('stop', '--time', '20', $Name); Write-Output 'Only the owned test container was stopped. Volumes and private test credentials were retained.'; exit }
 if ($Mode -eq 'Install') {
@@ -206,10 +228,10 @@ if ($Mode -eq 'Install') {
     $null = Docker @('stop', '--time', '20', $Name)
     $null = Docker @('cp', $stage, ($Name + ':/config/plugins/MediaHub_' + $PackageVersion))
     $null = Docker @('start', $Name)
-    $null = Ready
+    $null = Ready 'install-restart'
 }
 if ($Mode -eq 'Uninstall') {
-    $null = Ready
+    $null = Ready 'check'
     $retained = Plugin-StateDigest
     $personal = Api 'MediaHub/Me' $null $state.ViewerToken 'mediahub-acceptance-viewer'
     $state | Add-Member -NotePropertyName RetainedPersonal -NotePropertyValue $personal -Force
@@ -217,7 +239,7 @@ if ($Mode -eq 'Uninstall') {
     # Exercise Jellyfin's actual uninstall hook. Only the GUID/version in this owned fixture is selected.
     $null = Api ('Plugins/c70297bf-77bd-4ad4-93c9-f67598519777/' + $PackageVersion) $null $state.AdminToken 'mediahub-acceptance-admin' 15 'DELETE'
     $null = Docker @('restart', '--time', '20', $Name)
-    $null = Ready
+    $null = Ready 'uninstall-restart'
     $after = Snapshot $state
     $afterRetained = Plugin-StateDigest
     if ($retained -ne $afterRetained) { throw 'Plugin settings/key were not retained unchanged during uninstall.' }
@@ -258,7 +280,7 @@ if ($Mode -eq 'Install' -and $state.PSObject.Properties['RetainedPersonal']) {
 $saved = Api 'MediaHub/Me' @{ Revision = $before.Revision; Preferences = @{ JellyfinNotifications = $false; DiscordNotifications = $false; Muted = $true } } $state.ViewerToken 'mediahub-acceptance-viewer'
 if ($Mode -eq 'Restart') {
     $null = Docker @('restart', '--time', '20', $Name)
-    $null = Ready
+    $null = Ready 'explicit-restart'
     $persisted = Api 'MediaHub/Me' $null $state.ViewerToken 'mediahub-acceptance-viewer'
     if ($persisted.Revision -ne $saved.Revision -or !$persisted.Preferences.Muted) { throw 'Personal preferences did not persist across a real host restart.' }
     $persistedSettings = Api 'MediaHub/Settings' $null $state.AdminToken

@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$Version,
     [Parameter(Mandatory)][string]$PlaywrightModule,
     [Parameter(Mandatory)][string]$AxeFile,
-    [Parameter(Mandatory)][string]$ProviderZip
+    [Parameter(Mandatory)][string]$ProviderZip,
+    [ValidateRange(10, 300)][int]$StartupTimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
 # CI-only fresh runner; never replace a retained fixture or use production credentials.
@@ -11,10 +12,10 @@ $name = 'mediahub-test-settings'
 $root = Join-Path $env:LOCALAPPDATA 'Temp/opencode'
 $null = New-Item -ItemType Directory -Path $root -Force
 $harness = Join-Path $PSScriptRoot 'Test-Jellyfin.ps1'
-$arguments = @{ Name = $name; Port = 18296; PackageVersion = $Version }
+$arguments = @{ Name = $name; Port = 18296; PackageVersion = $Version; StartupTimeoutSeconds = $StartupTimeoutSeconds }
 $digest = (Get-FileHash -Algorithm SHA256 $Package).Hash
-$existing = @(& docker ps -a --format '{{.Names}}')
-if ($LASTEXITCODE -ne 0) { throw 'Disposable Docker engine is unavailable.' }
+$dockerHelper = Join-Path $PSScriptRoot 'Invoke-TestDocker.ps1'
+$existing = @(& $dockerHelper -Arguments @('ps', '-a', '--format', '{{.Names}}') -TimeoutSeconds 15)
 if ((Test-Path (Join-Path $root ($name + '.json'))) -or $existing -contains $name) { throw 'Fresh release smoke refuses retained fixture state. Nothing was started or stopped.' }
 try {
     & $harness @arguments -Mode Start
@@ -33,6 +34,8 @@ try {
     Write-Output ('Exact-ZIP lifecycle/native-browser gate passed. SHA256=' + $digest.ToLowerInvariant())
 } finally {
     # Label-guarded stop only. Retain volumes/state for runner-local failure diagnosis.
-    $labels = & docker inspect --format '{{json .Config.Labels}}' $name 2>$null
-    if ($LASTEXITCODE -eq 0 -and ($labels | ConvertFrom-Json).'org.mediahub.acceptance' -eq $name) { & docker stop --time 20 $name | Out-Null }
+    try {
+        $owned = @(& $dockerHelper -Arguments @('ps', '-a', '--filter', ('name=^/' + $name + '$'), '--filter', ('label=org.mediahub.acceptance=' + $name), '--format', '{{.Names}}') -TimeoutSeconds 10)
+        if ($owned.Count -eq 1 -and $owned[0] -ceq $name) { $null = & $dockerHelper -Arguments @('stop', '--time', '20', $name) -TimeoutSeconds 30 }
+    } catch { Write-Warning 'Owned smoke-fixture stop was not confirmed. Private state and volumes were retained; no daemon reset or automatic retry was performed.' }
 }
