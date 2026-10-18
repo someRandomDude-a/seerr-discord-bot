@@ -1,4 +1,4 @@
-# Adversarial-input review · 16 October 2026
+# Adversarial-input review · updated 18 October 2026
 
 **Preview hardening, not a security certification or production approval.** Automatic deletion
 defaults off; `FeatureParityComplete` remains false. Do not activate production integrations.
@@ -26,6 +26,9 @@ evidence and exact test counts are in
 | Forged Discord controls or OAuth proof fields | Exact-message/actor/expiry-bound control ciphertext, cleared on consumption; same-browser OAuth proof binds state, handoff, native identity, cookie, expiry, configuration and Discord result. |
 | Wrong Arr files or broad monitoring writes | Exact provider/entry/path/file identity, bounded scans, approved destination and live ownership/configuration rechecks; file-ID DELETE only. Cleanup scope validated before narrow monitoring-only writes; no stale full-resource PUTs. |
 | Host resource and callback failures | Plugin-only network/event/concurrency/operation budgets, bounded file/database/journal reads and connection-local SQLite limits. Malformed companion transforms return the original payload. No global host resource-policy changes. |
+| Native command replay/other-user player selection | Schema 12 adds purpose/user/state-authenticated playback previews and conditional send claims. Only actual same-account capable sessions and visible individually playable items qualify; administrator ownership bypass and Activity invocation are absent. Timeouts remain uncertain and retain the bounded slot until completion; receipts never replay commands. |
+| Hook body impersonation or artwork SSRF | Optional HMAC/timestamp/nonce-checked HTTPS wake-ups ignore payload authority and trigger notification reads only. Fixed public poster origin, no credentials/redirects/active formats, bounded bytes/dimensions and current access checks. |
+| Stale owner moderation UI | Owner-only current-party and fresh snapshot checks before typed SDK policy/moderation calls; account/guest/owner distinctions and explicit shared guest-link effects. No administrator bypass or guest-admission enable control. |
 
 ## Upgrade/recovery implications
 
@@ -44,13 +47,15 @@ evidence and exact test counts are in
 1. Native Jellyfin authentication, library/user-data APIs and the OS/key store are trusted.
    A process with the plugin key or native-host privileges can forge authorization; these
    guards are not a sandbox. Filesystem path checks cannot eliminate hostile OS-level races.
-2. Signatures detect alteration, not replay of an entire previously valid snapshot. Full
-   backup rollback, replayed valid record sets and cross-process anti-rollback durability are
-   not solved by a key stored next to the database. Restore only during stopped maintenance.
-3. Not every non-destructive retained field is authenticated: watch baselines/intents,
-   subscriptions/preferences, notification and inbox projections still rely on private state
-   access plus live identity/visibility/schema/domain checks. A hostile database writer can
-   alter those behaviors. Further review is required before claiming adversarial-state safety.
+2. Schema-13 private outside-SQLite generations reject older valid SQLite sets/seals for the
+   complete protected activity/watchlist/request scopes. A consistent rollback of the **entire**
+   stopped directory (including matching private roots/checkpoints/key) is not detectable solely
+   with local state. Restore only during stopped maintenance; never reseal a mismatched subset.
+3. Watch baselines/intents, subscriptions/preferences and request authorization states are now
+   complete-set authenticated. Notification/inbox projections still rely on private state plus
+   live identity/visibility/schema/domain checks; they are not write authority. A hostile private
+   state writer can affect unsealed projections. No comprehensive adversarial-state certification
+   is claimed; full private-root/key compromise remains outside this integrity boundary.
 4. Approved provider addresses and their responses remain a trust boundary. DNS/proxy changes,
    malicious trusted providers and compromised native metadata cannot be made harmless merely
    by validating JSON. Private network addresses intentionally remain supported; no network or
@@ -61,7 +66,14 @@ evidence and exact test counts are in
 6. Shared-runtime exhaustion, native crashes, dependency vulnerabilities and actual filesystem
    durability cannot be excluded by unit tests. Maintain host backups/resource monitoring.
 7. Live Seerr/Arr/Discord/OAuth/proxy/companion-client acceptance and remaining [features](FEATURES.md)
-   work are incomplete. SyncPlay invitations remain blocked without exact creator-session proof.
+   work are incomplete. Watch parties use the reviewed public Private SyncPlay SDK, not a duplicate
+    engine. Invitation bearer URLs are forwardable; native-control handoff is implemented without
+    those secrets, but audience-bound invitations need provider support. Real-media/multi-player
+    acceptance remains outstanding. No anonymous guests can be enabled through Media Hub.
+8. Hook nonces are bounded in-memory hints, not durable write authorization. Restart may permit an
+   otherwise valid recent hint again; it can cause only an extra verified read, not a replayed action.
+   Native player and owner-policy checks are not atomic transactions with external player/provider
+   state changes; actual concurrent-client acceptance remains mandatory.
 
 No release, catalog publication or production deployment is authorized by this
 document. See [SAFETY.md](SAFETY.md) for permitted effects and [README.md](README.md) for recovery.

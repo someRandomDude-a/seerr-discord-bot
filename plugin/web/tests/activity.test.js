@@ -38,6 +38,8 @@ test('Activity uses bundled shared controls, an in-memory session and base-path-
     assert.ok(h.events.includes('mounted')); assert.ok(h.calls.every(c => c.url.startsWith('https://123456.discordsays.com/base/MediaHub/Activity/')));
     assert.equal(h.dom.window.localStorage.length, 0); assert.equal(h.dom.window.sessionStorage.length, 0);
     assert.equal(h.dom.window.document.querySelector('[data-link]').closest('section').hidden, true);
+    const content = h.dom.window.document.querySelector('#hubMessageText');
+    assert.equal(h.dom.window.document.querySelector('label[for="hubMessageText"]').textContent, content.getAttribute('label'));
     assert.equal(h.dom.window.document.documentElement.style.getPropertyValue('--hub-background'), '#112233');
     assert.equal(h.dom.window.document.documentElement.style.getPropertyValue('--hub-text'), '');
     await h.dom.window.ApiClient.ajax({ url: h.dom.window.ApiClient.getUrl('MediaHub/Me'), data: '{"Revision":0}' });
@@ -54,6 +56,17 @@ test('unlinked Activity opens an HTTPS native link explicitly and never reads pr
     assert.equal(h.events.includes('mounted'), false); assert.equal(h.calls.some(c => c.url.includes('/Api/')), false);
     assert.equal(h.calls.some(c => c.url.endsWith('/Link')), false);
     h.dom.window.document.querySelector('button').click(); await h.settle(); assert.match(h.events.at(-1).open, /^https:\/\/jellyfin.example\/base\/MediaHub\/Link\?handoff=/);
+  } finally { h.close(); }
+});
+test('Activity party handoff explicitly opens native controls without publishing a bearer or invoking player routes', async () => {
+  const h = await harness();
+  try {
+    const url = 'https://jellyfin.example/base/web/index.html#!/userpluginsettings.html?pageUrl=%2Fweb%2FConfigurationPage%3Fname%3Dmediahub';
+    h.control.reply = async target => target.endsWith('/Api/NativeHub') ? { ok: true, status: 200, json: async () => ({ Url: url }) } : undefined;
+    assert.equal(h.calls.some(c => c.url.endsWith('/Api/NativeHub')), false);
+    h.dom.window.document.querySelector('[data-native-party-handoff] button').click(); await h.settle();
+    assert.equal(h.events.at(-1).open, url); assert.equal(h.calls.some(c => /\/Players|\/WatchParty/.test(c.url)), false);
+    assert.doesNotMatch(h.dom.window.document.body.textContent, /session-memory-only|discord-access-only/);
   } finally { h.close(); }
 });
 

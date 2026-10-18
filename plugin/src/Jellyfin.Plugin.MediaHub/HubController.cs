@@ -1,4 +1,6 @@
 using MediaBrowser.Common.Api;
+using Jellyfin.Data;
+using Jellyfin.Database.Implementations.Enums;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,13 +18,15 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     private HostIdentity identity => provider.GetRequiredService<HostIdentity>();
     private HubStore store => provider.GetRequiredService<HubStore>();
     private SettingsService settings => provider.GetRequiredService<SettingsService>();
-    private PartyService parties => provider.GetRequiredService<PartyService>();
+    private WatchPartyIntegration watchParty => provider.GetRequiredService<WatchPartyIntegration>();
     private PersonalService personal => provider.GetRequiredService<PersonalService>();
     private DeletionQueue deletions => provider.GetRequiredService<DeletionQueue>();
     private MediaCatalog catalog => provider.GetRequiredService<MediaCatalog>();
     private MediaRequests requests => provider.GetRequiredService<MediaRequests>();
     private ExtraMedia extras => provider.GetRequiredService<ExtraMedia>();
     private async Task<Jellyfin.Database.Implementations.Entities.User> Viewer() => identity.Active((await identity.Browser(User)).UserId);
+    private async Task Administrator()
+    { if (!(await Viewer()).HasPermission(PermissionKind.IsAdministrator)) throw new HubError("Jellyfin administrator access is required."); }
     [HttpGet("Storage")]
     public Task<IActionResult> Storage(CancellationToken cancellation) => Safe(async () =>
     {
@@ -49,17 +53,30 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     public Task<IActionResult> ExtraReceipt(string id) => Safe(async () => extras.Receipt(await Viewer(), id));
     [HttpPost("Me/ExtraWatchlist/{kind}/{foreign}")]
     public Task<IActionResult> ExtraFollow(string kind, string foreign, ExternalWatchUpdate update, CancellationToken cancellation) => Safe(async () =>
-    { var viewer = await Viewer(); var recorded = await extras.Follow(viewer, kind, foreign, update.Subscribed, update.Revision, async () => { await identity.Browser(User); }, cancellation); return personal.State(viewer) with { Activity = recorded }; });
+    { var viewer = await Viewer(); var recorded = await extras.Follow(viewer, kind, foreign, update.Subscribed, update.Revision, async () => { await identity.Browser(User); }, cancellation, update.SaveOnly); return personal.State(viewer) with { Activity = recorded }; });
     [HttpGet("Catalog/Library")]
     public Task<IActionResult> Library(string kind = "all", string query = "", int page = 1) => Safe(async () => catalog.Library(await Viewer(), kind, query, page));
     [HttpGet("Catalog/Browse")]
     public Task<IActionResult> Browse(CancellationToken cancellation, string kind = "movie", string query = "", int page = 1) => Safe(async () => await catalog.Browse(await Viewer(), kind, query, page, cancellation));
     [HttpGet("Catalog/{kind}/{id:int}")]
     public Task<IActionResult> Details(string kind, int id, CancellationToken cancellation) => Safe(async () => await catalog.Details(await Viewer(), kind, id, cancellation));
+    [HttpGet("Catalog/{kind}/{id:int}/Poster")]
+    public Task<IActionResult> Poster(string kind, int id, CancellationToken cancellation) => Safe(async () =>
+    {
+        var user = await Viewer(); var card = await catalog.Details(user, kind, id, cancellation);
+        var image = await provider.GetRequiredService<PosterAssets>().Download(card.Poster ?? "", cancellation);
+        var current = await catalog.Details(await Viewer(), kind, id, cancellation);
+        if (current.Poster != card.Poster) throw new HubError("Artwork changed. Load it again explicitly.");
+        Response.Headers["X-Content-Type-Options"] = "nosniff"; Response.Headers["Content-Security-Policy"] = "sandbox; default-src 'none'"; return File(image.Bytes, image.Mime);
+    });
     [HttpPost("Catalog/{kind}/{id:int}/Details")]
     public Task<IActionResult> InteractDetails(string kind, int id, CancellationToken cancellation) => Safe(async () => await catalog.Details(await Viewer(), kind, id, cancellation, true));
     [HttpPost("Catalog/{kind}/{id:int}/Open")]
     public Task<IActionResult> OpenMedia(string kind, int id, CancellationToken cancellation) => Safe(async () => await catalog.Open(await Viewer(), kind, id, cancellation));
+    [HttpGet("Catalog/{kind}/{id:int}/Editions")]
+    public Task<IActionResult> Editions(string kind, int id) => Safe(async () => catalog.Editions(await Viewer(), kind, id));
+    [HttpPost("Catalog/{kind}/{id:int}/Editions/{edition:guid}/Open")]
+    public Task<IActionResult> OpenEdition(string kind, int id, Guid edition) => Safe(async () => catalog.OpenEdition(await Viewer(), kind, id, edition));
     [HttpGet("Requests")]
     public Task<IActionResult> Requests(CancellationToken cancellation, bool all = false, int page = 1) => Safe(async () => await catalog.Requests(await Viewer(), all, page, cancellation));
     [HttpGet("Me/RequestPermissions")]
@@ -82,6 +99,10 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     [HttpGet("Items/{item:guid}/DeletionRequests")]
     public Task<IActionResult> ItemDeletionRequests(Guid item, CancellationToken cancellation) => Safe(async () =>
         await provider.GetRequiredService<IRequestAuthority>().FindOwned(identity.Active((await identity.Browser(User)).UserId), item, cancellation));
+    [HttpGet("Items/{item:guid}/Controls")]
+    public Task<IActionResult> ItemControls(Guid item) => Safe(async () => provider.GetRequiredService<IViewerMedia>().Find(await Viewer(), item) ?? throw new HubError("Item unavailable."));
+    [HttpPost("Items/{item:guid}/Details")]
+    public Task<IActionResult> NativeDetails(Guid item) => Safe(async () => catalog.NativeDetails(await Viewer(), item, true));
     [HttpGet("Deletions")]
     public Task<IActionResult> Deletions() => Safe(async () => deletions.List(identity.Active((await identity.Browser(User)).UserId)));
     [HttpGet("Deletions/{id}/Audit")]
@@ -114,7 +135,8 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     private async Task<IActionResult> Safe(Func<Task<object>> operation)
     {
         Response.Headers["Cache-Control"] = "no-store";
-        try { return Ok(await operation()); }
+        try { var result = await operation(); return result is IActionResult response ? response : Ok(result); }
+        catch (HubError error) when (error.Code == WatchPartyIntegration.UnavailableCode) { return StatusCode(503, new { Error = error.Message, error.Code }); }
         catch (HubError error) { return BadRequest(new { Error = error.Message }); }
         catch { return StatusCode(503, new { Error = "Action not confirmed. Check the result before retrying." }); }
     }
@@ -122,7 +144,7 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     public Task<IActionResult> Status() => Safe(async () =>
     {
         var browser = await identity.Browser(User);
-        return new { Linked = store.IsLinked(browser.UserId), Party = await parties.Status(browser), FeatureParityComplete = false };
+        return new { Linked = store.IsLinked(browser.UserId), WatchParty = watchParty.Status(), Party = watchParty.Status(), Web = provider.GetRequiredService<WebIntegration>().Status(), FeatureParityComplete = false };
     });
     public sealed record Approval(string Code, string DiscordId);
     [HttpPost("Link/Approve")]
@@ -133,36 +155,34 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
         return new { Linked = true };
     });
     public sealed record CreateParty(string Name);
+    // Compatibility tombstones: old clients receive an explicit unavailable result, not
+    // a group operation or consumption/migration of legacy invitations and tickets.
     [HttpPost("Parties")]
-    [Authorize(Policy = Policies.SyncPlayCreateGroup)]
-    public Task<IActionResult> Create(CreateParty request, CancellationToken cancellation) => Safe(async () =>
-    {
-        var browser = await identity.Browser(User);
-        var party = await parties.Create(browser, identity.Active(browser.UserId), request.Name, cancellation);
-        return new { party.Id, GroupId = party.Group, GroupName = party.Name, party.Expires };
-    });
+    public Task<IActionResult> Create(CreateParty request, CancellationToken cancellation) => WatchPartyUnavailable();
     public sealed record JoinParty(string Ticket);
     [HttpPost("Parties/Join")]
-    [Authorize(Policy = Policies.SyncPlayJoinGroup)]
-    public Task<IActionResult> Join(JoinParty request, CancellationToken cancellation) => Safe(async () =>
-        await parties.Join(await identity.Browser(User), request.Ticket, cancellation));
+    public Task<IActionResult> Join(JoinParty request, CancellationToken cancellation) => WatchPartyUnavailable();
     [HttpPost("Parties/{id}/Close")]
-    public Task<IActionResult> Close(string id) => Safe(async () =>
+    public Task<IActionResult> Close(string id) => WatchPartyUnavailable();
+    private Task<IActionResult> WatchPartyUnavailable() => Safe(async () =>
     {
-        parties.Close(await identity.Browser(User), id); return new { Closed = true };
+        await identity.Browser(User);
+        throw watchParty.Unavailable();
     });
     [HttpGet("Me")]
     public Task<IActionResult> Me() => Safe(async () => personal.State(identity.Active((await identity.Browser(User)).UserId)));
     [HttpGet("Me/Notifications")]
-    public Task<IActionResult> Notifications() => Safe(async () => provider.GetRequiredService<NotificationFeed>().List(await Viewer()));
+    public Task<IActionResult> Notifications(CancellationToken cancellation) => Safe(async () => await provider.GetRequiredService<NotificationFeed>().ListAsync(await Viewer(), cancellation));
+    [HttpGet("Me/Notifications/Diagnostics")]
+    public Task<IActionResult> NotificationDiagnostics() => Safe(async () => provider.GetRequiredService<NotificationFeed>().Diagnostics(await Viewer()));
     [HttpPost("Me/Notifications/{id}/Seen")]
     public Task<IActionResult> SeenNotification(string id) => Safe(async () => { provider.GetRequiredService<NotificationFeed>().Seen(await Viewer(), id); return new { Saved = true }; });
-    public sealed record ExternalWatchUpdate(long Revision, bool? Subscribed);
+    public sealed record ExternalWatchUpdate(long Revision, bool? Subscribed, bool SaveOnly = false);
     [HttpPost("Me/Watchlist/{kind}/{id:int}")]
     public Task<IActionResult> ExternalWatch(string kind, int id, ExternalWatchUpdate update, CancellationToken cancellation) => Safe(async () =>
     {
         var viewer = await Viewer();
-        var recorded = await provider.GetRequiredService<WatchlistSync>().Follow(viewer, new(kind, id), update.Subscribed, update.Revision, async () => { await identity.Browser(User); }, cancellation);
+        var recorded = await provider.GetRequiredService<WatchlistSync>().Follow(viewer, new(kind, id), update.Subscribed, update.Revision, async () => { await identity.Browser(User); }, cancellation, update.SaveOnly);
         return personal.State(viewer) with { Activity = recorded };
     });
     [HttpPost("Me/Watchlist/Sync")]
@@ -171,6 +191,17 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
         var viewer = await Viewer();
         return await provider.GetRequiredService<WatchlistSync>().Sync(viewer, async () => { await identity.Browser(User); }, cancellation);
     });
+    [HttpGet("Me/Watchlist/Sync/Issues")]
+    public Task<IActionResult> SyncIssues() => Safe(async () => provider.GetRequiredService<WatchlistSync>().Issues(await Viewer()));
+    [HttpPost("Me/Watchlist/Sync/Review")]
+    public Task<IActionResult> ReviewSync(MediaKey key, CancellationToken cancellation) => Safe(async () => await provider.GetRequiredService<WatchlistSync>().Review(await Viewer(), key, async () => { await identity.Browser(User); }, cancellation));
+    public sealed record SyncAcceptance(string Token);
+    [HttpPost("Me/Watchlist/Legacy/Review")]
+    public Task<IActionResult> ReviewLegacy(CancellationToken cancellation) => Safe(async () => await provider.GetRequiredService<WatchlistSync>().ReviewLegacy(await Viewer(), async () => { await identity.Browser(User); }, cancellation));
+    [HttpPost("Me/Watchlist/Legacy/Accept")]
+    public Task<IActionResult> AcceptLegacy(SyncAcceptance proof, CancellationToken cancellation) => Safe(async () => { await provider.GetRequiredService<WatchlistSync>().AcceptLegacy(await Viewer(), proof.Token, async () => { await identity.Browser(User); }, cancellation); return new { Saved = true }; });
+    [HttpPost("Me/Watchlist/Sync/AcceptRemote")]
+    public Task<IActionResult> AcceptRemoteSync(SyncAcceptance proof, CancellationToken cancellation) => Safe(async () => await provider.GetRequiredService<WatchlistSync>().AcceptRemote(await Viewer(), proof.Token, async () => { await identity.Browser(User); }, cancellation));
     public sealed record PersonalUpdate(long Revision, PersonalPreferences Preferences);
     [HttpPost("Me")]
     public Task<IActionResult> SavePersonal(PersonalUpdate update) => Safe(async () =>
@@ -180,13 +211,16 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     public Task<IActionResult> Bell(Guid item, BellUpdate update) => Safe(async () =>
         personal.Bell(identity.Active((await identity.Browser(User)).UserId), item, update.Subscribed, update.Revision));
     public sealed record WatchlistRemove(long Revision);
+    [HttpPost("Me/Watchlist/{item:guid}/Add")]
+    public Task<IActionResult> Add(Guid item, WatchlistRemove update) => Safe(async () =>
+        personal.Add(identity.Active((await identity.Browser(User)).UserId), item, update.Revision));
     [HttpPost("Me/Watchlist/{item:guid}/Remove")]
     public Task<IActionResult> Remove(Guid item, WatchlistRemove update) => Safe(async () =>
         personal.Remove(identity.Active((await identity.Browser(User)).UserId), item, update.Revision));
     [HttpGet("Settings")]
     [Authorize(Policy = Policies.RequiresElevation)]
-    public Task<IActionResult> Settings() => Safe(async () => { await identity.Browser(User); return settings.Public(); });
+    public Task<IActionResult> Settings() => Safe(async () => { await Administrator(); return settings.Public(); });
     [HttpPost("Settings")]
     [Authorize(Policy = Policies.RequiresElevation)]
-    public Task<IActionResult> Save(SettingsUpdate update) => Safe(async () => { await identity.Browser(User); settings.Update(update); return settings.Public(); });
+    public Task<IActionResult> Save(SettingsUpdate update) => Safe(async () => { await Administrator(); settings.Update(update); return settings.Public(); });
 }

@@ -18,7 +18,7 @@ public sealed class LinkFlow(HubStore store, SettingsService settings, HostIdent
     internal string Pin() { var s = settings.Current; return Hash(string.Join('|', s.PublicJellyfinUrl, s.Features.DiscordApplicationId, s.Features.DiscordClientSecretEncrypted, s.Features.OAuthPkce)); }
     public string Redirect => settings.Current.PublicJellyfinUrl.TrimEnd('/') + "/MediaHub/Link/OAuth/Callback";
     public string HandoffUrl(string handoff) => settings.Current.PublicJellyfinUrl.TrimEnd('/') + "/MediaHub/Link?handoff=" + Uri.EscapeDataString(handoff);
-    public string WebUrl(string handoff) => settings.PartyUrl() + "&hubLink=" + Uri.EscapeDataString(handoff);
+    public string WebUrl(string handoff) => settings.WebUrl() + "&hubLink=" + Uri.EscapeDataString(handoff);
     internal static string CookieName(string state) => "MediaHubLink-" + Hash(state)[..16];
     private static string ProofPurpose(string state, string handoff, string user, string browser, string pin, string expires, string cookie, string status, string discord) =>
         "MediaHub.OAuthProof.v1|" + System.Text.Json.JsonSerializer.Serialize(new { state, handoff, user, browser, pin, expires, cookie, status, discord });

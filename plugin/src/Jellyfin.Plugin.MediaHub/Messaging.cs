@@ -367,6 +367,21 @@ public sealed class Messaging(HubStore store, SettingsService settings, Operator
         return new(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.IsDBNull(4) ? null : r.GetString(4), r.GetString(5), r.GetString(6), r.GetString(7), rich,
             DateTimeOffset.Parse(r.GetString(9)), r.IsDBNull(10) ? null : DateTimeOffset.Parse(r.GetString(10)), r.GetInt32(11) != 0, r.GetString(12), r.IsDBNull(13) ? null : r.GetString(13), r.IsDBNull(15) ? null : r.GetString(15));
     }
+    public async Task<MessageView> Message(OperatorActor actor, string id, CancellationToken cancellation)
+    {
+        Snowflake(id); await operators.Check(actor, cancellation); MessageView row;
+        using (var db = store.Open()) using (var read = HubStore.Command(db, "SELECT i.*,d.state FROM message_inbox i LEFT JOIN message_deliveries d ON d.id=i.delivery WHERE i.id=$0 AND i.created>=$1", id, Time(DateTimeOffset.UtcNow.AddDays(-settings.Current.Features.MessageRetentionDays))))
+        using (var r = read.ExecuteReader()) { if (!r.Read()) throw new HubError("Referenced message is not retained."); row = Project(r); }
+        if (!await Readable(actor, row.Guild, row.Channel, row.Peer, cancellation)) throw new HubError("Conversation access unavailable.");
+        await operators.Check(actor, cancellation); return row;
+    }
+    public async Task<IReadOnlyDictionary<string, long>> Diagnostics(OperatorActor actor, CancellationToken cancellation)
+    {
+        await operators.Check(actor, cancellation); var result = new Dictionary<string, long>();
+        using (var db = store.Open()) using (var read = HubStore.Command(db, "SELECT d.state,COUNT(*) FROM message_deliveries d JOIN message_plans p ON p.id=d.plan WHERE p.actor=$0 AND p.discord=$1 GROUP BY d.state", Actor(actor), actor.Discord))
+        using (var r = read.ExecuteReader()) while (r.Read()) { var state = r.GetString(0); if (state is not ("pending" or "sending" or "sent" or "uncertain" or "blocked")) throw new HubError("Invalid retained delivery state."); result.Add(state, r.GetInt64(1)); }
+        await operators.Check(actor, cancellation); return result;
+    }
     internal async Task<(string Url, string Filename, string Revision)> Asset(OperatorActor actor, string message, string key, CancellationToken cancellation)
     {
         await operators.Check(actor, cancellation); string? guild, peer; string channel, rich;

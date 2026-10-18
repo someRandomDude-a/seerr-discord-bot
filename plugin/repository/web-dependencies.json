@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "targetAbi": "12.2.0",
+  "packages": [
+    {
+      "id": "5e87cc92-571a-4d8d-8d98-d2d4147f9f90",
+      "name": "File Transformation",
+      "assembly": "Jellyfin.Plugin.FileTransformation",
+      "version": "3.0.2.0",
+      "directory": "FileTransformation_3.0.2.0",
+      "sourceUrl": "https://github.com/IAmParadox27/jellyfin-plugin-file-transformation/releases/download/3.0.2.0/Release-12.2.0.zip",
+      "sha256": "b267dc0e09154f242ef9d3201a6ed4fd1dc9594da42ff133400b0ed4ca10b859",
+      "sourceRevision": "2dd4279bc7aedd082de0639278f9142ead229a52"
+    },
+    {
+      "id": "5b6550fa-a014-4f4c-8a2c-59a43680ac6d",
+      "name": "Plugin Pages",
+      "assembly": "Jellyfin.Plugin.PluginPages",
+      "version": "3.0.2.0",
+      "directory": "PluginPages_3.0.2.0",
+      "sourceUrl": "https://github.com/IAmParadox27/jellyfin-plugin-pages/releases/download/3.0.2.0/Release-12.2.0.zip",
+      "sha256": "06eb4d57780490c15b27c3215e6859e4bc1c58deca00cc849842d13914ee0c69",
+      "sourceRevision": "5dab0dbcc25dd1534dd5e4c3263ec5bb94910f0f"
+    }
+  ]
+}

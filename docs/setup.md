@@ -1,6 +1,6 @@
 # Install and configure the Jellyfin plugin
 
-Media Hub runs in Jellyfin **12.x** on **.NET 10**. Users install the plugin ZIP/catalog package,
+Media Hub targets only the **latest stable Jellyfin (currently 12.2.0)** on **.NET 10**. Users install the plugin ZIP/catalog package,
 not a standalone application or development server. The optional Discord Activity is bundled in
 the plugin and uses the existing Jellyfin listener. No additional admin port is required.
 
@@ -10,7 +10,7 @@ the plugin and uses the existing Jellyfin listener. No additional admin port is 
   and not approved for production; automatic deletion must remain off during onboarding.
 - Back up native Jellyfin data and any existing plugin state consistently before maintenance.
 - Have a native Jellyfin administrator account and an ordinary account for permission checks.
-- Have an existing user-facing HTTPS Jellyfin base URL. The tutorial does not create hosting,
+- Have an existing user-facing HTTPS Jellyfin base URL. The plugin does not create hosting,
   change VPN/DNS assignments or expose services for you.
 - For movie/TV requests, configure Seerr's Jellyfin user mappings, request permissions/quotas
   and existing media-service routing. Seerr requests/history remain intact.
@@ -33,26 +33,24 @@ build the documented allowlisted ZIP and use the owned disposable-host harness; 
 the test project's output or replacement Jellyfin/SQLite assemblies.
 
 For ordinary-user navigation/login resume and supported Web-card controls, install Jellyfin-12
-compatible **Plugin Pages** and **File Transformation** builds. The elevated configuration page
+compatible **Plugin Pages** and **File Transformation** builds (see [dependency guidance](../plugin/WEB_DEPENDENCIES.md)). The elevated configuration page
 does not require promoting ordinary users or giving Activity configuration access.
 
-## Configure through the integrated tutorial
+## Configure connections and permissions
 
-Sign in as the administrator, open **Dashboard → Plugins → Media Hub → settings**, and follow
-**Set up Media Hub**. It starts automatically for a new configuration and can be paused,
-resumed or restarted at any time without resetting settings. The real forms appear in its
-connection, messaging, Activity and media-service steps.
+Sign in as the administrator and open **Dashboard → Plugins → Media Hub → settings**.
+Choose a **Settings section**, use field **Help**, and load named folders/profiles from saved
+service connections. Review the structured list of independently approved media servers.
 
-Only explicit **Save plugin settings** and **Save integrations** change configuration.
-Back/Next/Finish do not install the Discord app, enable features, send messages or certify a
-connection test. Finish the manual permission, linking and read-only checks with an ordinary
-account. See [tutorial controls](onboarding.md) and the optional
+Only **Save server settings** changes configuration across all sections. Section/help navigation
+never saves or enables a service. A save does not certify a connection. Complete permission,
+linking and read-only checks with an ordinary account. See [settings controls](onboarding.md) and the
 [field-by-field reference](../plugin/ONBOARDING.md).
 
 Discord connects outward using the application's bot token; leave Interactions Endpoint URL
 blank. Use a server install with `bot` and `applications.commands`, limited channel permissions
 and an explicit allowed-server list. Administrator permission on the Discord account is not
-required. OAuth client secrets are separate from bot tokens; the Activity tutorial covers both
+required. OAuth client secrets are separate from bot tokens; Activity connection help covers both
 redirects, directory URL mapping, human launch permissions and Discord's App Launcher.
 
 ## State and updates

@@ -1,11 +1,9 @@
 # OAuth linking and optional Activity preview
 
-**New installation?** The integrated **Set up Media Hub** tutorial opens in the native plugin
-settings. Its Activity step includes the real OAuth/Activity fields and explains the two
-different secrets, both redirects, permissions, directory mapping,
-Discord's App Launcher/Launch entry point, and the first account link. No `/activity` slash command
-is registered by the native plugin. Pause/resume/restart it at any time without resetting saved
-settings. The [onboarding reference](ONBOARDING.md) is optional additional detail.
+**New installation?** Open native settings → **Account linking and Discord Activity**.
+Field Help and expandable connection details explain the separate secrets, calculated callback,
+SDK placeholder redirect, directory mapping and App Launcher. Only **Save server settings**
+changes configuration. No `/activity` slash command is registered. See the [settings reference](ONBOARDING.md).
 
 These transports have automated safety tests, not completed live Discord/browser acceptance.
 Use a separate **test** Discord application. Do not enable the production bot or change existing

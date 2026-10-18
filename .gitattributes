@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Preserve the exact reviewed upstream SDK assets and their documented SHA-256 values.
+plugin/lib/PrivateSyncPlay.Api-1.1.0/*.dll binary
+plugin/lib/PrivateSyncPlay.Api-1.1.0/*.xml -text
+plugin/lib/PrivateSyncPlay.Api-1.1.0/LICENSE -text

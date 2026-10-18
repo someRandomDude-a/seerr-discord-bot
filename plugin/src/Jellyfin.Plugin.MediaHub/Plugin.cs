@@ -4,6 +4,7 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using MediaBrowser.Model.Plugins;
 using Microsoft.Extensions.DependencyInjection;
+using Jellyfin.Plugin.PrivateSyncPlay.Api;
 
 namespace Jellyfin.Plugin.MediaHub;
 
@@ -22,8 +23,10 @@ public sealed class Plugin : BasePlugin, IHasWebPages
     [
         new() { Name = "mediahub", EmbeddedResourcePath = GetType().Namespace + ".Web.hub.html" },
         new() { Name = "mediahub.js", EmbeddedResourcePath = GetType().Namespace + ".Web.hub.js" },
+        new() { Name = "mediahub.settings.js", EmbeddedResourcePath = GetType().Namespace + ".Web.settings.js" },
         new() { Name = "mediahub.items.js", EmbeddedResourcePath = GetType().Namespace + ".Web.items.js" },
-        new() { Name = "mediahub.messenger.js", EmbeddedResourcePath = GetType().Namespace + ".Web.messenger.js" }
+        new() { Name = "mediahub.messenger.js", EmbeddedResourcePath = GetType().Namespace + ".Web.messenger.js" },
+        new() { Name = "mediahub.watchparty.js", EmbeddedResourcePath = GetType().Namespace + ".Web.watchparty.js" }
     ];
 }
 
@@ -35,7 +38,8 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<HubStore>();
         services.AddSingleton<SettingsService>();
         services.AddSingleton<HostIdentity>();
-        services.AddSingleton<PartyService>();
+        services.AddPrivateSyncPlayClient();
+        services.AddSingleton<WatchPartyIntegration>();
         services.AddSingleton<IViewerMedia, JellyfinViewerMedia>();
         services.AddSingleton<MediaActivity>();
         services.AddSingleton<IRecentActivity>(provider => provider.GetRequiredService<MediaActivity>());
@@ -50,6 +54,7 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<MediaRequests>();
         services.AddSingleton<ServiceHttp>();
         services.AddSingleton<ArrRegistry>();
+        services.AddSingleton<ConfigurationDiscovery>();
         services.AddSingleton<ExtraMedia>();
         services.AddSingleton<OperatorAuthority>();
         services.AddSingleton<IDiscordOAuth, DiscordOAuth>();
@@ -63,10 +68,14 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<WatchlistSync>();
         services.AddSingleton<INotificationStatus, NotificationStatus>();
         services.AddSingleton<NotificationFeed>();
+        services.AddSingleton<NotificationSignals>();
+        services.AddSingleton<PosterAssets>();
+        services.AddSingleton<NativePlayback>();
         services.AddHostedService<MediaMaintenance>();
         services.AddSingleton<DiscordHost>();
         services.AddHostedService(provider => provider.GetRequiredService<DiscordHost>());
         services.AddSingleton<IPluginPageBridge, PluginPageBridge>();
+        services.AddSingleton<WebIntegration>();
         services.AddHostedService<ItemControlsRegistration>();
         services.AddSingleton<PageRegistration>();
         services.AddHostedService(provider => provider.GetRequiredService<PageRegistration>());

@@ -2,17 +2,22 @@
 
 Media Hub is an **in-process C#/.NET 10 plugin** for Jellyfin 12. It uses Jellyfin's existing
 authenticated pages and listener, with no additional runtime, sidecar or admin port.
-It is **not yet a feature-complete replacement**. The [implementation plan](IMPLEMENTATION_PLAN.md)
+It is **not yet feature-complete**. The [implementation plan](IMPLEMENTATION_PLAN.md)
 tracks the remaining Discord, Activity, media and safety features.
+Native Web controls require separately installed, Jellyfin-12.2-compatible **File Transformation**
+and **Plugin Pages**. See [dependency setup and upstream compatibility guidance](WEB_DEPENDENCIES.md).
+The latest security, Discord-surface and personal-navigation changes are recorded in
+[REMEDIATION.md](REMEDIATION.md), with separate live-service acceptance limits.
+The [completion handoff](COMPLETION.md) lists local verification tools and the exact external
+access/human acceptance needed for the remaining gates; none is silently waived.
 
-**First installation? Open Media Hub's settings as the Jellyfin administrator.** The integrated
-**Set up Media Hub** tutorial opens automatically, walks through one step at a time and places the
-actual configuration forms in the relevant steps. It covers Discord app creation, IDs/secrets,
-least-privilege permissions, account linking, optional inbox intents and web Activity setup.
-**Pause / Resume / Restart tutorial** remains available at any time without resetting settings or
-links; only explicit Save actions change configuration. Progress is browser-local, scoped to the
-native user/server/page, and stores no credentials or form drafts. The [onboarding reference](ONBOARDING.md)
-is supplementary, not required reading before setup.
+**First installation? Open Media Hub's settings as the Jellyfin administrator.** The conventional
+**Server connections and permissions** workspace provides section/mode dropdowns, contextual Help,
+expandable Discord/OAuth details, saved-service profile/folder choices and structured destination
+approval. One **Save server settings** action saves all sections; switching sections never saves.
+Draft review, explicit credential removal, disconnect controls and confirmed reload replace the
+walkthrough. Nothing is auto-enabled and no progress/drafts/secrets enter browser storage.
+The [settings reference](ONBOARDING.md) is supplementary to the in-place help.
 
 **Fresh installation:** users create their own links/settings. Existing upstream Seerr requests
 are retained, not automatically deleted or recreated.
@@ -28,7 +33,7 @@ Use one plugin instance per Discord application token.
   native-preview schema checks reject unrelated files; unknown future schemas and corrupt
   state disable the affected plugin functions rather than resetting data. Existing databases
   are checked read-only before any migration. Linked state directories/files are rejected.
-- No persisted Jellyfin Web edits. Optional Plugin Pages navigation is registered in memory
+- No persisted Jellyfin Web edits. Required Plugin Pages navigation is registered in memory
   and removed only for this plugin's GUID-scoped entry. No library refresh, account creation,
   media deletion, settings change or SyncPlay group change runs merely on install/start/stop.
 - Stateful services initialize lazily behind plugin error boundaries. Discord startup,
@@ -48,9 +53,23 @@ isolated Docker fixture; see [ACCEPTANCE.md](ACCEPTANCE.md). Catalog/upgrade/pro
 acceptance remains required. No in-process extension can
 honestly guarantee zero possible host impact: assembly-loading, shared-runtime/resource faults,
 Jellyfin's normal plugin bookkeeping and required restarts remain host-level concerns. These
-are reasons to test a preview first, not permission to modify host databases or settings.
+  are reasons to test a preview first, not permission to modify host databases or settings.
+
+Native UI follows Jellyfin Web component/label/container/list patterns with no independent
+stylesheet. See [skin compatibility](SKINNING.md) for the conventions, Activity isolation and
+remaining real-skin acceptance limits.
 
 ## Implemented
+
+- Native top-bar watchlist navigation and a notification bell with unread count; a focused personal
+  watchlist page, separate Add/Subscribe actions, removal-proposal markers and explicit Yes/No consent.
+  The global bootstrap requires compatible File Transformation, and ordinary-user page navigation
+  requires Plugin Pages. It reuses the visible Jellyfin 12 toolbar's themed classes, not an independent
+  native stylesheet. Opening notifications never votes, marks updates read or changes native activity.
+- Schema-13 complete-set activity/watchlist/request protection with private anti-rollback generations;
+  retained unsigned watches require review, older request write plans stay read-only, and legacy
+  removal activity is quarantined for a full configured recent-activity window. Restore matching
+  whole-directory stopped backups rather than deleting authentication records.
 
 - Explicit item activity through `/hub-item`, `/hub-follow`, watchlist subscription and
   the authenticated item-activity API. Uses Jellyfin's timestamp-only user-data DTO;
@@ -87,17 +106,11 @@ are reasons to test a preview first, not permission to modify host databases or 
   identities using one-use state, optional PKCE and a Secure/HttpOnly callback cookie. Callback
   GET only records proof; a signed-in explicit POST confirms the displayed accounts. Forwarded
   authorization URLs without the original cookie cannot produce proof. Real-browser acceptance remains.
-- Initial SyncPlay invitation plumbing: the creator's actual authenticated browser session creates
-  the native group. `/watchparty` posts a generic server/channel join button;
-  `/watchparty recipient:USER` sends a generic DM. Each click rechecks the audience and
-  linked account before privately issuing a two-minute, account-bound, one-use join URL.
-- Joining targets the opening browser's real session and native library/SyncPlay policy.
-  The UI waits for native `GroupJoined`, not just HTTP success. Closing invitations does
-  not destroy a native group or eject participants. Invitations fail closed after native
-  groups disappear. **Exact creator-session membership still needs hardening**; a participant
-  username alone does not prove the original player remains joined. **Invitations now fail
-  closed without an exact-session membership verifier.** Jellyfin 12's public group DTO does
-  not provide this proof; no production verifier is registered and native SyncPlay remains usable.
+- Native watch parties use the public **Private SyncPlay SDK 1.1.0** with the separately installed
+  **0.1.5** provider. Exact-player status, private creation with a one-use signed-in invitation,
+  owner invitation/revocation and explicit leave/end are integrated without a duplicate engine.
+  Missing/unhealthy providers fail safely; Activity and the old Discord invitation flow cannot
+  impersonate a player. See [WATCHPARTY.md](WATCHPARTY.md) for bearer-link limits and acceptance gaps.
 - Local per-user notification preferences, explicit Discord DM opt-in (off by default),
   global mute and a plugin-owned watchlist/subscriptions API and Jellyfin page. Subscribe
   adds membership atomically; unsubscribe keeps the title; Remove is separate. No favorites
@@ -107,8 +120,9 @@ are reasons to test a preview first, not permission to modify host databases or 
   the matching Seerr user's watchlist using a pinned mapping, complete stable reads, three-way
   baselines and durable revisioned intents. Unsubscribe retains membership. Ambiguous writes
   are read-reconciled, not blindly resent; reasserting a membership choice is an explicit new intent.
-  Music/books remain plugin-local. Existing native-preview watches made before this increment
-  need their bell reasserted to create an upstream intent.
+  Music/books remain plugin-local. Explicit Sync imports older accessible movie/series watches,
+  preserving subscriptions and visible aliases; background updates do not import those watches.
+  Uncertain sync review can adopt current Seerr membership locally without resending.
 - User-scoped Seerr movie/TV discovery, search, details, request history, permission/quota
   projections and confirmed requests, plus native accessible movie/TV/music/book library browsing.
   Requests use `X-API-User` after live native/Seerr mapping and `auth/me` verification. Only
@@ -119,15 +133,23 @@ are reasons to test a preview first, not permission to modify host databases or 
 - Native Discord `/dashboard`, `/search`, `/discover`, `/library`, `/requests`, `/watchlist`,
   `/deletions`, `/notifications` and `/link` navigation. Opaque controls bind both identities,
   the exact private message and a ten-minute view lifetime; one click invalidates the old view.
-  Navigation edits one response. Full rich poster galleries, all watchlist pages and advanced
-  season/profile selection in Discord still need completion; Jellyfin pages support season selection.
-- Optional in-memory File Transformation bootstrap adds subscribe/proposal controls to supported
-  Jellyfin Web cards. No persistent web-file edits; no automatic mobile/TV injection is claimed.
+  Navigation edits one response. Paginated poster galleries, watchlists/removals/updates, selected
+  TV seasons, book/native editions and receipt refresh are connected. Seerr still owns request profiles.
+- Required in-memory File Transformation bootstrap adds subscribe/proposal controls to supported
+  Jellyfin Web cards and recognized native detail pages. No persistent web-file edits; no automatic mobile/TV injection is claimed.
   Movie/show proposal controls discover only the user's verified owned requests and require confirmation.
 - Per-user availability/status feed with first-snapshot suppression, displayed-status deduplication,
   opt-in at-most-once Discord delivery, mute/access rechecks, read markers and bounded retention.
   A minute-cycle worker has a 45-second work budget and bounded reads; outages do not become
-  availability transitions. This is polling, not a completed webhook/music/book notification port.
+  availability transitions. Existing own Seerr requests and pinned local music/book requests have
+  bounded rotating status scans. Optional HMAC notification-only wake-ups never trust payload states
+  or replace polling. Personal and operator diagnostics expose scoped delivery counts.
+- Real same-account native player destinations, explicit previews/confirmation and authenticated
+  once-only command receipts (schema 12). Cancellation/receipt review never retries. Activity cannot
+  invoke native player routes; command acceptance is not playback confirmation. Folders/series stay
+  in the real Jellyfin player for individual-item selection. See [PLAYBACK.md](PLAYBACK.md).
+- Explicit-load native/Activity PNG/JPEG posters use a fixed public artwork origin without credentials,
+  redirects or relaxed CSP, with byte/dimension/concurrency limits and access revalidation.
 - Versioned plugin-owned SQLite schema and restart persistence. Unknown future schemas are
   rejected rather than reset; native-preview upgrades retain records. Old incompatible native
   links/proofs require explicit reapproval, never silent replay. It never opens another
@@ -156,15 +178,16 @@ are reasons to test a preview first, not permission to modify host databases or 
 | Feature | Status |
 | --- | --- |
 | Login-resuming linking | Dual-identity OAuth/cookie proof, explicit completion and opaque resume coded/tested; live browser acceptance remains |
-| Real-browser/Discord SyncPlay acceptance and exact host-player ownership | Invitations blocked without supported exact-session proof |
-| Native media catalog/requests/quotas | Movie/TV API, Jellyfin page and initial private Discord controls implemented; rich galleries/advanced defaults remain |
-| Seerr identity and two-way watchlists | Scoped verified mapping, stable reads and durable reconciliation implemented; multi-edition/card reconciliation needs broader coverage |
+| Private SyncPlay companion integration | Typed native creation, invites, owner moderation/policy and credential-free handoff implemented; live/concurrent-client acceptance remains |
+| Native media catalog/requests/quotas | APIs, native/Activity artwork, Discord galleries, season/edition controls and receipt refresh implemented; live provider/client acceptance remains |
+| Seerr identity and two-way watchlists | Scoped mapping, stable reads, visible aliases, legacy import and reviewed no-retry recovery implemented; live concurrency acceptance remains |
 | Live storage, health and complete Arr discovery | Path/key-free projections implemented; real-service and broader UI acceptance remain |
 | Lidarr/Readarr music/books requests and limits | Selected-item/edition plans, limits and receipts implemented; real-service acceptance remains |
-| Personal watchlist subscription controls | Local/external API, page and supported Web-card controls implemented; native detail/mobile/TV extension coverage remains |
+| Personal watchlist subscription controls | Local/external API, page and supported Web card/detail controls implemented; other client/skin acceptance remains |
 | Shared deletion queue and consent | Arr-only execution/cleanup, private inbox and opt-in DMs implemented; automatic removal defaults off; real-service acceptance remains |
-| Notifications and hooks | Availability/status polling/feed and opt-in Discord sends implemented; hooks and full request/music/book coverage remain |
-| Rich private messenger, attachments, confirmed announcements, auditing/retention | Core services/native UI implemented; live Discord acceptance and navigation polish remain |
+| Notifications and hooks | Own requests/subscriptions, rotating music/book status, optional signed read-only hints and scoped diagnostics implemented; live signing-producer/provider acceptance remains |
+| Rich private messenger, attachments, confirmed announcements, auditing/retention | Services, conversation/mention/retained-reply navigation and operator diagnostics implemented; live Discord acceptance remains |
+| Real native player destinations | Own live capable sessions, explicit once-only previews/receipts and manual uncertainty review implemented; real-device/media acceptance remains |
 | Discord Activity and validated cross-origin host-theme bridge | Bundled OAuth/shared-service adapter and color-only host bridge implemented; live SDK/proxy acceptance remains |
 
 `FeatureParityComplete` remains false. Unit tests and an installable ZIP do not establish
@@ -183,7 +206,7 @@ https://somerandomdude-a.github.io/seerr-discord-bot/manifest.json
 
 1. Confirm the HTTPS URL returns the catalog JSON and its referenced release ZIP exists.
 2. In Jellyfin **Dashboard → Plugins → Repositories**, add that manifest URL (not the Git URL).
-3. Install **Media Hub (Preview)** from the catalog on a test Jellyfin 12 host, then restart.
+3. Install **Media Hub (Preview)** from the catalog on latest stable test Jellyfin (currently 12.2.0), then restart.
 4. Install compatible Plugin Pages/File Transformation for the ordinary-user page.
 5. Configure the external Jellyfin HTTPS base URL (including any base path), allowed guild
    IDs and a **test** Discord token in the elevated settings section. Discord is off by default.
@@ -195,7 +218,12 @@ changed and no new public/LAN port is needed.
 ## Build and test
 
 Requires **.NET 10 SDK** and **Node 22.12+** for browser tests and the bundled Activity build.
-The installed plugin needs only its Jellyfin host runtime. The default API baseline is Jellyfin 12.0.0.
+The installed plugin needs its Jellyfin host runtime. Only the latest stable Jellyfin, currently
+12.2.0, is targeted; older/unreviewed API overrides are rejected. Optional watch parties additionally
+require the matching Private SyncPlay provider. Review the pinned API/SDK/catalog ABI together when
+a new stable Jellyfin is released; no floating dependency or older-version fallback is used.
+CI/release checks compare the reviewed release tag with Jellyfin's latest stable release and fail
+closed on drift or lookup failure instead of silently publishing an older target or auto-upgrading it.
 
 ```sh
 dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release
@@ -209,7 +237,7 @@ npm run build --prefix plugin/activity
 Build a local preview package (use a new/empty repository output directory each time):
 
 ```sh
-dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release -p:JellyfinVersion=12.0.0 -p:RequireActivityBundle=true -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -o plugin/artifacts/build
+dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release -p:RequireActivityBundle=true -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -o plugin/artifacts/build
 dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --input plugin/artifacts/build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
 ```
 
@@ -228,8 +256,8 @@ Do not install the test application's build output into Jellyfin.
    to host both; this workflow owns the Pages root.
 2. Run **Publish Jellyfin plugin repository** with a new four-part version (for example
    `0.1.0.0`), or push its `plugin-v0.1.0.0` tag.
-3. The workflow tests both API versions and the independent browser suite, stamps/builds the
-   baseline assembly, preserves catalog history from the highest published plugin release,
+3. The workflow tests the latest stable API target and the independent browser suite, stamps/builds the
+   matching assembly, preserves catalog history from the highest published plugin release,
    creates an immutable **prerelease**, downloads/verifies its ZIP and then deploys Pages.
    Missing/corrupt prior history fails closed, even if Pages is unavailable.
 4. Verify the live manifest and install its downloaded ZIP on a test Jellyfin. Upstream-host

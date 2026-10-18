@@ -43,6 +43,14 @@ public sealed class PersonalTests : IDisposable
         Assert.Empty(personal.Remove(owner, item, off.Revision).Watchlist);
     }
     [Fact]
+    public void AddToWatchlistDoesNotForceOrEraseTheIndependentNotificationChoice()
+    {
+        var saved = personal.Add(owner, item, 0); Assert.False(Assert.Single(saved.Watchlist).Subscribed);
+        var subscribed = personal.Bell(owner, item, true, saved.Revision); Assert.True(Assert.Single(subscribed.Watchlist).Subscribed);
+        var again = personal.Add(owner, item, subscribed.Revision); Assert.True(Assert.Single(again.Watchlist).Subscribed);
+        Assert.Empty(personal.State(other).Watchlist);
+    }
+    [Fact]
     public void DisablingUnknownBellDoesNotCreateMembershipAndMuteDoesNotEraseIt()
     {
         var off = personal.Bell(owner, item, false, 0); Assert.Empty(off.Watchlist);

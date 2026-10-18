@@ -1,11 +1,11 @@
 # Media Hub plugin implementation plan
 
-Updated 16 October 2026. This document defines the plugin's architecture, supported effects
+Updated 18 October 2026. This document defines the plugin's architecture, supported effects
 and remaining implementation/verification work. It is not a production-readiness claim.
 
 ## Product and architecture
 
-- Target Jellyfin **12 / .NET 10**. The plugin owns its Discord gateway, application services,
+- Target only latest stable Jellyfin **12.2.0 / .NET 10**. The plugin owns its Discord gateway, application services,
   cancellable background workers, authenticated native pages, API routes and bundled Activity.
   It does not spawn processes or install an additional runtime service/admin listener.
 - Native Jellyfin user/token/session/library services are authoritative. Discord OAuth proves
@@ -24,14 +24,17 @@ and remaining implementation/verification work. It is not a production-readiness
 
 ## First-install setup and presentation
 
-- A fresh configuration automatically starts **Set up Media Hub** for a native administrator.
-  Present one step at a time with the actual configuration forms, clear manual checks and
-  explicit Save actions. Back/Next/Finish never enable a service or claim a verified connection.
+- A native administrator uses a conventional settings workspace, with section/mode dropdowns,
+  contextual help and one explicit Save action covering all sections. Navigation/help never enable
+  a service or claim a verified connection. Show a secret-free list of all unsaved field names.
 - Cover Discord app creation/installation, least-privilege permissions, IDs/secrets, server
   allowlisting, Seerr mapping, optional intents/messaging, OAuth, Activity mapping and account linking.
-- Pause/resume/restart must remain available without resetting settings, credentials, links or
-  current drafts. Browser-local progress is version/step/completion metadata only, scoped to the
-  native user/server/page; never persist credentials or draft configuration there.
+- Keep the original form controls and drafts when switching sections. Explicit reload confirms
+  draft discard; page/account/access changes clear private configuration. Do not store draft settings
+  or progress in browser storage. Secret keep/replace/remove semantics are explicit and confirmed.
+- Discover named roots/profiles only through saved service addresses/keys. Seerr destination discovery
+  must not contact or auto-approve discovered Arr addresses; each exact destination requires independent
+  review and an explicit add/save. Keep destructive features off during setup.
 - Inherit Jellyfin components, theme and custom CSS. Do not add a separate theme selector.
   Activity is a different origin: copy only validated color preferences, not arbitrary styles,
   fonts, credentials or a privileged iframe of the native host.
@@ -104,9 +107,10 @@ and remaining implementation/verification work. It is not a production-readiness
 - Activity sessions are short-lived and memory-only. Verify app/scopes/current allowed-guild membership
   and the linked native account. Never expose native bearer credentials, host configuration or
   synthetic/native-player impersonation routes through the Activity adapter.
-- Use actual native player sessions and supported SyncPlay events. Exact original creator-session
-  membership is mandatory for invitations; public participant names are insufficient. With no supported
-  proof provider registered, invitations stay blocked. Closing invitations does not eject participants.
+- Use the matching public Private SyncPlay SDK 1.1 through one typed integration boundary,
+  with no direct SyncPlay orchestration/fallback or guessed provider API. The companion owns playback,
+  admission and confirmed joins; Media Hub verifies exact native actors, expected parties and ownership.
+  Retain legacy records inertly; do not redeem or auto-migrate old invitations. See [WATCHPARTY.md](WATCHPARTY.md).
 
 ## Persistence, resources and release
 
@@ -127,13 +131,15 @@ and remaining implementation/verification work. It is not a production-readiness
 
 ## Remaining work and acceptance
 
-[FEATURES.md](FEATURES.md) is the detailed backlog. Remaining gates include native Discord galleries/
-navigation, request/notification hooks, watchlist alias/concurrency/recovery cases, Activity polish,
-supported exact-session SyncPlay proof and live provider/client acceptance.
+[FEATURES.md](FEATURES.md) separates connected code paths, explicit bounds and remaining acceptance.
+Galleries/seasons/editions, native-player destinations and once-only receipts, signed notification-only
+wake-ups, own-request coverage, watchlist alias/import/reviewed recovery, messenger navigation and owner
+moderation/native handoff now have implementations. Provider/client, concurrency and skin acceptance
+still block completion; forwardable invitations cannot become recipient-bound without provider support.
 
 Retain native/browser regression coverage for authorization and stale identities, malformed input,
 interrupted persistence, schema upgrades, forwarded/replayed proofs, restricted libraries, consent/
-aging/delay changes, ambiguous external writes, cleanup-only recovery and tutorial lifecycle. Test the
+aging/delay changes, ambiguous external writes, cleanup-only recovery and settings/draft lifecycle. Test the
 downloaded ZIP on Jellyfin with companion plugins, base paths, themes and real playback concurrency.
 
 The isolated Jellyfin 12.2 local-ZIP install/restart/native-uninstall/reinstall evidence is limited to

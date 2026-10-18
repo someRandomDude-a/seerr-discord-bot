@@ -28,7 +28,10 @@ public sealed partial class DiscordHost
             if (image is not null && MessageAssets.Allowed(image)) { var key = "embed-" + i + "-image"; row["image"] = key; assets[key] = new JsonObject { ["url"] = image, ["filename"] = "image" }; }
             embeds.Add(row); i++;
         }
-        return new JsonObject { ["attachments"] = attachments, ["embeds"] = embeds, ["assets"] = assets, ["bot"] = message.Author.IsBot };
+        var mentions = new JsonArray(); foreach (var user in message.MentionedUsers.Take(25)) mentions.Add(new JsonObject { ["id"] = user.Id.ToString(), ["name"] = Text(user.GlobalName ?? user.Username, 160) });
+        var reply = message is SocketUserMessage replyMessage ? replyMessage.Reference : null;
+        return new JsonObject { ["attachments"] = attachments, ["embeds"] = embeds, ["assets"] = assets, ["bot"] = message.Author.IsBot, ["mentions"] = mentions,
+            ["reply"] = reply?.MessageId.IsSpecified == true ? new JsonObject { ["id"] = reply.MessageId.Value.ToString(), ["channel"] = reply.ChannelId.ToString() } : null };
     }
     private Task ReceiveMessage(SocketMessage message)
     {

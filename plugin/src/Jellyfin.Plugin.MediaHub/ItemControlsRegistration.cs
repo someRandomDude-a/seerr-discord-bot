@@ -6,8 +6,9 @@ using Newtonsoft.Json.Linq;
 namespace Jellyfin.Plugin.MediaHub;
 
 /// <summary>Transforms the served response only; never edits Jellyfin Web files.</summary>
-public sealed class ItemControlsRegistration(ILogger<ItemControlsRegistration> log) : IHostedService
+public sealed class ItemControlsRegistration(ILogger<ItemControlsRegistration> log, WebIntegration? dependencies = null) : IHostedService
 {
+    private readonly WebIntegration integrations = dependencies ?? new();
     private static readonly Guid Id = Guid.Parse("c70297bf-77bd-4ad4-93c9-f67598519777");
     private Type? bridge;
     private bool registered;
@@ -29,21 +30,28 @@ public sealed class ItemControlsRegistration(ILogger<ItemControlsRegistration> l
     {
         try
         {
-            bridge = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("Jellyfin.Plugin.FileTransformation.PluginInterface")).FirstOrDefault(t => t is not null);
-            var register = bridge?.GetMethod("RegisterTransformation", BindingFlags.Public | BindingFlags.Static, [typeof(JObject)]);
-            if (register is null || cancellationToken.IsCancellationRequested) return Task.CompletedTask;
-            register.Invoke(null, [JObject.FromObject(new { id = Id, fileNamePattern = @"(?:^|[\\/])index\.html$", callbackAssembly = GetType().Assembly.FullName,
-                callbackClass = GetType().FullName, callbackMethod = nameof(Transform) })]);
+            bridge = integrations.TransformationApi();
+            if (bridge is null || integrations.PagesApi() is null || cancellationToken.IsCancellationRequested)
+            {
+                integrations.Unavailable(WebIntegration.TransformationId);
+                log.LogWarning("Media Hub requires ABI-compatible File Transformation >= {TransformationMinimum} and Plugin Pages >= {PagesMinimum}. Web controls were not registered; the host is unchanged.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
+                return Task.CompletedTask;
+            }
+            // Share Plugin Pages' exact index.html pipeline. File Transformation selects
+            // exact keys before regex keys; a separate regex would be shadowed by it.
+            WebIntegration.Register(bridge, true, JObject.FromObject(new { id = Id, fileNamePattern = "index.html", callbackAssembly = GetType().Assembly.FullName,
+                callbackClass = GetType().FullName, callbackMethod = nameof(Transform) }));
             registered = true;
+            integrations.Registered(WebIntegration.TransformationId);
         }
-        catch { log.LogWarning("Media Hub item controls unavailable. Jellyfin Web remains unchanged."); }
+        catch { integrations.Unavailable(WebIntegration.TransformationId, true); log.LogWarning("Media Hub dependency registration failed. Check the required native Web plugins and restart Jellyfin; no host files were edited."); }
         return Task.CompletedTask;
     }
     public Task StopAsync(CancellationToken cancellationToken)
     {
         try { if (registered) bridge?.GetMethod("RemoveTransformation", [typeof(Guid)])?.Invoke(null, [Id]); }
         catch { log.LogWarning("Media Hub item-control registration cleanup failed."); }
-        finally { registered = false; }
+        finally { registered = false; integrations.Unavailable(WebIntegration.TransformationId); }
         return Task.CompletedTask;
     }
 }

@@ -15,6 +15,17 @@ public sealed class MessagingTests
     private static MessageTarget Channel(string id = "123") => new("channel", id, "555");
     private static Messaging Service(FeatureFixture f, FakeDiscord transport) => new(f.Store, f.Settings, f.Operators, transport);
     [Fact]
+    public async Task ReferencedMessageNavigationRechecksCurrentOperatorAndChannelPermissions()
+    {
+        using var f = new FeatureFixture(); var transport = new FakeDiscord(); var messages = Service(f, transport);
+        var view = new MessageView("987", "43", "Sender", "555", "Server", "123", "channel", "retained reference", new JsonObject(), DateTimeOffset.UtcNow, null, false, "in", null, null);
+        messages.Receive(view, new JsonObject { ["reply"] = new JsonObject { ["id"] = "986", ["channel"] = "123" } }, false, true, false);
+        Assert.Equal("retained reference", (await messages.Message(f.Actor, "987", default)).Content);
+        transport.Denied = true; await Assert.ThrowsAsync<HubError>(() => messages.Message(f.Actor, "987", default));
+        transport.Denied = false; f.Update(f.Features(operators: [])); await Assert.ThrowsAsync<HubError>(() => messages.Message(f.Actor, "987", default));
+        Assert.Equal(0, transport.Sends); f.Data.VerifyNoOtherCalls();
+    }
+    [Fact]
     public async Task NativeAdministrationDoesNotGrantOperatorAccessAndRevocationIsLive()
     {
         using var f = new FeatureFixture(); f.User.SetPermission(PermissionKind.IsAdministrator, true); f.Update(f.Features(operators: [])); var transport = new FakeDiscord(); var messages = Service(f, transport);

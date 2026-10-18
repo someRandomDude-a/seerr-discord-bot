@@ -30,27 +30,31 @@ public sealed class MediaRequests(HubStore store, SeerrBridge bridge, MediaCatal
         var token = HubStore.Nonce(); var expires = DateTimeOffset.UtcNow.AddMinutes(10);
         await scope.Verify(cancellation); catalog.RequireAccess(user, kind, id);
         using var db = store.Open(); using var tx = db.BeginTransaction();
+        settings.Protection.Check(db, tx, "requests");
         using var expire = HubStore.Command(db, "UPDATE request_operations SET state='expired' WHERE user=$0 AND state='prepared' AND expires<=$1", user.Id.ToString("N"), DateTimeOffset.UtcNow.ToString("O")); expire.Transaction = tx; expire.ExecuteNonQuery();
         using var duplicate = HubStore.Command(db, "SELECT 1 FROM request_operations WHERE user=$0 AND origin=$1 AND seerr_id=$2 AND kind=$3 AND external_id=$4 AND state IN ('prepared','sending','uncertain')", user.Id.ToString("N"), scope.Viewer.Origin, scope.Viewer.Id, kind, id); duplicate.Transaction = tx;
         if (duplicate.ExecuteScalar() is not null) throw new HubError("A request is pending or unconfirmed. Check its status before trying again.");
         using var insert = HubStore.Command(db, "INSERT INTO request_operations VALUES($0,$1,$2,$3,$4,$5,$6,'prepared',NULL,$7)", token, user.Id.ToString("N"), scope.Viewer.Origin, scope.Viewer.Id, kind, id, settings.Protect(body.ToJsonString(), Purpose(token, user, scope.Viewer.Origin, scope.Viewer.Id, kind, id, expires.ToString("O"))), expires.ToString("O"));
-        insert.Transaction = tx; insert.ExecuteNonQuery(); tx.Commit();
+        insert.Transaction = tx; insert.ExecuteNonQuery(); settings.Protection.Seal(db, tx, "requests"); tx.Commit();
         return new(token, details["title"]?.GetValue<string>() ?? details["name"]?.GetValue<string>() ?? "Untitled", expires);
     }
     public RequestReceipt Receipt(User user, string id)
     {
+        settings.Protection.Check("requests");
         using var db = store.Open(); using var read = HubStore.Command(db, "SELECT state,result FROM request_operations WHERE id=$0 AND user=$1", id, user.Id.ToString("N"));
         using var r = read.ExecuteReader(); if (!r.Read()) throw new HubError("Request confirmation unavailable.");
         return new(id, r.GetString(0), r.IsDBNull(1) ? null : int.Parse(r.GetString(1)));
     }
     public RequestReceipt Cancel(User user, string id)
     {
-        using var db = store.Open(); using var cancel = HubStore.Command(db, "UPDATE request_operations SET state='cancelled' WHERE id=$0 AND user=$1 AND state='prepared'", id, user.Id.ToString("N"));
-        if (cancel.ExecuteNonQuery() != 1) throw new HubError("Only an unsent request plan can be cancelled. Check Seerr for sent or uncertain requests.");
+        var changed = settings.Protection.Update("requests", (db, tx) => { using var cancel = HubStore.Command(db, "UPDATE request_operations SET state='cancelled' WHERE id=$0 AND user=$1 AND state='prepared'", id, user.Id.ToString("N")); cancel.Transaction = tx; return cancel.ExecuteNonQuery(); });
+        if (changed != 1) throw new HubError("Only an unsent request plan can be cancelled. Check Seerr for sent or uncertain requests.");
         return Receipt(user, id);
     }
     public async Task<RequestReceipt> Confirm(User user, string id, Func<Task> verifyActor, CancellationToken cancellation)
     {
+        settings.Protection.Check("requests");
+        if (settings.Protection.LegacyRequest(id)) throw new HubError("Legacy request authorization is read-only. Inspect Seerr and prepare a new explicit selection; no retry was sent.");
         using var scope = await bridge.Open(user, cancellation);
         string payload, kind; int external;
         using (var db = store.Open())
@@ -83,9 +87,8 @@ public sealed class MediaRequests(HubStore store, SeerrBridge bridge, MediaCatal
         else if (retained.ContainsKey("seasons")) throw new HubError("A movie request cannot contain TV seasons.");
         if (!(body["is4k"]!.GetValue<bool>() ? scope.Can(kind == "movie" ? 1024 | 2048 : 1024 | 4096) : scope.Can(kind == "movie" ? 32 | 262144 : 32 | 524288))) throw new HubError("Seerr request permission was revoked.");
         // The server enforces current quotas, profiles, permissions and season availability via X-API-User.
-        using (var db = store.Open())
-        using (var claim = HubStore.Command(db, "UPDATE request_operations SET state='sending',payload='' WHERE id=$0 AND user=$1 AND state='prepared' AND expires>$2", id, user.Id.ToString("N"), DateTimeOffset.UtcNow.ToString("O")))
-            if (claim.ExecuteNonQuery() != 1) return Receipt(user, id);
+        var claimed = settings.Protection.Update("requests", (db, tx) => { using var claim = HubStore.Command(db, "UPDATE request_operations SET state='sending',payload='' WHERE id=$0 AND user=$1 AND state='prepared' AND expires>$2", id, user.Id.ToString("N"), DateTimeOffset.UtcNow.ToString("O")); claim.Transaction = tx; return claim.ExecuteNonQuery(); });
+        if (claimed != 1) return Receipt(user, id);
         string state = "uncertain"; int? requestId = null;
         try
         {
@@ -96,8 +99,7 @@ public sealed class MediaRequests(HubStore store, SeerrBridge bridge, MediaCatal
             requestId = result["id"]!.GetValue<int>(); if (requestId <= 0) throw new HubError("Invalid request receipt."); state = "completed";
         }
         catch { /* Uncertain writes are never automatically replayed, including server-side denial after claim. */ }
-        using (var db = store.Open())
-        using (var save = HubStore.Command(db, "UPDATE request_operations SET state=$0,result=$1 WHERE id=$2 AND state='sending'", state, requestId?.ToString(), id)) save.ExecuteNonQuery();
+        settings.Protection.Update("requests", (db, tx) => { using var save = HubStore.Command(db, "UPDATE request_operations SET state=$0,result=$1 WHERE id=$2 AND state='sending'", state, requestId?.ToString(), id); save.Transaction = tx; return save.ExecuteNonQuery(); });
         ActivityReceipt? recorded = null;
         if (state == "completed")
             try { var matches = catalog.Matches(user, kind, external); if (matches.Count == 1) recorded = activity.Record(user, matches[0].Id, MediaInteraction.Request); }

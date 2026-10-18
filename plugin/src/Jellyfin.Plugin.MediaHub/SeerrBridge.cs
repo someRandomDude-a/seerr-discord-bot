@@ -45,11 +45,12 @@ public sealed class SeerrBridge(HubStore store, SettingsService settings, HostId
         {
             await scope.Verify(cancellation);
             using var db = store.Open(); using var tx = db.BeginTransaction();
+            settings.Protection.Check(db, tx, "watches");
             using var add = HubStore.Command(db, "INSERT OR IGNORE INTO seerr_bindings VALUES($0,$1,$2)", actor.Id.ToString("N"), origin, scope.Viewer.Id);
             add.Transaction = tx; add.ExecuteNonQuery();
             using var read = HubStore.Command(db, "SELECT origin,seerr_id FROM seerr_bindings WHERE user=$0", actor.Id.ToString("N")); read.Transaction = tx;
             using (var r = read.ExecuteReader()) if (!r.Read() || r.GetString(0) != origin || r.GetInt32(1) != scope.Viewer.Id) throw new HubError("Seerr mapping changed. Administrator review is required; no changes were sent.");
-            tx.Commit(); return scope;
+            settings.Protection.Seal(db, tx, "watches"); tx.Commit(); return scope;
         }
         catch { scope.Dispose(); throw; }
     }

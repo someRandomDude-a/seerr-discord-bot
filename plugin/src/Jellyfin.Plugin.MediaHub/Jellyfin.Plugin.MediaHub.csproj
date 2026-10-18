@@ -4,6 +4,10 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="Jellyfin.Plugin.PrivateSyncPlay.Api">
+      <HintPath>../../lib/PrivateSyncPlay.Api-1.1.0/Jellyfin.Plugin.PrivateSyncPlay.Api.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
     <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />

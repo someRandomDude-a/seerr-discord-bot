@@ -1,0 +1,493 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Jellyfin.Plugin.PrivateSyncPlay.Api</name>
+    </assembly>
+    <members>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl">
+            <summary>A declarative guest control. No HTML, scripts, URLs or server commands are accepted.</summary>
+            <param name="Id">Stable namespaced ID, e.g. example.captions.</param>
+            <param name="Feature">One of mute, volume, subtitles or fullscreen.</param>
+            <param name="Label">Plain-text accessible label.</param>
+            <param name="Icon">A Jellyfin Material icon class name; ignored for volume sliders.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl.#ctor(System.String,System.String,System.String,System.String)">
+            <summary>A declarative guest control. No HTML, scripts, URLs or server commands are accepted.</summary>
+            <param name="Id">Stable namespaced ID, e.g. example.captions.</param>
+            <param name="Feature">One of mute, volume, subtitles or fullscreen.</param>
+            <param name="Label">Plain-text accessible label.</param>
+            <param name="Icon">A Jellyfin Material icon class name; ignored for volume sliders.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl.Id">
+            <summary>Stable namespaced ID, e.g. example.captions.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl.Feature">
+            <summary>One of mute, volume, subtitles or fullscreen.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl.Label">
+            <summary>Plain-text accessible label.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl.Icon">
+            <summary>A Jellyfin Material icon class name; ignored for volume sliders.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerUiExtensions">
+            <summary>Cross-load-context registration for explicitly enabled, guest-safe player controls.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerUiExtensions.ServiceKey">
+            <summary>Versioned DI key. Framework strings avoid plugin assembly load-context mismatches.</summary>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerUiExtensions.AddPrivateSyncPlayGuestControl(Microsoft.Extensions.DependencyInjection.IServiceCollection,Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerControl)">
+            <summary>Contributes a control to the administrator's designer. It is disabled until explicitly added.</summary>
+            <param name="services">Jellyfin's plugin service collection.</param>
+            <param name="control">Descriptor of a control backed only by a built-in local guest action.</param>
+            <returns>The service collection.</returns>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService">
+            <summary>The current typed .NET scripting API for party, invitation, permission and moderation operations.</summary>
+            <remarks>Actors must be derived from the calling plugin's authenticated context. No operation creates a login or synthetic session.</remarks>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.IsAvailable">
+            <summary>Gets whether the matching current API provider is registered. Operations may still fail if it is not ready.</summary>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.GetCurrentPartyAsync(System.Guid,System.String,System.Threading.CancellationToken)">
+            <summary>Gets the caller's current party, or null if its active session is not in a party.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's existing Jellyfin session ID.</param>
+            <param name="cancellationToken">Cancellation before the operation mutates state.</param><returns>A snapshot without other parties' secrets.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.CreatePartyAsync(System.Guid,System.String,Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions,System.Threading.CancellationToken)">
+            <summary>Creates a party for an active session that is not already in another party.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's existing Jellyfin session ID.</param>
+            <param name="options">Creation settings; null mode/limit inherit administrator policy.</param><param name="cancellationToken">Cancellation before mutation.</param>
+            <returns>The new party. Existing membership is never silently replaced.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.CreatePartyWithInviteAsync(System.Guid,System.String,Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions,Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions,System.Threading.CancellationToken)">
+            <summary>Creates a party and invitation together, validating invite permission/limits before creation.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's existing Jellyfin session ID.</param>
+            <param name="party">Party settings.</param><param name="invite">Invite settings, including the trusted public server URL.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>The party and its newly generated bearer link.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.CreateInviteAsync(System.Guid,System.String,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions,System.Threading.CancellationToken)">
+            <summary>Generates a bearer invite link for a party owned by the caller.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active session, which must belong to this party.</param>
+            <param name="partyId">Party identifier.</param><param name="options">Invite settings. Guest links require HTTPS and administrator permission.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>An invitation; its URL is a secret and must not be logged.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.RevokeInviteAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <summary>Revokes an owner's invitation and any guest leases admitted by it.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active party session.</param><param name="partyId">Party identifier.</param>
+            <param name="inviteId">Invitation identifier, not its secret token.</param><param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.JoinByCodeAsync(System.Guid,System.String,System.String,System.Threading.CancellationToken)">
+            <summary>Joins a private party using its short code, retaining the user's own library restrictions.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active Jellyfin session.</param><param name="code">Private group join code.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.JoinByInviteAsync(System.Guid,System.String,System.String,System.Threading.CancellationToken)">
+            <summary>Joins using an invite secret, retaining media restrictions and redemption/capacity limits.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active Jellyfin session.</param><param name="token">Secret fragment from an invitation URL.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.LeavePartyAsync(System.Guid,System.String,System.Threading.CancellationToken)">
+            <summary>Leaves a party. The last authenticated member leaving invalidates all guest access.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active Jellyfin session.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.EndPartyAsync(System.Guid,System.String,System.Guid,System.Threading.CancellationToken)">
+            <summary>Ends a party as its owner or a server administrator.</summary>
+            <param name="userId">Authenticated actor's user ID.</param><param name="sessionId">Actor's active Jellyfin session.</param><param name="partyId">Party identifier.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.GetManagementAsync(System.Guid,System.String,System.Guid,System.Threading.CancellationToken)">
+            <summary>Gets a detached owner-only policy/participant snapshot. Requires the owner in an active session in this exact party.</summary>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Owner's active party session.</param><param name="partyId">Exact party.</param>
+            <param name="cancellationToken">Cancellation before the operation starts.</param><returns>A snapshot without invitation tokens or guest credentials.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.UpdatePolicyAsync(System.Guid,System.String,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy,System.Threading.CancellationToken)">
+            <summary>Replaces party policy without changing administrator settings or per-participant overrides.</summary>
+            <remarks>Read-modify-write the current Policy with a with-expression. Disabling guests permanently revokes guest-enabled links and their leases.</remarks>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Active party session.</param><param name="partyId">Exact party.</param>
+            <param name="policy">Complete admission, capacity and account-control policy. Guest player options are administrator-only.</param><param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.SetAccountPermissionsAsync(System.Guid,System.String,System.Guid,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions,System.Threading.CancellationToken)">
+            <summary>Sets permissions for all devices of one account in this party; cannot demote the owner or bypass party/admin ceilings.</summary>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Active party session.</param><param name="partyId">Exact party.</param>
+            <param name="participantId">Account participant ID from the management snapshot, not a Jellyfin user ID.</param><param name="permissions">Playback/queue permissions; queue editing also requires playback.</param>
+            <param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.KickAccountAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <summary>Removes all of an account's devices and blocks rejoining this party. Does not ban the Jellyfin account.</summary>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Active party session.</param><param name="partyId">Exact party.</param>
+            <param name="participantId">Account participant ID; guest IDs are rejected to avoid accidentally revoking a shared link.</param><param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.KickGuestAndRevokeInviteAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <summary>Revokes a guest's admission invitation and disconnects ALL guest leases admitted by that same invitation.</summary>
+            <remarks>Confirm the shared-link effect with the caller. Anonymous identity across new browsers/new invitations cannot be established. Account IDs are rejected.</remarks>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Active party session.</param><param name="partyId">Exact party.</param>
+            <param name="participantId">Guest participant ID from a fresh snapshot.</param><param name="cancellationToken">Cancellation before mutation.</param><returns>Completion; the link cannot admit new guests or accounts.</returns>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService.UnblockAccountAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <summary>Allows an account to rejoin this party. Does not automatically rejoin it, restore permissions, or redeem a link.</summary>
+            <param name="userId">Authenticated owner.</param><param name="sessionId">Active party session.</param><param name="partyId">Exact party.</param>
+            <param name="participantId">ID from BlockedAccounts.</param><param name="cancellationToken">Cancellation before mutation.</param><returns>Completion.</returns>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility">
+            <summary>Group visibility independent of the server plugin's implementation types.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility.Public">
+            <summary>Browsable through SyncPlay/List.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility.Private">
+            <summary>Requires a valid code or invite.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions">
+            <summary>Options for a new party.</summary>
+            <param name="Name">Display name, between 1 and 200 characters.</param><param name="Visibility">Null inherits policy.</param>
+            <param name="MaxViewers">Concurrent session limit including the host; null inherits the server limit.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions.#ctor(System.String,System.Nullable{Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility},System.Nullable{System.Int32})">
+            <summary>Options for a new party.</summary>
+            <param name="Name">Display name, between 1 and 200 characters.</param><param name="Visibility">Null inherits policy.</param>
+            <param name="MaxViewers">Concurrent session limit including the host; null inherits the server limit.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions.Name">
+            <summary>Display name, between 1 and 200 characters.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions.Visibility">
+            ><summary>Null inherits policy.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions.MaxViewers">
+            <summary>Concurrent session limit including the host; null inherits the server limit.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions">
+            <summary>Invitation options. Guests are disabled unless explicitly requested and permitted.</summary>
+            <param name="ServerBaseUrl">Trusted public HTTP(S) Jellyfin base URL, including any /jellyfin prefix; no query, fragment or credentials.</param>
+            <param name="AllowGuests">Whether to permit anonymous viewers; requires HTTPS and administrator permission.</param>
+            <param name="MaxUses">Maximum redemptions; null inherits the administrator limit.</param><param name="ExpiresAt">Optional earlier expiration; never outlives the party.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions.#ctor(System.Uri,System.Boolean,System.Nullable{System.Int32},System.Nullable{System.DateTimeOffset})">
+            <summary>Invitation options. Guests are disabled unless explicitly requested and permitted.</summary>
+            <param name="ServerBaseUrl">Trusted public HTTP(S) Jellyfin base URL, including any /jellyfin prefix; no query, fragment or credentials.</param>
+            <param name="AllowGuests">Whether to permit anonymous viewers; requires HTTPS and administrator permission.</param>
+            <param name="MaxUses">Maximum redemptions; null inherits the administrator limit.</param><param name="ExpiresAt">Optional earlier expiration; never outlives the party.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions.ServerBaseUrl">
+            <summary>Trusted public HTTP(S) Jellyfin base URL, including any /jellyfin prefix; no query, fragment or credentials.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions.AllowGuests">
+            <summary>Whether to permit anonymous viewers; requires HTTPS and administrator permission.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions.MaxUses">
+            <summary>Maximum redemptions; null inherits the administrator limit.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions.ExpiresAt">
+            ><summary>Optional earlier expiration; never outlives the party.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo">
+            <summary>A caller-scoped party snapshot.</summary>
+            <param name="PartyId">Party ID.</param><param name="OwnerUserId">Owner ID.</param><param name="Visibility">Public/private mode.</param>
+            <param name="MaxViewers">Effective concurrent limit.</param><param name="ViewerCount">Current account and guest sessions.</param>
+            <param name="JoinCode">Private code for its owner only; otherwise null. Treat as a secret.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.#ctor(System.Guid,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility,System.Int32,System.Int32,System.String)">
+            <summary>A caller-scoped party snapshot.</summary>
+            <param name="PartyId">Party ID.</param><param name="OwnerUserId">Owner ID.</param><param name="Visibility">Public/private mode.</param>
+            <param name="MaxViewers">Effective concurrent limit.</param><param name="ViewerCount">Current account and guest sessions.</param>
+            <param name="JoinCode">Private code for its owner only; otherwise null. Treat as a secret.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.PartyId">
+            <summary>Party ID.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.OwnerUserId">
+            ><summary>Owner ID.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.Visibility">
+            ><summary>Public/private mode.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.MaxViewers">
+            <summary>Effective concurrent limit.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.ViewerCount">
+            ><summary>Current account and guest sessions.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo.JoinCode">
+            <summary>Private code for its owner only; otherwise null. Treat as a secret.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite">
+            <summary>A generated invitation. Never log or persist its bearer URL unnecessarily.</summary>
+            <param name="InviteId">Non-secret invitation ID used for revocation.</param><param name="PartyId">Party ID.</param>
+            <param name="InviteUrl">Bearer URL with a secret fragment.</param><param name="AllowGuests">Whether guests may redeem it.</param>
+            <param name="MaxUses">Redemption limit.</param><param name="ExpiresAt">Optional earlier expiration.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.#ctor(System.Guid,System.Guid,System.Uri,System.Boolean,System.Int32,System.Nullable{System.DateTimeOffset})">
+            <summary>A generated invitation. Never log or persist its bearer URL unnecessarily.</summary>
+            <param name="InviteId">Non-secret invitation ID used for revocation.</param><param name="PartyId">Party ID.</param>
+            <param name="InviteUrl">Bearer URL with a secret fragment.</param><param name="AllowGuests">Whether guests may redeem it.</param>
+            <param name="MaxUses">Redemption limit.</param><param name="ExpiresAt">Optional earlier expiration.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.InviteId">
+            <summary>Non-secret invitation ID used for revocation.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.PartyId">
+            ><summary>Party ID.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.InviteUrl">
+            <summary>Bearer URL with a secret fragment.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.AllowGuests">
+            ><summary>Whether guests may redeem it.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.MaxUses">
+            <summary>Redemption limit.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite.ExpiresAt">
+            ><summary>Optional earlier expiration.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyWithInvite">
+            <summary>A newly created party and its invitation.</summary>
+            <param name="Party">The party snapshot.</param><param name="Invite">The invitation.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyWithInvite.#ctor(Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInvite)">
+            <summary>A newly created party and its invitation.</summary>
+            <param name="Party">The party snapshot.</param><param name="Invite">The invitation.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyWithInvite.Party">
+            <summary>The party snapshot.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyWithInvite.Invite">
+            ><summary>The invitation.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyException">
+            <summary>A stable API failure (400 invalid input, 403 policy, 404 missing, 409 conflict, 429 throttled, 503 unavailable).</summary>
+            <param name="statusCode">HTTP-style status usable by calling plugins without depending on ASP.NET types.</param><param name="message">Safe error description.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyException.#ctor(System.Int32,System.String)">
+            <summary>A stable API failure (400 invalid input, 403 policy, 404 missing, 409 conflict, 429 throttled, 503 unavailable).</summary>
+            <param name="statusCode">HTTP-style status usable by calling plugins without depending on ASP.NET types.</param><param name="message">Safe error description.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyException.StatusCode">
+            <summary>Gets the failure status code.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClientExtensions">
+            <summary>Registers the typed client in the consuming plugin's own assembly context.</summary>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClientExtensions.AddPrivateSyncPlayClient(Microsoft.Extensions.DependencyInjection.IServiceCollection)">
+            <summary>Registers the single current .NET scripting client for all party operations, without HTTP or reflection.</summary>
+            <param name="services">The collection provided to IPluginServiceRegistrator.RegisterServices.</param><returns>The collection for chaining.</returns>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient">
+            <summary>A typed adapter safe to bundle in another Jellyfin plugin's isolated load context.</summary>
+            <param name="services">Jellyfin's service provider; resolved only after all plugin registration has completed.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.#ctor(System.IServiceProvider)">
+            <summary>A typed adapter safe to bundle in another Jellyfin plugin's isolated load context.</summary>
+            <param name="services">Jellyfin's service provider; resolved only after all plugin registration has completed.</param>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.ServiceKey">
+            <summary>Current API contract key. Only the matching SDK/provider contract is supported; no older-key fallback is attempted.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.IsAvailable">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.GetCurrentPartyAsync(System.Guid,System.String,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.CreatePartyAsync(System.Guid,System.String,Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.CreatePartyWithInviteAsync(System.Guid,System.String,Jellyfin.Plugin.PrivateSyncPlay.Api.CreatePartyOptions,Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.CreateInviteAsync(System.Guid,System.String,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.CreateInviteOptions,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.RevokeInviteAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.JoinByCodeAsync(System.Guid,System.String,System.String,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.JoinByInviteAsync(System.Guid,System.String,System.String,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.LeavePartyAsync(System.Guid,System.String,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.EndPartyAsync(System.Guid,System.String,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.GetManagementAsync(System.Guid,System.String,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.UpdatePolicyAsync(System.Guid,System.String,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.SetAccountPermissionsAsync(System.Guid,System.String,System.Guid,System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.KickAccountAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.KickGuestAndRevokeInviteAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyClient.UnblockAccountAsync(System.Guid,System.String,System.Guid,System.Guid,System.Threading.CancellationToken)">
+            <inheritdoc />
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy">
+            <summary>Complete party policy. These values can only narrow administrator/Jellyfin permissions.</summary>
+            <param name="AllowJoins">Admit new viewers; current viewers remain connected when false.</param><param name="AllowGuests">Permit guest access; false permanently revokes current guest-enabled invitations and their leases.</param>
+            <param name="ParticipantsControlPlayback">Playback ceiling for non-owner accounts.</param><param name="ParticipantsEditQueue">Queue ceiling; also requires playback permission.</param>
+            <param name="MaxViewers">Concurrent sessions including the owner, within administrator limits and covering current viewers.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.#ctor(System.Boolean,System.Boolean,System.Boolean,System.Boolean,System.Int32)">
+            <summary>Complete party policy. These values can only narrow administrator/Jellyfin permissions.</summary>
+            <param name="AllowJoins">Admit new viewers; current viewers remain connected when false.</param><param name="AllowGuests">Permit guest access; false permanently revokes current guest-enabled invitations and their leases.</param>
+            <param name="ParticipantsControlPlayback">Playback ceiling for non-owner accounts.</param><param name="ParticipantsEditQueue">Queue ceiling; also requires playback permission.</param>
+            <param name="MaxViewers">Concurrent sessions including the owner, within administrator limits and covering current viewers.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.AllowJoins">
+            <summary>Admit new viewers; current viewers remain connected when false.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.AllowGuests">
+            ><summary>Permit guest access; false permanently revokes current guest-enabled invitations and their leases.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.ParticipantsControlPlayback">
+            <summary>Playback ceiling for non-owner accounts.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.ParticipantsEditQueue">
+            ><summary>Queue ceiling; also requires playback permission.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy.MaxViewers">
+            <summary>Concurrent sessions including the owner, within administrator limits and covering current viewers.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions">
+            <summary>Account permission overrides. Effective queue editing also requires playback permission and both party ceilings.</summary>
+            <param name="ControlPlayback">Permit transport control.</param><param name="EditQueue">Permit queue editing.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions.#ctor(System.Boolean,System.Boolean)">
+            <summary>Account permission overrides. Effective queue editing also requires playback permission and both party ceilings.</summary>
+            <param name="ControlPlayback">Permit transport control.</param><param name="EditQueue">Permit queue editing.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions.ControlPlayback">
+            <summary>Permit transport control.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions.EditQueue">
+            ><summary>Permit queue editing.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant">
+            <summary>Account participant snapshot, aggregated across devices in this party.</summary>
+            <param name="ParticipantId">Opaque party-scoped ID.</param><param name="Name">Plain-text account display name.</param><param name="SessionCount">Active devices in this party.</param>
+            <param name="IsOwner">Whether this is the immutable owner.</param><param name="Permissions">Stored account overrides.</param><param name="EffectivePermissions">Overrides intersected with party ceilings; owner retains control.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.#ctor(System.Guid,System.String,System.Int32,System.Boolean,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountPermissions)">
+            <summary>Account participant snapshot, aggregated across devices in this party.</summary>
+            <param name="ParticipantId">Opaque party-scoped ID.</param><param name="Name">Plain-text account display name.</param><param name="SessionCount">Active devices in this party.</param>
+            <param name="IsOwner">Whether this is the immutable owner.</param><param name="Permissions">Stored account overrides.</param><param name="EffectivePermissions">Overrides intersected with party ceilings; owner retains control.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.ParticipantId">
+            <summary>Opaque party-scoped ID.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.Name">
+            ><summary>Plain-text account display name.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.SessionCount">
+            ><summary>Active devices in this party.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.IsOwner">
+            <summary>Whether this is the immutable owner.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.Permissions">
+            ><summary>Stored account overrides.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant.EffectivePermissions">
+            ><summary>Overrides intersected with party ceilings; owner retains control.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant">
+            <summary>Anonymous current guest lease snapshot; never a verified human identity.</summary>
+            <param name="ParticipantId">Opaque lease reference, not its credential.</param><param name="Name">Generated plain-text label.</param>
+            <param name="SharedInviteGuestCount">Current leases affected by revoking this guest's invitation; may change after this snapshot.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant.#ctor(System.Guid,System.String,System.Int32)">
+            <summary>Anonymous current guest lease snapshot; never a verified human identity.</summary>
+            <param name="ParticipantId">Opaque lease reference, not its credential.</param><param name="Name">Generated plain-text label.</param>
+            <param name="SharedInviteGuestCount">Current leases affected by revoking this guest's invitation; may change after this snapshot.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant.ParticipantId">
+            <summary>Opaque lease reference, not its credential.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant.Name">
+            ><summary>Generated plain-text label.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant.SharedInviteGuestCount">
+            <summary>Current leases affected by revoking this guest's invitation; may change after this snapshot.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyBlockedAccount">
+            <summary>An account blocked from this party only.</summary>
+            <param name="ParticipantId">Opaque ID to pass to UnblockAccountAsync.</param><param name="Name">Plain-text account label.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyBlockedAccount.#ctor(System.Guid,System.String)">
+            <summary>An account blocked from this party only.</summary>
+            <param name="ParticipantId">Opaque ID to pass to UnblockAccountAsync.</param><param name="Name">Plain-text account label.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyBlockedAccount.ParticipantId">
+            <summary>Opaque ID to pass to UnblockAccountAsync.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyBlockedAccount.Name">
+            ><summary>Plain-text account label.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement">
+            <summary>Detached owner-only management snapshot. Mutating a returned collection never changes the live party.</summary>
+            <param name="PartyId">Party reference.</param><param name="Policy">Stored policy, suitable for a read-modify-write update.</param><param name="ViewerCount">Account and guest sessions.</param>
+            <param name="GuestFeatures">Read-only snapshot of administrator-configured optional guest features. Owners cannot override these.</param>
+            <param name="Accounts">Active account participants.</param><param name="Guests">Current anonymous leases.</param><param name="BlockedAccounts">Accounts explicitly blocked from this party.</param>
+        </member>
+        <member name="M:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.#ctor(System.Guid,Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyPolicy,System.Int32,System.Collections.Generic.IReadOnlyList{System.String},System.Collections.Generic.IReadOnlyList{Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyAccountParticipant},System.Collections.Generic.IReadOnlyList{Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyGuestParticipant},System.Collections.Generic.IReadOnlyList{Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyBlockedAccount})">
+            <summary>Detached owner-only management snapshot. Mutating a returned collection never changes the live party.</summary>
+            <param name="PartyId">Party reference.</param><param name="Policy">Stored policy, suitable for a read-modify-write update.</param><param name="ViewerCount">Account and guest sessions.</param>
+            <param name="GuestFeatures">Read-only snapshot of administrator-configured optional guest features. Owners cannot override these.</param>
+            <param name="Accounts">Active account participants.</param><param name="Guests">Current anonymous leases.</param><param name="BlockedAccounts">Accounts explicitly blocked from this party.</param>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.PartyId">
+            <summary>Party reference.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.Policy">
+            ><summary>Stored policy, suitable for a read-modify-write update.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.ViewerCount">
+            ><summary>Account and guest sessions.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.GuestFeatures">
+            <summary>Read-only snapshot of administrator-configured optional guest features. Owners cannot override these.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.Accounts">
+            <summary>Active account participants.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.Guests">
+            ><summary>Current anonymous leases.</summary>
+        </member>
+        <member name="P:Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyManagement.BlockedAccounts">
+            ><summary>Accounts explicitly blocked from this party.</summary>
+        </member>
+        <member name="T:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures">
+            <summary>Stable feature names for administrator-configured guest controls. Unknown features are never granted.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Title">
+            <summary>Current video title; the server suppresses it when disallowed.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Position">
+            <summary>Read-only playback position display; synchronization timestamps remain necessary.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Volume">
+            <summary>Local browser volume control, not a server-enforceable device volume restriction.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Mute">
+            <summary>Local mute control.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Subtitles">
+            <summary>Optional text subtitle selection/delivery, enforced server-side.</summary>
+        </member>
+        <member name="F:Jellyfin.Plugin.PrivateSyncPlay.Api.GuestPlayerFeatures.Fullscreen">
+            <summary>Local fullscreen control, subject to browser permissions.</summary>
+        </member>
+    </members>
+</doc>

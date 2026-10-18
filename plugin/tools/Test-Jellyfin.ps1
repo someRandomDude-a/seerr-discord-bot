@@ -3,6 +3,8 @@ param(
     [ValidatePattern('^mediahub-test-[a-z0-9-]{1,35}$')][string]$Name = 'mediahub-test-brave-otter',
     [ValidateRange(1024, 65535)][int]$Port = 18096,
     [string]$Package,
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$PackageVersion = '0.1.0.0',
+    [ValidatePattern('^(|/[a-z0-9-]{1,32})$')][string]$BasePath = '',
     [string]$Image = 'jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037'
 )
 $ErrorActionPreference = 'Stop'
@@ -86,7 +88,9 @@ function Snapshot($state) {
     $users = @(Api 'Users' $null $state.AdminToken | Sort-Object Id | ForEach-Object { [ordered]@{ Id = $_.Id; Name = $_.Name; Administrator = $_.Policy.IsAdministrator; Disabled = $_.Policy.IsDisabled } })
     $folders = @(Api 'Library/VirtualFolders' $null $state.AdminToken)
     $config = Api 'System/Configuration' $null $state.AdminToken
-    return [ordered]@{ Users = $users; Folders = $folders; ServerName = $config.ServerName; EnableUPnP = $config.EnableUPnP; MetadataPath = $config.MetadataPath }
+    $snapshot = [ordered]@{ Users = $users; Folders = $folders; ServerName = $config.ServerName; EnableUPnP = $config.EnableUPnP; MetadataPath = $config.MetadataPath }
+    if ($state.PSObject.Properties['BasePath']) { $snapshot.NetworkBasePath = (Api 'System/Configuration/network' $null $state.AdminToken).BaseUrl }
+    return $snapshot
 }
 function Normalize-Snapshot($snapshot) {
     # Early Windows PowerShell runs wrapped REST arrays. Preserve and normalize the
@@ -102,14 +106,14 @@ function Normalize-Snapshot($snapshot) {
 }
 function Plugin-StateDigest {
     # Do not hash a live WAL-backed database; check the stable settings/key and reinstallation state separately.
-    return (Docker @('exec', $Name, 'find', '/config/data/media-hub', '-maxdepth', '1', '-type', 'f', '(', '-name', 'secrets.key', '-o', '-name', 'settings.json', ')', '-exec', 'sha256sum', '{}', '+') | Sort-Object) -join '|'
+    return (Docker @('exec', $Name, 'find', '/config/data/media-hub', '-maxdepth', '1', '-type', 'f', '(', '-name', 'secrets.key', '-o', '-name', 'settings.json', '-o', '-name', 'state-auth.json', '-o', '-name', 'state-auth.previous.json', ')', '-exec', 'sha256sum', '{}', '+') | Sort-Object) -join '|'
 }
 function Configure-Fixture($info) {
-    if ($info.Version -notmatch '^12\.') { throw 'This test image is not Jellyfin 12. No plugin was installed.' }
+    if ($info.Version -ne '12.2.0') { throw 'This test image is not the latest reviewed Jellyfin 12.2.0. No plugin was installed.' }
     if (Test-Path $stateFile) { $state = Get-Content $stateFile -Raw | ConvertFrom-Json }
     else {
         if ($info.StartupWizardCompleted) { throw 'A configured test server has no matching private credentials. Nothing was reset.' }
-        $state = [pscustomobject]@{ Name = $Name; Port = $Port; Version = $info.Version; AdminPassword = (Secret); ViewerPassword = (Secret); AdminToken = ''; ViewerToken = ''; Snapshot = $null }
+        $state = [pscustomobject]@{ Name = $Name; Port = $Port; BasePath = $BasePath; Version = $info.Version; AdminPassword = (Secret); ViewerPassword = (Secret); AdminToken = ''; ViewerToken = ''; Snapshot = $null }
         Save $state
     }
     if ($state.Name -ne $Name -or $state.Port -ne $Port) { throw 'Private test state belongs to another container/address.' }
@@ -130,6 +134,17 @@ function Configure-Fixture($info) {
     }
     $auth = Api 'Users/AuthenticateByName' @{ Username = 'mediahub-viewer'; Pw = $state.ViewerPassword } $null 'mediahub-acceptance-viewer'
     $state.ViewerToken = $auth.AccessToken
+    if (!$state.Snapshot -and $state.BasePath) {
+        # Fresh disposable fixture only, before its native baseline. Never change a
+        # retained/production host's network configuration to make a test pass.
+        $networkConfig = Api 'System/Configuration/network' $null $state.AdminToken
+        if ($networkConfig.BaseUrl) { throw 'Unexpected pre-existing base path; nothing was replaced.' }
+        $networkConfig.BaseUrl = $state.BasePath
+        $null = Api 'System/Configuration/network' $networkConfig $state.AdminToken
+        $script:url = 'http://127.0.0.1:' + $Port + $state.BasePath
+        $null = Docker @('restart', '--time', '20', $Name)
+        $null = Ready
+    }
     if (!$state.Snapshot) { $state.Snapshot = Snapshot $state } else { $state.Snapshot = Normalize-Snapshot $state.Snapshot }
     Save $state
     [pscustomobject]@{ Step = 'Test fixture configured'; Version = $state.Version; Address = $url; MediaFolders = @($state.Snapshot.Folders).Count; CredentialsLogged = $false } | ConvertTo-Json
@@ -152,10 +167,13 @@ if ($Mode -eq 'Start') {
     exit
 }
 OwnContainer
-if ($Mode -eq 'Configure') { Configure-Fixture (Ready); exit }
 if (!(Test-Path $stateFile)) { throw 'This test server has no matching private acceptance state file.' }
 $state = Get-Content $stateFile -Raw | ConvertFrom-Json
 if ($state.Name -ne $Name -or $state.Port -ne $Port) { throw 'Test state does not match the selected container/address.' }
+if ($state.BasePath -and $state.BasePath -notmatch '^/[a-z0-9-]{1,32}$') { throw 'Unrecognized fixture base path.' }
+if ($BasePath -and $BasePath -ne $state.BasePath) { throw 'Refusing to change a retained fixture base path.' }
+$url += $state.BasePath
+if ($Mode -eq 'Configure') { Configure-Fixture (Ready); exit }
 $state.Snapshot = Normalize-Snapshot $state.Snapshot
 if ($Mode -eq 'Stop') { $null = Docker @('stop', '--time', '20', $Name); Write-Output 'Only the owned test container was stopped. Volumes and private test credentials were retained.'; exit }
 if ($Mode -eq 'Install') {
@@ -163,7 +181,7 @@ if ($Mode -eq 'Install') {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $Package))
     try {
-        $allowed = @('Jellyfin.Plugin.MediaHub.dll', 'Jellyfin.Plugin.MediaHub.deps.json', 'Discord.Net.Core.dll', 'Discord.Net.Dave.dll', 'Discord.Net.Rest.dll', 'Discord.Net.WebSocket.dll', 'Newtonsoft.Json.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+        $allowed = @('Jellyfin.Plugin.MediaHub.dll', 'Jellyfin.Plugin.MediaHub.deps.json', 'Discord.Net.Core.dll', 'Discord.Net.Dave.dll', 'Discord.Net.Rest.dll', 'Discord.Net.WebSocket.dll', 'Newtonsoft.Json.dll', 'Jellyfin.Plugin.PrivateSyncPlay.Api.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
         $seen = @{}; $expanded = 0L
         foreach ($entry in $zip.Entries) {
             if ($entry.FullName -cnotin $allowed -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 33554432) { throw 'Unexpected, duplicate or oversized archive entry.' }
@@ -177,21 +195,22 @@ if ($Mode -eq 'Install') {
     foreach ($hostAssembly in @('Jellyfin.Controller.dll', 'Jellyfin.Model.dll', 'MediaBrowser.Controller.dll', 'MediaBrowser.Model.dll', 'Microsoft.Data.Sqlite.dll')) {
         if (Test-Path (Join-Path $stage $hostAssembly)) { throw 'Host replacement assemblies are not permitted in the test package.' }
     }
-    $directories = @(Docker @('exec', $Name, 'find', '/config/plugins', '-maxdepth', '1', '-name', 'MediaHub_0.1.0.0'))
+    $directories = @(Docker @('exec', $Name, 'find', '/config/plugins', '-maxdepth', '1', '-name', ('MediaHub_' + $PackageVersion)))
     if ($directories.Count -ne 0) { throw 'Test plugin package already exists. Uninstall the owned test package before installing a different local build.' }
     $null = Docker @('exec', $Name, 'mkdir', '-p', '/config/plugins')
     $null = Docker @('stop', '--time', '20', $Name)
-    $null = Docker @('cp', $stage, ($Name + ':/config/plugins/MediaHub_0.1.0.0'))
+    $null = Docker @('cp', $stage, ($Name + ':/config/plugins/MediaHub_' + $PackageVersion))
     $null = Docker @('start', $Name)
     $null = Ready
 }
 if ($Mode -eq 'Uninstall') {
+    $null = Ready
     $retained = Plugin-StateDigest
     $personal = Api 'MediaHub/Me' $null $state.ViewerToken 'mediahub-acceptance-viewer'
     $state | Add-Member -NotePropertyName RetainedPersonal -NotePropertyValue $personal -Force
     Save $state
     # Exercise Jellyfin's actual uninstall hook. Only the GUID/version in this owned fixture is selected.
-    $null = Api 'Plugins/c70297bf-77bd-4ad4-93c9-f67598519777/0.1.0.0' $null $state.AdminToken 'mediahub-acceptance-admin' 15 'DELETE'
+    $null = Api ('Plugins/c70297bf-77bd-4ad4-93c9-f67598519777/' + $PackageVersion) $null $state.AdminToken 'mediahub-acceptance-admin' 15 'DELETE'
     $null = Docker @('restart', '--time', '20', $Name)
     $null = Ready
     $after = Snapshot $state
@@ -208,6 +227,12 @@ $plugins = @(Api 'Plugins' $null $state.AdminToken)
 $plugin = @($plugins | Where-Object { [Guid]$_.Id -eq [Guid]'c70297bf-77bd-4ad4-93c9-f67598519777' })
 if ($plugin.Count -ne 1) { throw 'The test server did not discover exactly one Media Hub plugin.' }
 if ($plugin[0].Status -ne 'Active') { throw 'Jellyfin did not report the test plugin as Active.' }
+if ($plugin[0].Version -ne $PackageVersion) { throw 'Loaded plugin version differs from the selected release.' }
+if ($Mode -eq 'Install') {
+    $expected = (Get-FileHash -Algorithm SHA256 (Join-Path $stage 'Jellyfin.Plugin.MediaHub.dll')).Hash.ToLowerInvariant()
+    $installed = (Docker @('exec', $Name, 'sha256sum', ('/config/plugins/MediaHub_' + $PackageVersion + '/Jellyfin.Plugin.MediaHub.dll'))) -split '\s+'
+    if ($installed[0] -ne $expected) { throw 'Installed assembly differs from the exact ZIP.' }
+}
 $settings = Api 'MediaHub/Settings' $null $state.AdminToken
 if ($settings.ConfigurationReviewRequired) { Expect-Status 'MediaHub/Me' 400 $state.ViewerToken }
 if ($settings.DiscordEnabled -or $settings.AutomaticDeletion) { throw 'Fresh install must not enable Discord or automatic deletion.' }
@@ -241,8 +266,14 @@ Expect-Status 'MediaHub/Settings' 403 $state.ViewerToken
 Expect-Status 'MediaHub/Messaging/Access' 403 $state.ViewerToken
 Expect-Status 'MediaHub/Activity/Config' 401
 Expect-Status 'MediaHub/Activity/Api/Me' 401
+Expect-Status 'MediaHub/Players' 401
+Expect-Status 'MediaHub/Players/History' 200 $state.ViewerToken 'mediahub-acceptance-viewer'
 Expect-Status 'web/ConfigurationPage?name=mediahub' 200 $state.AdminToken 'mediahub-acceptance-admin'
 Expect-Status 'web/ConfigurationPage?name=mediahub.js' 200 $state.AdminToken 'mediahub-acceptance-admin'
+Expect-Status 'web/ConfigurationPage?name=mediahub.settings.js' 200 $state.AdminToken 'mediahub-acceptance-admin'
+Expect-Status ('MediaHub/Configuration/Destinations?revision=' + $settings.Revision) 401
+Expect-Status ('MediaHub/Configuration/Destinations?revision=' + $settings.Revision) 403 $state.ViewerToken
+if (!$settings.SeerrUrl) { Expect-Status ('MediaHub/Configuration/Destinations?revision=' + $settings.Revision) 400 $state.AdminToken 'mediahub-acceptance-admin' }
 $after = Snapshot $state
 if (($after | ConvertTo-Json -Depth 20 -Compress) -ne ($state.Snapshot | ConvertTo-Json -Depth 20 -Compress)) { throw 'Native users/library/configuration changed during the test.' }
 [pscustomobject]@{ Step = $Mode; Version = $info.Version; PluginDiscovered = $true; NativeFixtureUnchanged = $true; PersonalIsolation = $true; MalformedBodiesRejected = $rejected; DiscordDisabled = $true; AutomaticDeletionDisabled = $true } | ConvertTo-Json

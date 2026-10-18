@@ -3,7 +3,8 @@ using System.Text.Json;
 namespace Jellyfin.Plugin.MediaHub;
 
 public sealed record MediaControl(string Action, string Kind = "movie", int Id = 0, Guid? Native = null,
-    int Page = 1, string Query = "", bool All = false, long Revision = 0, string? Token = null, string? ForeignId = null, string? Edition = null);
+    int Page = 1, string Query = "", bool All = false, long Revision = 0, string? Token = null, string? ForeignId = null, string? Edition = null,
+    int[]? Seasons = null, int Offset = 0, bool NativeOnly = false, string? Guild = null, string? Peer = null, string? Channel = null, bool Oldest = false);
 
 /// <summary>Opaque, expiring controls bound to both identities and the exact message. One click invalidates the old view.</summary>
 public sealed class DiscordControls(HubStore store, SettingsService settings)

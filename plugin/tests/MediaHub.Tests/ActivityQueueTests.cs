@@ -136,6 +136,10 @@ public sealed class ActivityQueueTests : IDisposable
         data.Setup(d => d.SaveUserData(owner, movie.Object, It.IsAny<UpdateUserItemDataDto>(), UserDataSaveReason.UpdateUserData)).Throws<IOException>();
         Assert.False(service.Record(owner, item, MediaInteraction.Open).JellyfinUpdated);
         Assert.Single(service.Read(item));
+        using (var db = store.Open()) using (var omit = HubStore.Command(db, "DELETE FROM activity")) omit.ExecuteNonQuery();
+        Assert.Throws<HubError>(() => service.Read(item));
+        Assert.Throws<HubError>(() => service.Record(owner, item, MediaInteraction.Open));
+        Assert.Throws<HubError>(() => new MediaActivity(store, library.Object, users.Object, data.Object).Read(item));
     }
     [Theory]
     [InlineData(true)] [InlineData(false)]

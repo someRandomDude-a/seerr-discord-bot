@@ -105,6 +105,16 @@ public sealed class SeerrFeatureTests : IDisposable
         data.Verify(d => d.SaveUserData(viewer, movie.Object, It.IsAny<MediaBrowser.Model.Dto.UpdateUserItemDataDto>(), MediaBrowser.Model.Entities.UserDataSaveReason.UpdateUserData), Times.Once);
     }
     [Fact]
+    public void NativeDetailsDoNotRequireOrContactSeerrEvenWhenTheItemHasAnExternalId()
+    {
+        settings.Update(new(settings.Current.Revision, false, "", [], "", null, ""));
+        var movie = new Mock<Movie>(); movie.Object.Id = Guid.NewGuid(); movie.Object.Name = "Native title"; movie.Object.ProviderIds["Tmdb"] = "123";
+        movie.Setup(m => m.IsVisibleStandalone(viewer)).Returns(true); library.Setup(l => l.GetItemById(movie.Object.Id)).Returns(movie.Object);
+        var card = catalog.NativeDetails(viewer, movie.Object.Id); Assert.True(card.NativeOnly); Assert.Equal(123, card.ExternalId); Assert.Empty(server.Calls); data.VerifyNoOtherCalls();
+        Assert.NotNull(catalog.NativeDetails(viewer, movie.Object.Id, true).Activity); Assert.Empty(server.Calls);
+        data.Verify(d => d.SaveUserData(viewer, movie.Object, It.IsAny<MediaBrowser.Model.Dto.UpdateUserItemDataDto>(), MediaBrowser.Model.Entities.UserDataSaveReason.UpdateUserData), Times.Once);
+    }
+    [Fact]
     public async Task RestrictedNativeMediaIsOmittedFromCatalogRequestsAndDetails()
     {
         var movie = new Mock<Movie>(); movie.Object.Id = Guid.NewGuid(); movie.Object.ProviderIds["Tmdb"] = "123";
@@ -159,7 +169,7 @@ public sealed class SeerrFeatureTests : IDisposable
     {
         var media = new Mock<IExternalMedia>();
         media.Setup(m => m.Resolve(viewer, It.IsAny<MediaKey>())).Returns((true, (Guid?)null));
-        return new(store, bridge, media.Object);
+        return new(store, bridge, media.Object, settings: settings);
     }
     [Fact]
     public async Task WatchlistUnionsFirstSyncThenRespectsRemoteAndExplicitLocalRemovals()
@@ -189,6 +199,17 @@ public sealed class SeerrFeatureTests : IDisposable
         Assert.Single(sync.List(viewer)); Assert.Equal(0, server.Writes);
     }
     [Fact]
+    public async Task ConcurrentServiceInstancesCannotOverlapAWatchlistSyncOrSendTheSameIntentTwice()
+    {
+        var sync = WatchSync(); await sync.Follow(viewer, new("movie", 123), true, 0, () => Task.CompletedTask, default);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        server.BeforeWatchRead = () => { entered.TrySetResult(); return release.Task; };
+        var first = sync.Sync(viewer, () => Task.CompletedTask, default); await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try { await Assert.ThrowsAnyAsync<Exception>(() => WatchSync().Sync(viewer, () => Task.CompletedTask, default)); }
+        finally { release.TrySetResult(); }
+        Assert.True((await first).Complete); Assert.Equal(1, server.Writes); data.VerifyNoOtherCalls();
+    }
+    [Fact]
     public async Task FailedWatchlistMutationIsReconciledButNotResentWithoutNewExplicitIntent()
     {
         var sync = WatchSync();
@@ -202,6 +223,28 @@ public sealed class SeerrFeatureTests : IDisposable
         Assert.True((await sync.Sync(viewer, () => Task.CompletedTask, CancellationToken.None)).Complete); Assert.Equal(2, server.Writes);
     }
     [Fact]
+    public async Task ForgedReadyIntentCannotWriteWithoutAnExplicitFollowEvenAfterRestart()
+    {
+        var sync = WatchSync();
+        using (var db = store.Open()) using (var inject = HubStore.Command(db, "INSERT INTO watchlist_intents VALUES($0,'movie',123,1,0,'ready')", viewer.Id.ToString("N"))) inject.ExecuteNonQuery();
+        await Assert.ThrowsAsync<HubError>(() => sync.Sync(viewer, () => Task.CompletedTask, default));
+        await Assert.ThrowsAsync<HubError>(() => WatchSync().Sync(viewer, () => Task.CompletedTask, default));
+        Assert.Equal(0, server.Writes);
+    }
+    [Theory]
+    [InlineData("DELETE FROM watchlist_intents")]
+    [InlineData("UPDATE watchlist_intents SET desired=0")]
+    [InlineData("INSERT INTO watchlist_baselines VALUES($0,'[]')")]
+    [InlineData("DELETE FROM external_watches")]
+    public async Task MutatedWatchAuthorizersFailClosedWithoutResealingOrSending(string sql)
+    {
+        var sync = WatchSync(); await sync.Follow(viewer, new("movie", 123), true, 0, () => Task.CompletedTask, default);
+        using (var db = store.Open()) using (var inject = HubStore.Command(db, sql, viewer.Id.ToString("N"))) inject.ExecuteNonQuery();
+        await Assert.ThrowsAsync<HubError>(() => sync.Sync(viewer, () => Task.CompletedTask, default));
+        await Assert.ThrowsAsync<HubError>(() => sync.Follow(viewer, new("movie", 123), true, 1, () => Task.CompletedTask, default));
+        Assert.Equal(0, server.Writes);
+    }
+    [Fact]
     public async Task UnsubscribeKeepsMembershipAndStaleRevisionCannotRemoveIt()
     {
         var sync = WatchSync();
@@ -211,24 +254,112 @@ public sealed class SeerrFeatureTests : IDisposable
         await Assert.ThrowsAsync<HubError>(() => sync.Follow(viewer, new("tv", 123), null, 1, () => Task.CompletedTask, CancellationToken.None));
         Assert.Single(sync.List(viewer)); Assert.Equal(0, server.Writes);
     }
+    private (WatchlistSync Sync, PersonalService Personal, Guid[] Aliases) AliasFixture()
+    {
+        var aliases = new[] { Guid.NewGuid(), Guid.NewGuid() }; var mapping = new Mock<IExternalMedia>(); var visible = new Mock<IViewerMedia>();
+        foreach (var id in aliases)
+        {
+            mapping.Setup(m => m.Identify(viewer, id)).Returns((new MediaKey("movie", 123), "A title"));
+            visible.Setup(m => m.Find(viewer, id)).Returns(new VisibleItem(id, "A title", "Movie"));
+        }
+        mapping.Setup(m => m.Resolve(viewer, It.IsAny<MediaKey>())).Returns((true, (Guid?)null));
+        var sync = new WatchlistSync(store, bridge, mapping.Object, settings: settings);
+        return (sync, new PersonalService(store, visible.Object, sync: sync), aliases);
+    }
+    [Fact]
+    public async Task ExplicitSyncImportsLegacyAliasesOnceWithoutChangingNotificationChoicesOrNativeData()
+    {
+        var (sync, personal, aliases) = AliasFixture();
+        settings.Protection.Update("watches", (db, tx) => { foreach (var id in aliases) { using var add = HubStore.Command(db, "INSERT INTO subscriptions VALUES($0,$1,0,$2)", viewer.Id.ToString("N"), id.ToString("N"), HubStore.Now); add.Transaction = tx; add.ExecuteNonQuery(); } return true; });
+        await sync.Sync(viewer, () => Task.CompletedTask, default, importNative: false); Assert.Empty(sync.List(viewer)); Assert.Equal(0, server.Writes);
+        await sync.Sync(viewer, () => Task.CompletedTask, default); var row = Assert.Single(sync.List(viewer));
+        Assert.False(row.Subscribed); Assert.Null(row.NativeId); Assert.Equal(2, row.NativeIds!.Count); Assert.Equal(1, server.Writes);
+        await sync.Sync(viewer, () => Task.CompletedTask, default); Assert.Equal(1, server.Writes); Assert.Equal(2, personal.State(viewer).Watchlist.Count);
+        data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task RemoteRemovalClearsEveryAccessibleSavedAliasAndItsNotifications()
+    {
+        var (sync, personal, aliases) = AliasFixture();
+        personal.Bell(viewer, aliases[0], true, 0); personal.Bell(viewer, aliases[1], true, 1);
+        await sync.Sync(viewer, () => Task.CompletedTask, default);
+        server.Remote.Clear(); await sync.Sync(viewer, () => Task.CompletedTask, default);
+        Assert.Empty(personal.State(viewer).Watchlist); Assert.Empty(sync.List(viewer)); Assert.Equal(1, server.Writes);
+        using var db = store.Open(); using var count = HubStore.Command(db, "SELECT COUNT(*) FROM subscriptions"); Assert.Equal(0L, count.ExecuteScalar()); data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task NativeUnsubscribeAndRemoveApplyToAllSavedEditionsWithoutTouchingOtherUsers()
+    {
+        var (sync, personal, aliases) = AliasFixture();
+        personal.Bell(viewer, aliases[0], true, 0); personal.Bell(viewer, aliases[1], true, 1);
+        personal.Bell(viewer, aliases[0], false, 2); Assert.All(personal.State(viewer).Watchlist, w => Assert.False(w.Subscribed)); Assert.False(Assert.Single(sync.List(viewer)).Subscribed);
+        settings.Protection.Update("watches", (db, tx) => { using var add = HubStore.Command(db, "INSERT INTO subscriptions VALUES('other',$0,1,$1)", aliases[0].ToString("N"), HubStore.Now); add.Transaction = tx; return add.ExecuteNonQuery(); });
+        personal.Remove(viewer, aliases[0], 3); Assert.Empty(personal.State(viewer).Watchlist); Assert.Empty(sync.List(viewer));
+        using (var db = store.Open()) using (var count = HubStore.Command(db, "SELECT COUNT(*) FROM subscriptions WHERE user='other'")) Assert.Equal(1L, count.ExecuteScalar());
+        Assert.Equal(0, server.Writes); data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task LocalMutationDuringStableRemoteScanCannotBeOverwrittenByLegacyImport()
+    {
+        var (sync, personal, aliases) = AliasFixture(); personal.Bell(viewer, aliases[0], true, 0);
+        await Assert.ThrowsAsync<HubError>(() => sync.Sync(viewer, () => { personal.Bell(viewer, aliases[0], false, 1); return Task.CompletedTask; }, default));
+        Assert.False(Assert.Single(personal.State(viewer).Watchlist).Subscribed); Assert.Equal(0, server.Writes);
+    }
+    [Fact]
+    public async Task ReviewedUncertainRecoveryAdoptsRemoteOnlyAndRejectsReplayWithoutAnyRetry()
+    {
+        var sync = WatchSync(); await sync.Follow(viewer, new("movie", 123), true, 0, () => Task.CompletedTask, default);
+        server.FailWatch = true; await sync.Sync(viewer, () => Task.CompletedTask, default); Assert.Equal(1, server.Writes);
+        var review = await sync.Review(viewer, new("movie", 123), () => Task.CompletedTask, default); Assert.False(review.RemoteMembership); Assert.True(review.LocalMembership);
+        Assert.True((await sync.AcceptRemote(viewer, review.Token, () => Task.CompletedTask, default)).Complete);
+        Assert.Empty(sync.List(viewer)); Assert.Empty(sync.Issues(viewer)); Assert.Equal(1, server.Writes);
+        await Assert.ThrowsAsync<HubError>(() => sync.AcceptRemote(viewer, review.Token, () => Task.CompletedTask, default)); Assert.Equal(1, server.Writes);
+    }
+    [Theory]
+    [InlineData("wrong-user")] [InlineData("remote-change")] [InlineData("draft-change")] [InlineData("tamper")]
+    public async Task ChangedOrForgedRecoveryProofCannotDiscardPendingState(string change)
+    {
+        var sync = WatchSync(); await sync.Follow(viewer, new("movie", 123), true, 0, () => Task.CompletedTask, default);
+        server.FailWatch = true; await sync.Sync(viewer, () => Task.CompletedTask, default);
+        var review = await sync.Review(viewer, new("movie", 123), () => Task.CompletedTask, default);
+        var actor = change == "wrong-user" ? new User("Other", "provider", "reset") { Id = Guid.NewGuid() } : viewer;
+        if (change == "remote-change") server.Remote.Add(new("movie", 123), "A title");
+        if (change == "draft-change") await sync.Follow(viewer, new("movie", 123), false, 1, () => Task.CompletedTask, default);
+        await Assert.ThrowsAsync<HubError>(() => sync.AcceptRemote(actor, change == "tamper" ? "tampered-proof" : review.Token, () => Task.CompletedTask, default));
+        Assert.NotEmpty(sync.Issues(viewer)); Assert.Equal(1, server.Writes); data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task ExistingOwnRequestsNotifyWithoutWatchlistMembershipAndOwnershipLossHidesRetainedNotices()
+    {
+        var personal = new PersonalService(store, Mock.Of<IViewerMedia>());
+        var feed = new NotificationFeed(store, personal, Mock.Of<INotificationStatus>(), identity, settings, catalog);
+        await feed.Scan(viewer, default); Assert.Empty(await feed.ListAsync(viewer, default));
+        server.RequestStatus = 3; await feed.Scan(viewer, default);
+        var notice = Assert.Single(await feed.ListAsync(viewer, default)); Assert.Equal("Declined", notice.Status); Assert.StartsWith("Your request", notice.Title);
+        Assert.Empty(personal.State(viewer).Watchlist); Assert.Equal(0, server.Writes); data.VerifyNoOtherCalls();
+        server.WrongOwner = true; Assert.Empty(await feed.ListAsync(viewer, default));
+        server.WrongOwner = false; personal.Save(viewer, 0, new(OwnRequestNotifications: false)); Assert.Empty(await feed.ListAsync(viewer, default));
+    }
     private sealed class Handler(Server server) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellation) => server.Send(request, cancellation);
     }
     private sealed class Server(Guid native)
     {
-        public int UserId = 7, Writes; public long Permissions = 32;
+        public int UserId = 7, Writes, RequestStatus = 2; public long Permissions = 32;
         public bool Duplicate, IgnoreUser, Incomplete, LoseResponse, WrongOwner, IncompleteWatch, FailWatch;
         public readonly Dictionary<MediaKey, string> Remote = [];
         public readonly List<(string Path, string? User)> Calls = [];
         public readonly List<string> Bodies = [];
+        public Func<Task>? BeforeWatchRead;
         public async Task<HttpResponseMessage> Send(HttpRequestMessage request, CancellationToken cancellation)
         {
             var path = request.RequestUri!.PathAndQuery["/base/api/v1/".Length..];
+            if (path.StartsWith("discover/watchlist?") && BeforeWatchRead is not null) await BeforeWatchRead();
             var apiUser = request.Headers.TryGetValues("X-API-User", out var values) ? values.Single() : null;
             Calls.Add((path, apiUser)); Assert.Equal("key", request.Headers.GetValues("X-Api-Key").Single());
             object body;
-            object Request() => new { id = 22, type = "movie", is4k = false, requestedBy = new { id = WrongOwner ? 999 : UserId }, media = new { tmdbId = 123 }, status = 2 };
+            object Request() => new { id = 22, type = "movie", is4k = false, requestedBy = new { id = WrongOwner ? 999 : UserId }, media = new { tmdbId = 123 }, status = RequestStatus };
             if (path == "discover/watchlist?page=1") body = new { page = 1, totalResults = IncompleteWatch ? 1 : Remote.Count, totalPages = 1,
                 results = Remote.Select(pair => new { mediaType = pair.Key.Kind, tmdbId = pair.Key.Id, title = pair.Value, requestedBy = new { id = UserId } }).ToArray() };
             else if (path == "watchlist" || path.StartsWith("watchlist/"))
@@ -254,6 +385,7 @@ public sealed class SeerrFeatureTests : IDisposable
             else if (path == "auth/me") body = new { id = IgnoreUser ? 1 : UserId, permissions = Permissions };
             else if (path == "user/" + UserId) body = new { id = UserId, jellyfinUserId = native.ToString() };
             else if (path.StartsWith("request?")) body = new { pageInfo = new { results = 1 }, results = new[] { Request() } };
+            else if (path == "request/22") body = Request();
             else if (path.StartsWith("search?") || path.StartsWith("discover/")) body = new { totalPages = 1, results = new[] { new { id = 123, mediaType = "movie", title = "A title" } } };
             else if (path == "settings/public") return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { }), Headers = { { "Set-Cookie", "XSRF-TOKEN=csrf; Path=/" } } };
             else body = new { id = 123, title = "A title", mediaInfo = new { status = 5 }, seasons = new[] { new { seasonNumber = 1 } } };

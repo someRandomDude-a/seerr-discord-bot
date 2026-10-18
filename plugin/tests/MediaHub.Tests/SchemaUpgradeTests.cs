@@ -6,6 +6,18 @@ namespace MediaHub.Tests;
 public sealed class SchemaUpgradeTests : IDisposable
 {
     private readonly string directory = Path.Combine(Path.GetTempPath(), "mediahub-schema-upgrade-" + Guid.NewGuid());
+    [Fact]
+    public void SchemaElevenUpgradeAddsOnlyPlaybackJournalAfterVerifiedBackupAndKeepsSettingsAndLegacyRows()
+    {
+        var store = new HubStore(directory); var settings = new SettingsService(store); settings.Update(new(0, false, "https://jellyfin.example", [], "", null, null));
+        var settingsBytes = File.ReadAllBytes(Path.Combine(directory, "settings.json")); var keyBytes = File.ReadAllBytes(Path.Combine(directory, "secrets.key"));
+        using (var db = store.Open()) using (var old = HubStore.Command(db, "DROP TABLE playback_operations; PRAGMA user_version=11; INSERT INTO parties VALUES('legacy','owner','session','group','kept',0,'active')")) old.ExecuteNonQuery();
+        var upgraded = new HubStore(directory); using var ready = upgraded.Open(); using var version = HubStore.Command(ready, "PRAGMA user_version"); Assert.Equal((long)HubStore.SchemaVersion, version.ExecuteScalar());
+        using var legacy = HubStore.Command(ready, "SELECT name FROM parties WHERE id='legacy'"); Assert.Equal("kept", legacy.ExecuteScalar());
+        using var journal = HubStore.Command(ready, "SELECT COUNT(*) FROM playback_operations"); Assert.Equal(0L, journal.ExecuteScalar());
+        Assert.Single(Directory.GetFiles(Path.Combine(directory, "backups"), "*.db")); Assert.Equal(settingsBytes, File.ReadAllBytes(Path.Combine(directory, "settings.json"))); Assert.Equal(keyBytes, File.ReadAllBytes(Path.Combine(directory, "secrets.key")));
+        Assert.Equal(1, new SettingsService(upgraded).Current.Revision);
+    }
     [Theory]
     [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)]
     public void NativePreviewUpgradePreservesQueueSettingsAndUncertainOperations(int version)

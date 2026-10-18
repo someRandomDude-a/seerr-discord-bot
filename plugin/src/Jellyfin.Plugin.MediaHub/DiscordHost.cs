@@ -12,7 +12,6 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
     private HubStore store => provider.GetRequiredService<HubStore>();
     private HostIdentity identity => provider.GetRequiredService<HostIdentity>();
     private SettingsService settings => provider.GetRequiredService<SettingsService>();
-    private PartyService parties => provider.GetRequiredService<PartyService>();
     private DiscordSocketClient? client;
     private int connectionRevision = -1;
     internal DiscordSocketClient? Connection => settings.Current is { DiscordEnabled: true } s && s.Revision == connectionRevision && client is { ConnectionState: ConnectionState.Connected } ? client : null;
@@ -132,9 +131,6 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             var guild = connection.GetGuild(ulong.Parse(guildId)); if (guild is null) continue;
             await guild.CreateApplicationCommandAsync(new SlashCommandBuilder().WithName("hub-link")
                 .WithDescription("Link your Discord account to Jellyfin").Build());
-            await guild.CreateApplicationCommandAsync(new SlashCommandBuilder().WithName("watchparty")
-                .WithDescription("Invite people to your watch party")
-                .AddOption("recipient", ApplicationCommandOptionType.User, "Send a private invitation to this user", false).Build());
             foreach (var command in new[] { ("hub-item", "View a Jellyfin item"), ("hub-follow", "Save a Jellyfin item and subscribe") })
                 await guild.CreateApplicationCommandAsync(new SlashCommandBuilder().WithName(command.Item1).WithDescription(command.Item2)
                     .AddOption("item", ApplicationCommandOptionType.String, "Jellyfin item ID", true).Build());
@@ -161,7 +157,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             Limit(interaction.User.Id);
             if (interaction is SocketSlashCommand slash) await Slash(slash);
             else if (interaction is SocketMessageComponent control && control.Data.CustomId.StartsWith("mediahub:control:", StringComparison.Ordinal)) await MediaClick(control);
-            else if (interaction is SocketMessageComponent button) await JoinButton(button);
+            else if (interaction is SocketMessageComponent button) await LegacyOrConsentButton(button);
         }
         catch (HubError error) { await interaction.FollowupAsync(error.Message, ephemeral: true, allowedMentions: AllowedMentions.None); }
         catch { await interaction.FollowupAsync("Not confirmed. Check the result before retrying.", ephemeral: true, allowedMentions: AllowedMentions.None); }
@@ -173,6 +169,9 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
         if (OperatorCommands.Contains(interaction.CommandName)) { await OperatorSlash(interaction); return; }
         if (MediaCommands.Contains(interaction.CommandName)) { await MediaSlash(interaction); return; }
         if (interaction.CommandName is not ("hub-link" or "watchparty" or "hub-item" or "hub-follow")) throw new HubError("Unknown command.");
+        // An older installation may still have this command registered in Discord. Do not
+        // publish more invitations or remove commands belonging to the companion plugin.
+        if (interaction.CommandName == "watchparty") throw provider.GetRequiredService<WatchPartyIntegration>().Unavailable();
         if (interaction.CommandName == "hub-link")
         {
             var code = store.BeginLink(interaction.User.Id.ToString());
@@ -198,36 +197,8 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             }
             return;
         }
-        if (!provider.GetRequiredService<PageRegistration>().Available)
-            throw new HubError("A compatible Plugin Pages integration must be installed before watch-party invitations can be published.");
-        var party = await parties.Creator(user);
-        var recipient = interaction.Data.Options.FirstOrDefault(option => option.Name == "recipient")?.Value as IUser;
-        if (recipient is not null && (recipient.IsBot || recipient.Id == interaction.User.Id)) throw new HubError("Choose another person, not a bot.");
-        if (recipient is not null)
-        {
-            var member = await ((IGuild)(client?.GetGuild(guild) ?? throw new HubError("Server unavailable."))).GetUserAsync(recipient.Id);
-            if (member is null) throw new HubError("Choose a user in this Discord server.");
-        }
-        else
-        {
-            if (interaction.User is not SocketGuildUser member || interaction.Channel is not SocketGuildChannel channel)
-                throw new HubError("Use a server channel you can send messages in.");
-            var permissions = member.GetPermissions(channel);
-            if (!permissions.ViewChannel || (channel is SocketThreadChannel ? !permissions.SendMessagesInThreads : !permissions.SendMessages))
-                throw new HubError("You cannot publish a party invitation in this channel.");
-        }
-        var invite = store.AddInvite(party, recipient?.Id.ToString(), guild.ToString(),
-            recipient is null ? interaction.ChannelId?.ToString() : null);
-        var button = new ComponentBuilder().WithButton("Verify & join watch party", "mediahub:join:" + invite.Id, ButtonStyle.Primary).Build();
-        const string message = "You're invited to a watch party. Verify your account to join.";
-        // One explicit send only. Ambiguous Discord sends are never replayed.
-        var options = new RequestOptions { RetryMode = RetryMode.AlwaysFail, Timeout = 15000 };
-        if (recipient is not null) await recipient.SendMessageAsync(message, components: button, allowedMentions: AllowedMentions.None, options: options);
-        else if (interaction.Channel is IMessageChannel channel) await channel.SendMessageAsync(message, components: button, allowedMentions: AllowedMentions.None, options: options);
-        else throw new HubError("This channel cannot receive invitations.");
-        await interaction.FollowupAsync(recipient is null ? "Invitation posted." : "Invitation sent.", ephemeral: true, allowedMentions: AllowedMentions.None);
     }
-    private async Task JoinButton(SocketMessageComponent interaction)
+    private async Task LegacyOrConsentButton(SocketMessageComponent interaction)
     {
         const string consentPrefix = "mediahub:consent:";
         if (interaction.Data.CustomId.StartsWith(consentPrefix, StringComparison.Ordinal))
@@ -240,15 +211,8 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             await interaction.FollowupAsync(parts[1] == "yes" ? "Agreed." : "Deletion blocked while your activity is recent.", ephemeral: true, allowedMentions: AllowedMentions.None);
             return;
         }
-        const string prefix = "mediahub:join:";
-        if (!interaction.Data.CustomId.StartsWith(prefix, StringComparison.Ordinal)) throw new HubError("Unknown invitation control.");
-        var session = await identity.DiscordSession(interaction.User.Id.ToString());
-        var invite = store.Invite(interaction.Data.CustomId[prefix.Length..]);
-        invite.RequireAudience(interaction.User.Id.ToString(), interaction.GuildId?.ToString(), interaction.ChannelId?.ToString(), settings.Current.AllowedGuilds);
-        var party = await parties.Live(store.GetParty(invite.PartyId), session);
-        var ticket = store.Ticket(party, session.UserId);
-        await interaction.FollowupAsync("Open Jellyfin Web with your linked account to join. Expires in 2 minutes.",
-            components: new ComponentBuilder().WithButton("Open Jellyfin & join", style: ButtonStyle.Link, url: settings.PartyUrl(ticket)).Build(),
-            ephemeral: true, allowedMentions: AllowedMentions.None);
+        if (interaction.Data.CustomId.StartsWith("mediahub:join:", StringComparison.Ordinal))
+            throw provider.GetRequiredService<WatchPartyIntegration>().Unavailable();
+        throw new HubError("Unknown control.");
     }
 }

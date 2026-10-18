@@ -4,12 +4,13 @@ using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.MediaHub;
+using Jellyfin.Plugin.PrivateSyncPlay.Api;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
-using MediaBrowser.Controller.SyncPlay;
-using MediaBrowser.Controller.SyncPlay.Requests;
-using MediaBrowser.Model.SyncPlay;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -23,13 +24,9 @@ public sealed class HubTests : IDisposable
     private readonly SettingsService settings;
     private readonly Mock<IUserManager> users = new();
     private readonly Mock<ISessionManager> sessions = new();
-    private readonly Mock<ISyncPlayManager> sync = new();
-    private readonly Mock<IPartyMembership> membership = new();
     private readonly HostIdentity identity;
-    private readonly PartyService parties;
     private readonly User user = new("Host", "provider", "reset") { Id = Guid.NewGuid() };
     private readonly SessionInfo browser;
-    private readonly Guid groupId = Guid.NewGuid();
     public HubTests()
     {
         store = new(directory); settings = new(store);
@@ -38,22 +35,8 @@ public sealed class HubTests : IDisposable
         users.Setup(manager => manager.GetUserById(user.Id)).Returns(user);
         sessions.SetupGet(manager => manager.Sessions).Returns([browser]);
         sessions.Setup(manager => manager.GetSessionByAuthenticationToken("valid-user-token", browser.DeviceId, It.IsAny<string>())).ReturnsAsync(browser);
-        membership.Setup(m => m.CreatorSessionJoined(browser.Id, user.Id, groupId)).Returns(true);
-        identity = new(store, settings, users.Object, sessions.Object); parties = new(store, identity, sessions.Object, sync.Object, membership.Object);
+        identity = new(store, settings, users.Object, sessions.Object);
         var code = store.BeginLink("42"); store.Approve(code, user.Id, "42", settings.ProtectLink("valid-user-token", "42", user.Id, browser.DeviceId), browser.DeviceId);
-        sync.Setup(manager => manager.NewGroup(browser, It.IsAny<NewGroupRequest>(), It.IsAny<CancellationToken>()))
-            .Returns(Group());
-        sync.Setup(manager => manager.GetGroup(It.IsAny<SessionInfo>(), groupId)).Returns(Group());
-    }
-    private GroupInfoDto Group(IReadOnlyList<string>? participants = null) => new(groupId, "Party", GroupStateType.Idle, participants ?? [user.Username], DateTime.UtcNow);
-    private Party SavedParty() { var party = new Party(HubStore.Nonce(), user.Id, browser.Id, groupId, "Party", HubStore.Now + 3600, "active"); store.AddParty(party); return party; }
-    [Fact]
-    public async Task SameUsernameWithoutExactCreatorSessionProofCannotAuthorizeInvitations()
-    {
-        var party = SavedParty(); membership.Setup(m => m.CreatorSessionJoined(browser.Id, user.Id, groupId)).Returns(false);
-        await Assert.ThrowsAsync<HubError>(() => parties.Live(party, browser));
-        await Assert.ThrowsAsync<HubError>(() => new PartyService(store, identity, sessions.Object, sync.Object).Live(party, browser));
-        sync.Verify(s => s.JoinGroup(It.IsAny<SessionInfo>(), It.IsAny<JoinGroupRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
     private ClaimsPrincipal Principal(bool apiKey = false) => new(new ClaimsIdentity([
         new("Jellyfin-UserId", user.Id.ToString()), new("Jellyfin-DeviceId", browser.DeviceId),
@@ -69,13 +52,14 @@ public sealed class HubTests : IDisposable
         Assert.Equal("discord-private", new SettingsService(store).DiscordToken());
     }
     [Fact]
-    public void InvitationLinksUseTheOrdinaryUserPluginPagesRouteNotAdminDashboard()
+    public void NativeLinksUseTheOrdinaryUserPluginPagesRouteWithoutRetiredPartyTickets()
     {
         settings.Update(new(0, false, "https://jellyfin.example/base", ["555"], "", null, null));
-        var url = settings.PartyUrl("one-use-ticket");
-        Assert.StartsWith("https://jellyfin.example/base/web/index.html#!/userpluginsettings.html?pageUrl=", url);
-        Assert.Contains("hubTicket=one-use-ticket", url);
-        Assert.Contains("pageUrl=%2Fbase%2Fweb%2FConfigurationPage%3Fname%3Dmediahub", url);
+        var url = settings.WebUrl();
+        Assert.StartsWith("https://jellyfin.example/base/web/index.html#/userpluginsettings.html?pageUrl=", url);
+        Assert.DoesNotContain("hubTicket", url);
+        Assert.Contains("pageUrl=%2Fweb%2FConfigurationPage%3Fname%3Dmediahub", url);
+        Assert.DoesNotContain("pageUrl=%2Fbase", url);
         Assert.DoesNotContain("#!/configurationpage", url);
         Assert.DoesNotContain("valid-user-token", url);
     }
@@ -123,97 +107,77 @@ public sealed class HubTests : IDisposable
         user.SetPermission(PermissionKind.IsDisabled, true);
         await Assert.ThrowsAsync<HubError>(() => identity.Browser(Principal()));
     }
-    [Fact]
-    public async Task CreatorIsActualBrowserUserNotBotOrAdmin()
+    private ServiceProvider WatchPartyServices() => new ServiceCollection()
+        .AddSingleton(identity).AddSingleton(store).AddSingleton(settings).AddSingleton(sessions.Object)
+        .AddPrivateSyncPlayClient().AddSingleton<WatchPartyIntegration>().AddSingleton<WebIntegration>().BuildServiceProvider();
+    private HubController Controller(IServiceProvider services, bool apiKey = false) => new(services)
     {
-        var created = await parties.Create(browser, user, "Watch together", CancellationToken.None);
-        Assert.Equal(browser.Id, created.CreatorSession); Assert.Equal(user.Id, created.Creator); Assert.Equal(groupId, created.Group);
-        sync.Verify(manager => manager.NewGroup(browser, It.Is<NewGroupRequest>(request => request.GroupName == "Watch together"), CancellationToken.None), Times.Once);
+        ControllerContext = new() { HttpContext = new DefaultHttpContext { User = Principal(apiKey) } }
+    };
+    [Fact]
+    public async Task StatusRequiresNoSyncPlayOrCompanionServicesAndDoesNotAdvertiseActiveParties()
+    {
+        using var services = WatchPartyServices();
+        var status = Assert.IsType<OkObjectResult>(await Controller(services).Status());
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(status.Value));
+        Assert.True(json.RootElement.GetProperty("Linked").GetBoolean());
+        Assert.True(json.RootElement.GetProperty("Web").GetProperty("Required").GetBoolean());
+        Assert.False(json.RootElement.GetProperty("Web").GetProperty("RegistrationsReady").GetBoolean());
+        Assert.False(json.RootElement.GetProperty("WatchParty").GetProperty("Available").GetBoolean());
+        Assert.False(json.RootElement.GetProperty("Party").GetProperty("Active").GetBoolean());
+        Assert.Equal(WatchPartyIntegration.UnavailableCode, json.RootElement.GetProperty("WatchParty").GetProperty("Code").GetString());
     }
-    [Fact]
-    public async Task ConcurrentCreateDoesNotCreateDuplicateGroups()
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("close")]
+    public async Task RetiredRoutesRejectWithoutChangingRetainedStateAcrossRestart(string action)
     {
-        var results = await Task.WhenAll(Enumerable.Range(0, 2).Select(async _ =>
-        { try { await parties.Create(browser, user, "Party", CancellationToken.None); return true; } catch (HubError) { return false; } }));
-        Assert.Single(results, success => success);
-        sync.Verify(manager => manager.NewGroup(It.IsAny<SessionInfo>(), It.IsAny<NewGroupRequest>(), It.IsAny<CancellationToken>()), Times.Once);
-    }
-    [Fact]
-    public async Task CannotCreateOrJoinWhenSyncPlayPolicyDisallowsIt()
-    {
-        user.SyncPlayAccess = SyncPlayUserAccessType.None;
-        await Assert.ThrowsAsync<HubError>(() => parties.Create(browser, user, "Party", CancellationToken.None));
-        var party = SavedParty(); var ticket = store.Ticket(party, user.Id);
-        await Assert.ThrowsAsync<HubError>(() => parties.Join(browser, ticket, CancellationToken.None));
-        sync.Verify(manager => manager.JoinGroup(It.IsAny<SessionInfo>(), It.IsAny<JoinGroupRequest>(), It.IsAny<CancellationToken>()), Times.Never);
-    }
-    [Fact]
-    public void TicketsAreAccountBoundOneUseAndSurviveRestart()
-    {
-        var party = SavedParty(); var token = store.Ticket(party, user.Id);
-        Assert.Throws<HubError>(() => store.ConsumeTicket(token, Guid.NewGuid()));
-        Assert.Equal(party.Id, new HubStore(directory).ConsumeTicket(token, user.Id).Id);
-        Assert.Throws<HubError>(() => store.ConsumeTicket(token, user.Id));
-    }
-    [Fact]
-    public async Task ClosedInvitationsAndMissingGroupsNeverJoin()
-    {
-        var party = SavedParty(); var token = store.Ticket(party, user.Id); store.Close(party.Id);
-        await Assert.ThrowsAsync<HubError>(() => parties.Join(browser, token, CancellationToken.None));
-        sync.Verify(manager => manager.JoinGroup(It.IsAny<SessionInfo>(), It.IsAny<JoinGroupRequest>(), It.IsAny<CancellationToken>()), Times.Never);
-    }
-    [Fact]
-    public async Task HostLeavingTheGroupInvalidatesInvitations()
-    {
-        var party = SavedParty(); sync.Setup(manager => manager.GetGroup(browser, groupId)).Returns(Group([]));
-        await Assert.ThrowsAsync<HubError>(() => parties.Live(party, browser));
-    }
-    [Fact]
-    public async Task NativeGroupDisappearanceInvalidatesInvitations()
-    {
-        var party = SavedParty(); sync.Setup(manager => manager.GetGroup(browser, groupId)).Returns((GroupInfoDto)null!);
-        await Assert.ThrowsAsync<HubError>(() => parties.Live(party, browser));
-    }
-    [Fact]
-    public void DmInvitationsCannotBeForwardedOrUsedInAChannel()
-    {
-        var invite = new Invitation("id", "party", "7", "555", null, HubStore.Now + 60);
-        invite.RequireAudience("7", null, "dm", ["555"]);
-        Assert.Throws<HubError>(() => invite.RequireAudience("42", null, "dm", ["555"]));
-        Assert.Throws<HubError>(() => invite.RequireAudience("7", "555", "channel", ["555"]));
-        Assert.Throws<HubError>(() => invite.RequireAudience("7", null, "dm", ["999"]));
-    }
-    [Fact]
-    public void PublicInvitationsAreBoundToOriginalGuildAndChannel()
-    {
-        var invite = new Invitation("id", "party", null, "555", "channel", HubStore.Now + 60);
-        invite.RequireAudience("7", "555", "channel", ["555"]);
-        Assert.Throws<HubError>(() => invite.RequireAudience("7", "999", "channel", ["555", "999"]));
-        Assert.Throws<HubError>(() => invite.RequireAudience("7", "555", "other-channel", ["555"]));
-        Assert.Throws<HubError>(() => invite.RequireAudience("7", null, "dm", ["555"]));
-    }
-    [Fact]
-    public void ExpiredTicketsAndInvitationsCannotBeUsed()
-    {
-        var party = SavedParty(); var ticket = store.Ticket(party, user.Id);
         using (var db = store.Open())
-        using (var command = HubStore.Command(db, "UPDATE tickets SET expires=0")) command.ExecuteNonQuery();
-        Assert.Throws<HubError>(() => store.ConsumeTicket(ticket, user.Id));
-        Assert.Throws<HubError>(() => new Invitation("id", party.Id, null, "555", "channel", 0).RequireAudience("7", "555", "channel", ["555"]));
+        using (var seed = HubStore.Command(db, """
+            INSERT INTO parties VALUES('legacy-party','untrusted-creator','old-session','old-group','retained title',9223372036854775807,'active');
+            INSERT INTO invitations VALUES('legacy-invite','legacy-party','42','555',NULL,9223372036854775807);
+            INSERT INTO tickets VALUES('legacy-ticket','legacy-party','untrusted-user',9223372036854775807,0);
+            """)) seed.ExecuteNonQuery();
+        string Snapshot(HubStore state)
+        {
+            using var db = state.Open();
+            return string.Join("\n", new[] { "parties", "invitations", "tickets" }.Select(table =>
+            {
+                using var query = HubStore.Command(db, "SELECT * FROM " + table);
+                using var reader = query.ExecuteReader(); var rows = new List<string>();
+                while (reader.Read()) { var values = new object[reader.FieldCount]; reader.GetValues(values); rows.Add(JsonSerializer.Serialize(values)); }
+                return string.Join("\n", rows);
+            }));
+        }
+        var before = Snapshot(store);
+        using var services = WatchPartyServices(); var controller = Controller(services);
+        var result = action switch
+        {
+            "create" => await controller.Create(new("must not create"), CancellationToken.None),
+            "join" => await controller.Join(new("legacy-ticket"), CancellationToken.None),
+            _ => await controller.Close("legacy-party")
+        };
+        var rejected = Assert.IsType<ObjectResult>(result); Assert.Equal(503, rejected.StatusCode);
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(rejected.Value));
+        Assert.Equal(WatchPartyIntegration.UnavailableCode, json.RootElement.GetProperty("Code").GetString());
+        Assert.Equal(before, Snapshot(new HubStore(directory)));
+        Assert.Equal(user.Id, store.LinkedUser("42"));
     }
-    [Fact]
-    public async Task AcceptedJoinDoesNotFalselyClaimPlaybackConfirmation()
+    [Theory]
+    [InlineData("create")]
+    [InlineData("join")]
+    [InlineData("close")]
+    public async Task RetiredRoutesStillRequireAnAuthenticatedNativeUserSession(string action)
     {
-        var party = SavedParty(); var token = store.Ticket(party, user.Id);
-        var result = JsonSerializer.Serialize(await parties.Join(browser, token, CancellationToken.None));
-        Assert.Contains("\"Confirmed\":false", result);
-        sync.Verify(manager => manager.JoinGroup(browser, It.Is<JoinGroupRequest>(request => request.GroupId == groupId), CancellationToken.None), Times.Once);
-    }
-    [Fact]
-    public void ClosingInvitesDoesNotDestroyGroupOrKickParticipants()
-    {
-        var party = SavedParty(); parties.Close(browser, party.Id);
-        sync.VerifyNoOtherCalls(); Assert.Equal("closed", store.GetParty(party.Id).State);
+        using var services = WatchPartyServices(); var controller = Controller(services, apiKey: true);
+        var result = action switch
+        {
+            "create" => await controller.Create(new("party"), CancellationToken.None),
+            "join" => await controller.Join(new("ticket"), CancellationToken.None),
+            _ => await controller.Close("party")
+        };
+        Assert.IsType<BadRequestObjectResult>(result);
     }
     public void Dispose() { SqliteConnection.ClearAllPools(); Directory.Delete(directory, true); }
 }

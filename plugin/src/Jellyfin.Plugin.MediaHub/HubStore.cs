@@ -9,27 +9,15 @@ public sealed class HubError(string message, string? code = null) : Exception(me
 {
     public string? Code { get; } = code;
 }
-public sealed record Party(string Id, Guid Creator, string CreatorSession, Guid Group, string Name, long Expires, string State);
-public sealed record Invitation(string Id, string PartyId, string? Recipient, string? Guild, string? Channel, long Expires)
-{
-    public void RequireAudience(string discord, string? guild, string? channel, IReadOnlyCollection<string> allowedGuilds)
-    {
-        if (Guild is null || !allowedGuilds.Contains(Guild) || Expires <= HubStore.Now) throw new HubError("This invitation is unavailable or expired.");
-        if (Recipient is not null)
-        {
-            if (Recipient != discord || guild is not null) throw new HubError("This invitation belongs to another recipient.");
-        }
-        else if (Guild != guild || Channel != channel || channel is null) throw new HubError("Use the invitation in its original Discord server and channel.");
-    }
-}
 
 /// <summary>Plugin-owned database only; no host database connections, attachments or configuration writes.</summary>
 public sealed class HubStore
 {
     // V3 protects extended preferences; V4 adds activity, proposals, votes and notices.
-    public const int SchemaVersion = 11;
+    public const int SchemaVersion = 13;
     public const int ApplicationId = 0x4D485542; // MHUB, only inside hub.db.
     public string DirectoryPath { get; }
+    internal bool NewDatabaseCreated { get; private set; }
     private readonly string connectionString;
     private readonly string databasePath;
     private readonly Action<string>? checkpoint;
@@ -38,6 +26,7 @@ public sealed class HubStore
     private static readonly IReadOnlyDictionary<string, string> Columns = new Dictionary<string, string>
     {
         ["links"] = "discord,user,approved,token,device", ["approvals"] = "hash,discord,expires",
+        // Legacy watch-party tables are retained/validated, never redeemed or auto-migrated.
         ["parties"] = "id,creator,session,group_id,name,expires,state", ["invitations"] = "id,party,recipient,guild,channel,expires",
         ["tickets"] = "hash,party,user,expires,used", ["personal"] = "user,revision,preferences",
         ["subscriptions"] = "user,item,subscribed,created",
@@ -62,7 +51,10 @@ public sealed class HubStore
         ["message_files"] = "id,actor,filename,mime,body,expires,plan",
         ["message_inbox"] = "id,author,author_name,guild,guild_name,channel,channel_name,content,rich,created,edited,deleted,direction,peer,delivery",
         ["link_oauth"] = "state,handoff_hash,handoff,user,browser,verifier,pin,expires,status,discord,cookie",
-        ["deletion_authorizations"] = "proposal,integrity"
+        ["deletion_authorizations"] = "proposal,integrity",
+        ["playback_operations"] = "id,user,state,payload",
+        ["state_seals"] = "scope,integrity",
+        ["watch_reviews"] = "user,payload"
     };
     public HubStore(IApplicationPaths paths) : this(Path.Combine(paths.DataPath, "media-hub")) { }
     public HubStore(string directory) : this(directory, null) { }
@@ -91,7 +83,7 @@ public sealed class HubStore
             BackupBeforeUpgrade(); // If backup creation/verification fails, no migration writes occur.
             using var db = Connect(); Migrate(db);
         }
-        else CreateDatabase();
+        else { CreateDatabase(); NewDatabaseCreated = true; }
         using var ready = Connect();
         using var wal = Command(ready, "PRAGMA journal_mode=WAL"); wal.ExecuteNonQuery();
         using var schema = Command(ready, "PRAGMA schema_version"); verifiedSchema = Convert.ToInt32(schema.ExecuteScalar());
@@ -200,6 +192,18 @@ public sealed class HubStore
         {
             // Never bless old consent/deadlines during migration. Retain old proposals for review/Undo only.
             command.CommandText = "CREATE TABLE IF NOT EXISTS deletion_authorizations(proposal TEXT PRIMARY KEY,integrity TEXT NOT NULL)";
+            command.ExecuteNonQuery();
+        }
+        if (version < 12)
+        {
+            command.CommandText = "CREATE TABLE IF NOT EXISTS playback_operations(id TEXT PRIMARY KEY,user TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL)";
+            command.ExecuteNonQuery();
+        }
+        if (version < 13)
+        {
+            // No old data is authorized by migration. Keyed initialization retains it for
+            // explicit watchlist review and a full activity lookback quarantine.
+            command.CommandText = "CREATE TABLE IF NOT EXISTS state_seals(scope TEXT PRIMARY KEY,integrity TEXT NOT NULL); CREATE TABLE IF NOT EXISTS watch_reviews(user TEXT PRIMARY KEY,payload TEXT NOT NULL)";
             command.ExecuteNonQuery();
         }
         command.CommandText = "PRAGMA user_version=" + SchemaVersion; command.ExecuteNonQuery();
@@ -316,7 +320,7 @@ public sealed class HubStore
         // Adopt only the exact known native preview, never an arbitrary unmarked database.
         using var tables = Command(db, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
         var names = new List<string>(); using (var reader = tables.ExecuteReader()) while (reader.Read()) names.Add(reader.GetString(0));
-        var required = version >= 11 ? Columns.Keys : version >= 10 ? Columns.Keys.Take(28) : version >= 9 ? Columns.Keys.Take(27) : version >= 8 ? Columns.Keys.Take(21) : version >= 7 ? Columns.Keys.Take(16) : version >= 6 ? Columns.Keys.Take(15) : version >= 5 ? Columns.Keys.Take(13) : version >= 4 ? Columns.Keys.Take(11) : version >= 2 ? Columns.Keys.Take(7) : Columns.Keys.Take(5);
+        var required = version >= 13 ? Columns.Keys : version >= 12 ? Columns.Keys.Take(30) : version >= 11 ? Columns.Keys.Take(29) : version >= 10 ? Columns.Keys.Take(28) : version >= 9 ? Columns.Keys.Take(27) : version >= 8 ? Columns.Keys.Take(21) : version >= 7 ? Columns.Keys.Take(16) : version >= 6 ? Columns.Keys.Take(15) : version >= 5 ? Columns.Keys.Take(13) : version >= 4 ? Columns.Keys.Take(11) : version >= 2 ? Columns.Keys.Take(7) : Columns.Keys.Take(5);
         if (required.Except(names, StringComparer.Ordinal).Any() || names.Except(Columns.Keys, StringComparer.Ordinal).Any())
             throw new HubError("Unrecognized Media Hub database schema. It was not changed.");
         foreach (var name in names)
@@ -376,7 +380,7 @@ public sealed class HubStore
     }
     public bool HasCredentials()
     {
-        using var db = Open(); using var command = Command(db, "SELECT 1 FROM links UNION ALL SELECT 1 FROM deletion_runs UNION ALL SELECT 1 FROM extra_requests UNION ALL SELECT 1 FROM link_oauth UNION ALL SELECT 1 FROM request_operations UNION ALL SELECT 1 FROM discord_controls UNION ALL SELECT 1 FROM message_plans UNION ALL SELECT 1 FROM deletion_authorizations LIMIT 1"); return command.ExecuteScalar() is not null;
+        using var db = Open(); using var command = Command(db, "SELECT 1 FROM links UNION ALL SELECT 1 FROM deletion_runs UNION ALL SELECT 1 FROM extra_requests UNION ALL SELECT 1 FROM link_oauth UNION ALL SELECT 1 FROM request_operations UNION ALL SELECT 1 FROM discord_controls UNION ALL SELECT 1 FROM message_plans UNION ALL SELECT 1 FROM deletion_authorizations UNION ALL SELECT 1 FROM playback_operations UNION ALL SELECT 1 FROM state_seals LIMIT 1"); return command.ExecuteScalar() is not null;
     }
     public string BeginLink(string discord)
     {
@@ -415,58 +419,5 @@ public sealed class HubStore
         link.Transaction = transaction; link.ExecuteNonQuery();
         using var consume = Command(db, "DELETE FROM approvals WHERE hash=$0", Hash(code));
         consume.Transaction = transaction; consume.ExecuteNonQuery(); transaction.Commit();
-    }
-    public void AddParty(Party party)
-    {
-        using var db = Open(); using var command = Command(db, "INSERT INTO parties VALUES($0,$1,$2,$3,$4,$5,$6)",
-            party.Id, party.Creator.ToString("N"), party.CreatorSession, party.Group.ToString("N"), party.Name, party.Expires, party.State);
-        command.ExecuteNonQuery();
-    }
-    public Party GetParty(string id)
-    {
-        using var db = Open(); using var command = Command(db, "SELECT * FROM parties WHERE id=$0", id);
-        using var reader = command.ExecuteReader();
-        if (!reader.Read()) throw new HubError("This invitation is unavailable.");
-        return new(reader.GetString(0), Guid.Parse(reader.GetString(1)), reader.GetString(2), Guid.Parse(reader.GetString(3)), reader.GetString(4), reader.GetInt64(5), reader.GetString(6));
-    }
-    public Party? CreatorParty(Guid creator)
-    {
-        using var db = Open(); using var command = Command(db, "SELECT id FROM parties WHERE creator=$0 AND state='active'", creator.ToString("N"));
-        return command.ExecuteScalar() is string id ? GetParty(id) : null;
-    }
-    public void Close(string id)
-    {
-        using var db = Open(); using var command = Command(db, "UPDATE parties SET state='closed' WHERE id=$0", id); command.ExecuteNonQuery();
-    }
-    public Invitation AddInvite(Party party, string? recipient, string? guild, string? channel)
-    {
-        var invite = new Invitation(Nonce(), party.Id, recipient, guild, channel, party.Expires);
-        using var db = Open();
-        using (var prune = Command(db, "DELETE FROM invitations WHERE expires<=$0", Now)) prune.ExecuteNonQuery();
-        using var command = Command(db, "INSERT INTO invitations VALUES($0,$1,$2,$3,$4,$5)",
-            invite.Id, invite.PartyId, recipient, guild, channel, invite.Expires); command.ExecuteNonQuery(); return invite;
-    }
-    public Invitation Invite(string id)
-    {
-        using var db = Open(); using var command = Command(db, "SELECT * FROM invitations WHERE id=$0 AND expires>$1", id, Now);
-        using var reader = command.ExecuteReader(); if (!reader.Read()) throw new HubError("This invitation is unavailable or expired.");
-        return new(reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetInt64(5));
-    }
-    public string Ticket(Party party, Guid user)
-    {
-        var token = Nonce(); using var db = Open();
-        using var prune = Command(db, "DELETE FROM tickets WHERE expires<=$0", Now); prune.ExecuteNonQuery();
-        using var command = Command(db, "INSERT INTO tickets(hash,party,user,expires) VALUES($0,$1,$2,$3)", Hash(token), party.Id, user.ToString("N"), Now + 120);
-        command.ExecuteNonQuery(); return token;
-    }
-    public Party ConsumeTicket(string token, Guid user)
-    {
-        using var db = Open(); using var transaction = db.BeginTransaction();
-        using var read = Command(db, "SELECT party FROM tickets WHERE hash=$0 AND user=$1 AND expires>$2 AND used=0", Hash(token), user.ToString("N"), Now);
-        read.Transaction = transaction;
-        if (read.ExecuteScalar() is not string party) throw new HubError("This join link is expired, already used, or belongs to another user. Click the Discord invitation again.");
-        using var update = Command(db, "UPDATE tickets SET used=1 WHERE hash=$0 AND used=0", Hash(token));
-        update.Transaction = transaction; if (update.ExecuteNonQuery() != 1) throw new HubError("This join link was already used.");
-        transaction.Commit(); return GetParty(party);
     }
 }

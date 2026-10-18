@@ -1,43 +1,17 @@
-# Integrated Media Hub setup tutorial
+# Media Hub connection settings
 
-You do not need to prepare configuration files or read a separate manual before setup.
+Open **Dashboard → Plugins → Media Hub → settings** on latest stable Jellyfin (currently 12.2.0).
 
-1. Install Media Hub on a test Jellyfin 12 host and restart Jellyfin.
-2. Sign in as the Jellyfin administrator and open **Dashboard → Plugins → Media Hub → settings**.
-3. A fresh configuration automatically starts **Set up Media Hub**. Follow its steps; the actual
-   settings forms appear inside the relevant step.
+The **Settings section** dropdown groups Jellyfin/Seerr, Discord, Activity, music, books, messaging,
+removal and approved servers. **Help** buttons and expandable connection details explain fields in
+place. There is no step-by-step wizard or progress state.
 
-The tutorial covers Discord application creation and installation, limited permissions, copying
-the correct IDs/secrets, Seerr account mapping, optional messaging intents, OAuth/Activity directory
-mapping and launching, account linking and safe first reads. Optional integrations can stay off.
-No step requires a broadcast, media request or deletion as a connectivity test.
+- **Save server settings** saves all sections explicitly, with a list of changed fields.
+- Section/help changes do not save, connect, send messages or enable services.
+- Empty password fields keep saved secrets; explicit removal requires confirmation.
+- Reload asks before discarding drafts. Page/account/access changes clear private drafts.
+- Service-folder/profile dropdowns load from saved connections only; discovery never auto-approves servers.
+- Personal preferences, account linking and messaging-operator authority remain separate from server setup.
 
-## Tutorial controls
-
-- **Back / Next:** navigate explanations; neither saves settings nor enables an integration.
-- **Save plugin settings / Save integrations:** explicitly save the displayed configuration form.
-  Saving validates/persists settings; it does not prove a live connection test passed.
-- **Pause tutorial:** return to the regular page without resetting settings or current drafts.
-- **Resume setup tutorial:** continue the unfinished walkthrough.
-- **Restart tutorial:** replay from the first step at any time, without clearing settings,
-  credentials or links. Drafts remain available for review.
-- **Finish tutorial:** remember walkthrough completion, not production approval or successful
-  external-service verification. Unsaved settings block forward configuration/finish actions.
-
-Progress is browser-local, scoped to the native Jellyfin user/server/page, and contains only the
-tutorial version, step and completion flag. Credentials and form drafts are never persisted in
-tutorial storage. Clearing browser storage or changing browsers may require starting again;
-the tutorial still works when storage is unavailable. Server configuration remains unchanged.
-
-## Access and first account link
-
-Integration setup requires a native Jellyfin administrator, not an Activity session or API key.
-Ordinary users open **Media Hub** from Jellyfin's main menu after compatible Plugin Pages and
-File Transformation are available. They request their own `/hub-link` in an allowed Discord
-server, sign in as their own Jellyfin user and explicitly approve the displayed identities.
-Do not promote viewers or approve their links using another account.
-
-Use the [onboarding reference](../plugin/ONBOARDING.md) for additional field-by-field detail,
-[setup guide](setup.md) for installation, and [Activity reference](../plugin/ACTIVITY.md) for
-optional Discord embedding. This remains a test preview; complete the documented acceptance
-and security gates before production use.
+See the [field reference](../plugin/ONBOARDING.md), [installation](setup.md) and
+[feature/acceptance checklist](../plugin/FEATURES.md).

@@ -13,6 +13,28 @@ namespace MediaHub.Tests;
 public sealed class ExtraMediaTests
 {
     private const string Album = "11111111-2222-3333-4444-555555555555";
+    [Fact]
+    public async Task OwnExtraRequestNotificationsUsePinnedIdentityAndCurrentStatusWithoutSubscriptionOrResend()
+    {
+        using var f = new FeatureFixture(); var server = new Server(); using var http = new ServiceHttp(server); var service = new ExtraMedia(f.Store, f.Settings, f.Bridge, http, f.Library.Object, f.Activity);
+        var plan = await service.Prepare(f.User, "music", Album, null, default); Assert.Empty(service.OwnNotificationRequests(f.User));
+        await service.Confirm(f.User, plan.Id, () => Task.CompletedTask, default); Assert.Equal(plan.Id, Assert.Single(service.OwnNotificationRequests(f.User)));
+        Assert.Equal("Not in your library", (await service.OwnRequestStatus(f.User, plan.Id, default)).Status);
+        server.Existing = true; Assert.Equal("Requested", (await service.OwnRequestStatus(f.User, plan.Id, default)).Status); Assert.Empty(service.Watches(f.User)); Assert.Equal(1, server.Posts);
+        using (var db = f.Store.Open()) using (var change = HubStore.Command(db, "UPDATE extra_requests SET foreign_id='21111111-2222-3333-4444-555555555555' WHERE id=$0", plan.Id)) change.ExecuteNonQuery();
+        await Assert.ThrowsAnyAsync<Exception>(() => service.OwnRequestStatus(f.User, plan.Id, default)); Assert.Equal(1, server.Posts); f.Data.VerifyNoOtherCalls();
+    }
+    [Theory]
+    [InlineData("music", Album)] [InlineData("book", "123")]
+    public async Task ResettingConsumedStateCannotReplayAnUnexpiredProofAfterUpstreamRemoval(string kind, string id)
+    {
+        using var f = new FeatureFixture(); var server = new Server(); using var http = new ServiceHttp(server); var service = new ExtraMedia(f.Store, f.Settings, f.Bridge, http, f.Library.Object, f.Activity);
+        var plan = await service.Prepare(f.User, kind, id, kind == "book" ? "456" : null, default);
+        await service.Confirm(f.User, plan.Id, () => Task.CompletedTask, default); Assert.Equal(1, server.Posts); server.RemoveAdded();
+        using (var db = f.Store.Open()) using (var reset = HubStore.Command(db, "UPDATE extra_requests SET state='prepared',result=NULL WHERE id=$0", plan.Id)) reset.ExecuteNonQuery();
+        await Assert.ThrowsAsync<HubError>(() => service.Confirm(f.User, plan.Id, () => Task.CompletedTask, default));
+        await Assert.ThrowsAsync<HubError>(() => new ExtraMedia(f.Store, new SettingsService(f.Store), f.Bridge, http, f.Library.Object, f.Activity).Confirm(f.User, plan.Id, () => Task.CompletedTask, default)); Assert.Equal(1, server.Posts);
+    }
     [Theory]
     [InlineData("music", Album)] [InlineData("book", "123")]
     public async Task OnlySelectedItemIsAddedWithVerifiedProfilesAndNoParentWideSearch(string kind, string id)
@@ -84,6 +106,7 @@ public sealed class ExtraMediaTests
     {
         public bool Excluded, BadProfile, Existing, ChangedParent, LoseResponse;
         public int Posts; public readonly List<string> Bodies = []; public readonly List<HttpMethod> Methods = []; private readonly Dictionary<string, string> added = [];
+        public void RemoveAdded() => added.Clear();
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Methods.Add(request.Method); var music = request.RequestUri!.Host == "lidarr"; var kind = music ? "album" : "book"; var foreign = music ? "foreignAlbumId" : "foreignBookId";

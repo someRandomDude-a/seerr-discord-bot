@@ -18,8 +18,9 @@ public interface IRecentActivity
 }
 
 /// <summary>Explicit item actions only. Never fabricates playback/completion events.</summary>
-public sealed class MediaActivity(HubStore store, ILibraryManager library, IUserManager users, IUserDataManager data) : IRecentActivity
+public sealed class MediaActivity(HubStore store, ILibraryManager library, IUserManager users, IUserDataManager data, SettingsService? settings = null) : IRecentActivity
 {
+    private StateIntegrity Protection => (settings ?? new SettingsService(store)).Protection;
     internal static IReadOnlyList<BaseItem> Related(ILibraryManager library, BaseItem root)
     {
         if (root is not (Series or MediaBrowser.Controller.Entities.Movies.Movie) || root.ProviderIds is null || !root.ProviderIds.TryGetValue("Tmdb", out var id)) return [root];
@@ -47,9 +48,10 @@ public sealed class MediaActivity(HubStore store, ILibraryManager library, IUser
         if (item is null || !item.IsVisibleStandalone(viewer)) throw new HubError("Item unavailable.");
         var now = DateTimeOffset.UtcNow; var root = Root(item);
         // Journal protection first. A failed native update must not erase recent interest.
-        using (var db = store.Open())
-        using (var write = HubStore.Command(db, "INSERT INTO activity VALUES($0,$1,$2) ON CONFLICT(item,user) DO UPDATE SET at=MAX(at,excluded.at)",
-            root.Id.ToString("N"), viewer.Id.ToString("N"), now.ToString("O"))) write.ExecuteNonQuery();
+        Protection.Update("activity", (db, tx) =>
+        {
+            using var write = HubStore.Command(db, "INSERT INTO activity VALUES($0,$1,$2) ON CONFLICT(item,user) DO UPDATE SET at=MAX(at,excluded.at)", root.Id.ToString("N"), viewer.Id.ToString("N"), now.ToString("O")); write.Transaction = tx; return write.ExecuteNonQuery();
+        });
         try
         {
             var previous = data.GetUserData(viewer, item)?.LastPlayedDate;
@@ -61,6 +63,7 @@ public sealed class MediaActivity(HubStore store, ILibraryManager library, IUser
     }
     public IReadOnlyList<RecentViewer> Read(Guid itemId)
     {
+        Protection.RequireActivityWindow();
         var root = library.GetItemById(itemId) ?? throw new HubError("Item unavailable.");
         if (Root(root).Id != root.Id) throw new HubError("Use the show's deletion target.");
         var roots = Related(library, root);
@@ -88,13 +91,13 @@ public sealed class MediaActivity(HubStore store, ILibraryManager library, IUser
                     if (!latest.TryGetValue(user.Id, out var old) || utc > old) latest[user.Id] = utc;
                 }
         }
-        using var db = store.Open(); using var read = HubStore.Command(db, "SELECT user,at FROM activity WHERE item IN (" + string.Join(',', roots.Select((_, i) => "$" + i)) + ")", roots.Select(item => (object?)item.Id.ToString("N")).ToArray());
+        using var db = store.Open(); using var tx = db.BeginTransaction(deferred: true); Protection.Check(db, tx, "activity"); using var read = HubStore.Command(db, "SELECT user,at FROM activity WHERE item IN (" + string.Join(',', roots.Select((_, i) => "$" + i)) + ")", roots.Select(item => (object?)item.Id.ToString("N")).ToArray()); read.Transaction = tx;
         using var reader = read.ExecuteReader();
         while (reader.Read())
         {
             var user = Guid.Parse(reader.GetString(0)); var at = DateTimeOffset.Parse(reader.GetString(1));
             if (!latest.TryGetValue(user, out var old) || at > old) latest[user] = at;
         }
-        return latest.Select(pair => new RecentViewer(pair.Key, pair.Value)).ToArray();
+        reader.Close(); tx.Commit(); return latest.Select(pair => new RecentViewer(pair.Key, pair.Value)).ToArray();
     }
 }

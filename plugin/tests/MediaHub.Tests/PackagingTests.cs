@@ -40,15 +40,15 @@ public sealed class PackagingTests : IDisposable
         instance.OnUninstalling(); Assert.False(Directory.Exists(instance.DataFolderPath));
     }
     [Fact]
-    public void IntegratedSetupTutorialShipsInsideThePluginWithoutAnExternalGuideDependency()
+    public void ConventionalSettingsAndContextualHelpShipInsideThePluginWithoutAnExternalUiDependency()
     {
         using var html = new StreamReader(typeof(Plugin).Assembly.GetManifestResourceStream("Jellyfin.Plugin.MediaHub.Web.hub.html")!);
-        using var script = new StreamReader(typeof(Plugin).Assembly.GetManifestResourceStream("Jellyfin.Plugin.MediaHub.Web.hub.js")!);
+        using var script = new StreamReader(typeof(Plugin).Assembly.GetManifestResourceStream("Jellyfin.Plugin.MediaHub.Web.settings.js")!);
         var page = html.ReadToEnd(); var code = script.ReadToEnd();
-        Assert.Contains("data-tutorial-restart", page); Assert.Contains("data-tutorial-slot=\"config\"", page);
-        Assert.Contains("data-tutorial-slot=\"activity\"", page); Assert.Contains("Finish tutorial", page);
-        Assert.Contains("function setupTutorial()", code); Assert.Contains("value.Revision === 0", code);
-        Assert.Contains("The plugin runs inside Jellyfin", page);
+        Assert.Contains("data-settings-section", page); Assert.Contains("data-configuration", page);
+        Assert.Contains("Save server settings", page); Assert.DoesNotContain("data-tutorial", page);
+        Assert.Contains("JellyfinMediaSettings", code); Assert.Contains("aria-expanded", code);
+        Assert.Contains("Configuration/Options/", code); Assert.DoesNotContain("localStorage", code);
     }
     [Fact]
     public void MaliciousRepositoryJsonAndNewlineVersionsAreRejectedBeforePackaging()
@@ -92,6 +92,18 @@ public sealed class PackagingTests : IDisposable
         File.Delete(Path.Combine(input, "Discord.Net.Rest.dll"));
         Assert.Throws<FileNotFoundException>(() => Build());
         Assert.False(File.Exists(Path.Combine(root, "output", "manifest.json")));
+    }
+    [Fact]
+    public void ReviewedPublicSdkIsRequiredButMainProviderAndEngineAreNeverBundled()
+    {
+        var sdk = Path.Combine(input, "Jellyfin.Plugin.PrivateSyncPlay.Api.dll");
+        Assert.Equal(new Version(1, 1, 0, 0), AssemblyName.GetAssemblyName(sdk).Version);
+        File.WriteAllText(Path.Combine(input, "Jellyfin.Plugin.PrivateSyncPlay.dll"), "must not ship");
+        var result = Build(); using var zip = ZipFile.OpenRead(result.Archive);
+        Assert.Contains(zip.Entries, e => e.FullName == "Jellyfin.Plugin.PrivateSyncPlay.Api.dll");
+        Assert.DoesNotContain(zip.Entries, e => e.FullName == "Jellyfin.Plugin.PrivateSyncPlay.dll");
+        File.WriteAllText(sdk, "unreviewed replacement");
+        Assert.Throws<InvalidDataException>(() => Build("tampered-sdk"));
     }
     [Fact]
     public void AssemblyVersionMustMatchCatalogVersion()

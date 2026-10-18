@@ -5,14 +5,15 @@ background work, configuration and the optional Discord web Activity run through
 No separate application server, admin listener or runtime service is installed.
 
 > **Preview, not production-ready.** Use a test Jellyfin and test Discord application.
-> Automatic deletion defaults off. SyncPlay invitations remain blocked without exact
-> creator-session proof. Provider/client acceptance and several features are still incomplete.
+> Automatic deletion defaults off. Optional watch parties use the separately installed Private
+> SyncPlay provider; see [integration and limits](plugin/WATCHPARTY.md). Provider/client acceptance and several features are still incomplete.
 > See the [feature checklist](plugin/FEATURES.md) and [security review](plugin/SECURITY_REVIEW.md).
 
 ## Install and set up
 
-1. Use an installable, version-matched plugin ZIP on Jellyfin **12.x**. Source files alone do not
-   install a plugin. The package references Jellyfin API **12.0.0** and is also tested against **12.2.0**.
+1. Use an installable, version-matched plugin ZIP on the **latest stable Jellyfin (currently 12.2.0)**.
+   Source files alone do not install a plugin. Build, CI and catalog ABI target only **12.2.0**;
+   older Jellyfin releases are not supported.
 2. When the catalog has been published, add its HTTPS manifest under
    **Dashboard → Plugins → Repositories**:
 
@@ -26,13 +27,12 @@ No separate application server, admin listener or runtime service is installed.
 3. Install **Media Hub (Preview)** and restart Jellyfin. For ordinary-user navigation and login
    resume, install compatible Jellyfin-12 **Plugin Pages** and **File Transformation** versions.
 4. Sign in as the Jellyfin administrator, open **Dashboard → Plugins → Media Hub → settings**,
-   and follow **Set up Media Hub**. It opens automatically for a new configuration.
+   and choose a section under **Server connections and permissions**.
 
-The integrated tutorial walks through Discord app creation, least-privilege permissions,
-IDs/secrets, the actual configuration forms, account linking and optional Activity setup.
-Use **Back / Next / Pause / Resume / Restart tutorial** at any time. Restart does not reset
-settings or links. Only explicit Save actions change configuration; tutorial progress stores no
-credentials or drafts. The [onboarding reference](plugin/ONBOARDING.md) is optional extra detail.
+The integrated settings UI uses section/mode dropdowns, named service-folder/profile choices,
+contextual Help and expandable Discord connection details. One **Save server settings** action
+saves all groups; switching sections preserves drafts without saving or enabling anything.
+No wizard progress or credentials are stored in browser storage. See the [field reference](plugin/ONBOARDING.md).
 
 ## Features
 
@@ -69,7 +69,7 @@ unit tests cannot establish absolute host immunity or production safety.
 Requires **.NET 10 SDK** and **Node 22.12+** for development only. Run from the repository root:
 
 ```sh
-dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.0.0
+dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release
 dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release -p:JellyfinVersion=12.2.0
 npm ci --prefix plugin/web
 npm test --prefix plugin/web
@@ -85,7 +85,7 @@ and the catalog only when explicitly run.
 
 ### Documentation
 
-- [Setup](docs/setup.md) · [Tutorial controls](docs/onboarding.md) · [Detailed plugin reference](plugin/README.md)
+- [Setup](docs/setup.md) · [Connection settings](docs/onboarding.md) · [Detailed plugin reference](plugin/README.md)
 - [Activity configuration](plugin/ACTIVITY.md) · [Implementation plan](plugin/IMPLEMENTATION_PLAN.md)
 - [Feature checklist](plugin/FEATURES.md) · [Safety boundaries](plugin/SAFETY.md)
 - [Security findings](plugin/SECURITY_REVIEW.md) · [Acceptance evidence](plugin/ACCEPTANCE.md)

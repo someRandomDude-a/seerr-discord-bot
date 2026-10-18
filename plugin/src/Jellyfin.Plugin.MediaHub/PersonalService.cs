@@ -6,11 +6,11 @@ using Microsoft.Data.Sqlite;
 namespace Jellyfin.Plugin.MediaHub;
 
 public sealed record ActivityTheme(string Background, string Text, string Accent, string Surface);
-public sealed record PersonalPreferences(bool JellyfinNotifications = true, bool DiscordNotifications = false, bool Muted = false, int? DeletionDelayDays = null, ActivityTheme? Theme = null);
+public sealed record PersonalPreferences(bool JellyfinNotifications = true, bool DiscordNotifications = false, bool Muted = false, int? DeletionDelayDays = null, ActivityTheme? Theme = null, bool OwnRequestNotifications = true);
 public sealed record VisibleItem(Guid Id, string Title, string Kind);
 public sealed record FollowedItem(Guid ItemId, string Title, string Kind, bool Subscribed);
 public sealed record PersonalState(long Revision, PersonalPreferences Preferences, IReadOnlyList<FollowedItem> Watchlist,
-    DeletionRules DeletionRules, int EffectiveDeletionDelayDays, IReadOnlyList<ExternalFollow>? ExternalWatchlist = null, ActivityReceipt? Activity = null, IReadOnlyList<ExtraWatch>? ExtraWatchlist = null);
+    DeletionRules DeletionRules, int EffectiveDeletionDelayDays, IReadOnlyList<ExternalFollow>? ExternalWatchlist = null, ActivityReceipt? Activity = null, IReadOnlyList<ExtraWatch>? ExtraWatchlist = null, bool WatchlistReviewRequired = false);
 
 public interface IViewerMedia
 {
@@ -38,6 +38,7 @@ public sealed class JellyfinViewerMedia(ILibraryManager library) : IViewerMedia
 /// <summary>Per-user watchlist/subscription state; never changes Jellyfin favorites.</summary>
 public sealed class PersonalService(HubStore store, IViewerMedia media, SettingsService? settings = null, MediaActivity? activity = null, WatchlistSync? sync = null, ExtraMedia? extras = null)
 {
+    private StateIntegrity Protection => (settings ?? new SettingsService(store)).Protection;
     private DeletionRules Rules()
     {
         var config = settings?.Current;
@@ -46,8 +47,10 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
     private static string Key(User viewer) => viewer.Id.ToString("N");
     public PersonalState State(User viewer)
     {
+        _ = Protection;
         using var db = store.Open();
         using var transaction = db.BeginTransaction(deferred: true);
+        Protection.Check(db, transaction, "watches");
         using var read = HubStore.Command(db, "SELECT revision,preferences FROM personal WHERE user=$0", Key(viewer));
         read.Transaction = transaction;
         long revision = 0; var preferences = new PersonalPreferences();
@@ -71,11 +74,13 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
         var rules = Rules(); rules.Validate();
         // Admin reductions constrain future proposals, not already-persisted queue deadlines.
         var delay = Math.Clamp(preferences.DeletionDelayDays ?? rules.DefaultDelayDays, rules.DefaultDelayDays, rules.RecentActivityDays);
-        return new(revision, preferences, items, rules, delay, sync?.List(viewer) ?? [], ExtraWatchlist: extras?.Watches(viewer) ?? []);
+        return new(revision, preferences, items, rules, delay, sync?.List(viewer) ?? [], ExtraWatchlist: extras?.Watches(viewer) ?? [], WatchlistReviewRequired: Protection.NeedsWatchReview(Key(viewer)));
     }
     public PersonalState Save(User viewer, long expectedRevision, PersonalPreferences preferences)
     {
+        _ = Protection;
         using var db = store.Open(); using var transaction = db.BeginTransaction();
+        Protection.Check(db, transaction, "watches");
         Validate(preferences);
         _ = Rules().Delay(preferences.DeletionDelayDays);
         Ensure(db, transaction, viewer);
@@ -83,7 +88,7 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
             JsonSerializer.Serialize(preferences), Key(viewer), expectedRevision);
         update.Transaction = transaction;
         if (update.ExecuteNonQuery() != 1) throw new HubError("Your settings changed in another window. Refresh before saving.");
-        transaction.Commit(); return State(viewer);
+        Protection.Seal(db, transaction, "watches"); transaction.Commit(); return State(viewer);
     }
     internal static void Validate(PersonalPreferences preferences)
     {
@@ -96,22 +101,25 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
         command.Transaction = transaction;
         command.ExecuteNonQuery();
     }
-    public PersonalState Bell(User viewer, Guid itemId, bool subscribed, long expectedRevision)
+    public PersonalState Add(User viewer, Guid itemId, long expectedRevision) => Bell(viewer, itemId, false, expectedRevision, saveOnly: true);
+    public PersonalState Bell(User viewer, Guid itemId, bool subscribed, long expectedRevision, bool saveOnly = false)
     {
+        _ = Protection;
         if (media.Find(viewer, itemId) is null) throw new HubError("This item is not accessible to your Jellyfin account.");
         var external = sync?.Identify(viewer, itemId);
-        using var db = store.Open(); using var transaction = db.BeginTransaction(); Ensure(db, transaction, viewer);
+        var aliases = external is { } mapped ? sync?.NativeAliases(viewer, mapped.Key) : null;
+        using var db = store.Open(); using var transaction = db.BeginTransaction(); Protection.Check(db, transaction, "watches"); Ensure(db, transaction, viewer);
         using var revision = HubStore.Command(db, "UPDATE personal SET revision=revision+1 WHERE user=$0 AND revision=$1", Key(viewer), expectedRevision);
         revision.Transaction = transaction;
         if (revision.ExecuteNonQuery() != 1) throw new HubError("Your watchlist changed in another window. Refresh before retrying.");
-        if (subscribed)
+        if (subscribed || saveOnly)
         {
             using var count = HubStore.Command(db, "SELECT COUNT(*) FROM subscriptions WHERE user=$0 AND item<>$1", Key(viewer), itemId.ToString("N"));
             count.Transaction = transaction;
             if ((long)count.ExecuteScalar()! >= 200) throw new HubError("Your watchlist is full (200 items). Remove an item first.");
             using var update = HubStore.Command(db, """
-                INSERT INTO subscriptions VALUES($0,$1,1,$2) ON CONFLICT(user,item) DO UPDATE SET subscribed=1
-                """, Key(viewer), itemId.ToString("N"), HubStore.Now);
+                INSERT INTO subscriptions VALUES($0,$1,$3,$2) ON CONFLICT(user,item) DO UPDATE SET subscribed=CASE WHEN $4=1 THEN subscriptions.subscribed ELSE excluded.subscribed END
+                """, Key(viewer), itemId.ToString("N"), HubStore.Now, subscribed ? 1 : 0, saveOnly ? 1 : 0);
             update.Transaction = transaction;
             update.ExecuteNonQuery();
         }
@@ -121,22 +129,25 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
             update.Transaction = transaction;
             update.ExecuteNonQuery(); // Unsubscribing does not erase a saved title.
         }
-        sync?.NativeIntent(db, transaction, viewer, itemId, external, subscribed);
-        if (!subscribed) WatchlistSync.ClearAlerts(db, transaction, viewer, itemId.ToString("N"));
-        transaction.Commit();
-        var recorded = subscribed ? activity?.Record(viewer, itemId, MediaInteraction.Follow) : null;
+        sync?.NativeIntent(db, transaction, viewer, itemId, external, subscribed, aliases, saveOnly);
+        if (!subscribed && !saveOnly) WatchlistSync.ClearAlerts(db, transaction, viewer, itemId.ToString("N"));
+        Protection.Seal(db, transaction, "watches"); transaction.Commit();
+        var recorded = subscribed || saveOnly ? activity?.Record(viewer, itemId, MediaInteraction.Follow) : null;
         return State(viewer) with { Activity = recorded };
     }
     public PersonalState Remove(User viewer, Guid itemId, long expectedRevision)
     {
-        using var db = store.Open(); using var transaction = db.BeginTransaction(); Ensure(db, transaction, viewer);
+        _ = Protection;
+        var external = sync?.Identify(viewer, itemId);
+        var aliases = external is { } mapped ? sync?.NativeAliases(viewer, mapped.Key) : null;
+        using var db = store.Open(); using var transaction = db.BeginTransaction(); Protection.Check(db, transaction, "watches"); Ensure(db, transaction, viewer);
         using var revision = HubStore.Command(db, "UPDATE personal SET revision=revision+1 WHERE user=$0 AND revision=$1", Key(viewer), expectedRevision);
         revision.Transaction = transaction;
         if (revision.ExecuteNonQuery() != 1) throw new HubError("Your watchlist changed in another window. Refresh before retrying.");
         using var remove = HubStore.Command(db, "DELETE FROM subscriptions WHERE user=$0 AND item=$1", Key(viewer), itemId.ToString("N"));
         remove.Transaction = transaction; remove.ExecuteNonQuery();
-        sync?.RemoveNative(db, transaction, viewer, itemId);
+        sync?.RemoveNative(db, transaction, viewer, itemId, external, aliases ?? []);
         WatchlistSync.ClearAlerts(db, transaction, viewer, itemId.ToString("N"));
-        transaction.Commit(); return State(viewer);
+        Protection.Seal(db, transaction, "watches"); transaction.Commit(); return State(viewer);
     }
 }

@@ -19,7 +19,8 @@ public static partial class CatalogBuilder
     public static readonly string[] RuntimeFiles =
     [
         "Jellyfin.Plugin.MediaHub.dll", "Jellyfin.Plugin.MediaHub.deps.json",
-        "Discord.Net.Core.dll", "Discord.Net.Dave.dll", "Discord.Net.Rest.dll", "Discord.Net.WebSocket.dll", "Newtonsoft.Json.dll"
+        "Discord.Net.Core.dll", "Discord.Net.Dave.dll", "Discord.Net.Rest.dll", "Discord.Net.WebSocket.dll", "Newtonsoft.Json.dll",
+        "Jellyfin.Plugin.PrivateSyncPlay.Api.dll"
     ];
     [GeneratedRegex(@"\A[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\z")]
     private static partial Regex RepositoryPattern();
@@ -80,11 +81,14 @@ public static partial class CatalogBuilder
         var metadata = ReadJson(metadataPath).AsObject();
         if (!Guid.TryParse(metadata["guid"]?.GetValue<string>(), out var guid)) throw new InvalidDataException("Invalid plugin GUID.");
         var targetAbi = metadata["targetAbi"]?.GetValue<string>() ?? "";
-        if (!Version.TryParse(targetAbi, out var abi) || abi.Major != 12) throw new InvalidDataException("Only a validated Jellyfin 12 target ABI can be packaged.");
+        if (!Version.TryParse(targetAbi, out var abi) || abi != new Version(12, 2, 0)) throw new InvalidDataException("Only the latest reviewed Jellyfin 12.2.0 target ABI can be packaged.");
         foreach (var field in new[] { "name", "overview", "description", "category" })
             if (string.IsNullOrWhiteSpace(metadata[field]?.GetValue<string>())) throw new InvalidDataException("Missing metadata: " + field);
         foreach (var name in RuntimeFiles)
             if (!File.Exists(Path.Combine(input, name))) throw new FileNotFoundException("Required release dependency missing: " + name);
+        using (var sdk = File.OpenRead(Path.Combine(input, "Jellyfin.Plugin.PrivateSyncPlay.Api.dll")))
+            if (Convert.ToHexString(SHA256.HashData(sdk)).ToLowerInvariant() != "0cf21a33c9d44fbb294503e52ad61479501811c2447d3e5dd925b49dd62ca136")
+                throw new InvalidDataException("Private SyncPlay public SDK differs from the reviewed 1.1.0 release.");
         if (AssemblyName.GetAssemblyName(Path.Combine(input, RuntimeFiles[0])).Version != parsed)
             throw new InvalidDataException("Manifest version must match the actual plugin assembly version.");
         // Read PE metadata without loading the plugin or its privileged host dependencies.
@@ -171,7 +175,7 @@ public static partial class CatalogBuilder
             <p>Add this manifest URL in Jellyfin Dashboard → Plugins → Repositories:</p>
             <p><a href="manifest.json">{WebUtility.HtmlEncode(repositoryUrl)}</a></p>
             <p><a href="{WebUtility.HtmlEncode(source)}">Download {WebUtility.HtmlEncode(version)}</a> · <a href="SHA256SUMS">SHA-256 checksum</a></p>
-            <p>Restart Jellyfin after installation. Use version-compatible Plugin Pages and File Transformation for the user-facing pages.</p>
+            <p>Install Jellyfin-12.2-compatible File Transformation and Plugin Pages from their upstream repository, then restart. They are required for native Web controls and user-facing pages, but are not bundled.</p>
             <p><a href="https://github.com/{WebUtility.HtmlEncode(repository)}/blob/{tag}/plugin/README.md">Features, limitations and setup</a></p></html>
             """;
         File.WriteAllText(Path.Combine(output, "index.html"), html, new UTF8Encoding(false));

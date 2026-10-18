@@ -39,11 +39,14 @@ public sealed record ExtendedSettings
     public bool ActivityEnabled { get; init; }
     public bool OAuthPkce { get; init; } = true;
     public ArrDestination[] ArrDestinations { get; init; } = [];
+    // Absent optional extensions must not change existing format-3 HMAC serialization.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NotificationHookKeyEncrypted { get; init; }
 }
 public sealed record ExtraServiceUpdate(string Url, string? Key, string Root, int Quality, int Metadata, bool Requests, int DailyLimit = 10);
 public sealed record ExtendedUpdate(ExtraServiceUpdate Lidarr, ExtraServiceUpdate Readarr, string[] Operators, bool SeerrOperators = false,
     bool MessageContent = false, bool MembersIntent = false, string[]? InboxChannels = null, int MessageRetentionDays = 7, int MaxRecipients = 100,
-    string? DiscordApplicationId = null, string? DiscordClientSecret = null, bool? ActivityEnabled = null, bool? OAuthPkce = null, ArrDestination[]? ArrDestinations = null);
+    string? DiscordApplicationId = null, string? DiscordClientSecret = null, bool? ActivityEnabled = null, bool? OAuthPkce = null, ArrDestination[]? ArrDestinations = null, string? NotificationHookKey = null);
 public sealed record SettingsUpdate(int Revision, bool DiscordEnabled, string PublicJellyfinUrl, string[] AllowedGuilds,
     string SeerrUrl, string? DiscordToken, string? SeerrKey, int? RecentActivityDays = null, int? DeletionDelayDays = null, bool? AutomaticDeletion = null, ExtendedUpdate? Features = null);
 
@@ -57,6 +60,7 @@ public sealed class SettingsService
     private readonly byte[] key;
     private readonly Action<string>? checkpoint;
     private HubSettings settings;
+    internal StateIntegrity Protection { get; }
     private static readonly JsonSerializerOptions Json = new() { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
     public SettingsService(HubStore store) : this(store, null) { }
     internal SettingsService(HubStore store, Action<string>? checkpoint)
@@ -64,27 +68,30 @@ public sealed class SettingsService
         directory = store.DirectoryPath; this.checkpoint = checkpoint;
         path = StateFiles.In(directory, "settings.json");
         keyPath = StateFiles.In(directory, "secrets.key");
+        var createdKey = false;
         if (!File.Exists(keyPath))
         {
-            if (File.Exists(path) || File.Exists(StateFiles.In(directory, "settings.previous.json")) || store.HasCredentials())
+            if (File.Exists(path) || File.Exists(StateFiles.In(directory, "settings.previous.json")) || File.Exists(StateFiles.In(directory, "state-auth.json")) || File.Exists(StateFiles.In(directory, "state-auth.previous.json")) || store.HasCredentials())
                 throw new HubError("Plugin encryption key is missing. Restore the backup; do not overwrite retained configuration.");
             using var lease = StateFiles.Lease(directory, "settings.lock");
             if (!File.Exists(keyPath))
             {
-                if (File.Exists(path) || File.Exists(StateFiles.In(directory, "settings.previous.json")) || store.HasCredentials())
+                if (File.Exists(path) || File.Exists(StateFiles.In(directory, "settings.previous.json")) || File.Exists(StateFiles.In(directory, "state-auth.json")) || File.Exists(StateFiles.In(directory, "state-auth.previous.json")) || store.HasCredentials())
                     throw new HubError("Plugin state changed during key initialization. Recheck retained state; no key was replaced.");
                 StateFiles.Publish(directory, "secrets.key", RandomNumberGenerator.GetBytes(32), checkpoint: checkpoint);
+                createdKey = true;
             }
         }
         key = StateFiles.ReadBounded(directory, "secrets.key", 32);
         if (key.Length != 32) throw new HubError("Invalid plugin encryption key.");
         settings = Load(allowUnsigned: true); // Only an elevated review may activate older unsigned settings.
+        Protection = new StateIntegrity(store, this); Protection.Initialize(createdKey);
     }
     public HubSettings Current { get { lock (gate) { settings = Load(); return settings with { AllowedGuilds = [.. settings.AllowedGuilds], Features = settings.Features with { Operators = [.. settings.Features.Operators], InboxChannels = [.. settings.Features.InboxChannels], ArrDestinations = [.. settings.Features.ArrDestinations] } }; } } }
     public object Public() { HubSettings s; lock (gate) s = Load(allowUnsigned: true); s = ReviewOnly(s); return new { s.Revision, s.DiscordEnabled, s.PublicJellyfinUrl, s.AllowedGuilds, s.SeerrUrl, ConfigurationReviewRequired = s.FormatVersion < 3,
         s.RecentActivityDays, s.DeletionDelayDays, s.AutomaticDeletion, Features = new { Lidarr = ExtraPublic(s.Features.Lidarr), Readarr = ExtraPublic(s.Features.Readarr), s.Features.Operators,
             s.Features.SeerrOperators, s.Features.MessageContent, s.Features.MembersIntent, s.Features.InboxChannels, s.Features.MessageRetentionDays, s.Features.MaxRecipients,
-            s.Features.DiscordApplicationId, s.Features.ActivityEnabled, s.Features.OAuthPkce, s.Features.ArrDestinations, HasDiscordClientSecret = s.Features.DiscordClientSecretEncrypted.Length > 0 },
+            s.Features.DiscordApplicationId, s.Features.ActivityEnabled, s.Features.OAuthPkce, s.Features.ArrDestinations, HasNotificationHookKey = !string.IsNullOrEmpty(s.Features.NotificationHookKeyEncrypted), HasDiscordClientSecret = s.Features.DiscordClientSecretEncrypted.Length > 0 },
         HasDiscordToken = s.DiscordTokenEncrypted.Length > 0, HasSeerrKey = s.SeerrKeyEncrypted.Length > 0, FeatureParityComplete = false }; }
     private static string Url(string value, bool https)
     {
@@ -122,6 +129,11 @@ public sealed class SettingsService
         if (f.ArrDestinations is null || f.ArrDestinations.Length > 100 || f.ArrDestinations.Any(d => d is null || d.Service is not ("radarr" or "sonarr") || d.Instance < 0) ||
             f.ArrDestinations.Select(d => (d.Service, d.Instance)).Distinct().Count() != f.ArrDestinations.Length) throw new HubError("Specify unique approved Arr service/instance destinations (maximum 100).");
         foreach (var d in f.ArrDestinations) _ = ServiceAddress.Url(d.Url);
+        if (f.NotificationHookKeyEncrypted is { } encrypted)
+        {
+            var hook = Unprotect(encrypted);
+            if (hook.Length is < 32 or > 256 || hook.Any(char.IsControl)) throw new HubError("Notification signing keys require 32–256 non-control characters, or explicit removal.");
+        }
     }
     internal void RequireArr(string service, int instance, string url)
     {
@@ -189,6 +201,7 @@ public sealed class SettingsService
                     InboxChannels = f.InboxChannels is null ? [] : [.. f.InboxChannels], MessageRetentionDays = f.MessageRetentionDays, MaxRecipients = f.MaxRecipients,
                     DiscordApplicationId = f.DiscordApplicationId ?? settings.Features.DiscordApplicationId, DiscordClientSecretEncrypted = f.DiscordClientSecret is null ? settings.Features.DiscordClientSecretEncrypted : Protect(f.DiscordClientSecret),
                     ActivityEnabled = f.ActivityEnabled ?? settings.Features.ActivityEnabled, OAuthPkce = f.OAuthPkce ?? settings.Features.OAuthPkce,
+                    NotificationHookKeyEncrypted = f.NotificationHookKey is null ? settings.Features.NotificationHookKeyEncrypted : f.NotificationHookKey.Length == 0 ? null : Protect(f.NotificationHookKey),
                     ArrDestinations = f.ArrDestinations is null ? [.. settings.Features.ArrDestinations] : f.ArrDestinations.Select(d => d is null ? throw new HubError("Invalid approved Arr destination.") : d with { Url = ServiceAddress.Url(d.Url) }).ToArray() },
                 RecentActivityDays = update.RecentActivityDays ?? settings.RecentActivityDays,
                 DeletionDelayDays = update.DeletionDelayDays ?? settings.DeletionDelayDays,
@@ -241,10 +254,9 @@ public sealed class SettingsService
     }
     internal bool Authenticated(string purpose, string value, string signature) => signature is { Length: 64 } && signature.All(Uri.IsHexDigit) &&
         CryptographicOperations.FixedTimeEquals(Convert.FromHexString(signature), Convert.FromHexString(Authenticate(purpose, value)));
-    public string PartyUrl(string? ticket = null)
+    public string WebUrl()
     {
-        var url = Current.PublicJellyfinUrl; var basePath = new Uri(url).AbsolutePath.TrimEnd('/');
-        return url + "/web/index.html#!/userpluginsettings.html?pageUrl=" + Uri.EscapeDataString(basePath + "/web/ConfigurationPage?name=mediahub") +
-            (ticket is null ? "" : "&hubTicket=" + Uri.EscapeDataString(ticket));
+        // Plugin Pages adds ApiClient's configured base path to pageUrl.
+        return Current.PublicJellyfinUrl + "/web/index.html#/userpluginsettings.html?pageUrl=" + Uri.EscapeDataString("/web/ConfigurationPage?name=mediahub");
     }
 }

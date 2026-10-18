@@ -11,21 +11,31 @@ public interface IPluginPageBridge
     void Remove();
 }
 
-/// <summary>Optional in-memory companion registration; never edits Jellyfin Web files/settings.</summary>
-public sealed class PluginPageBridge : IPluginPageBridge
+/// <summary>Required in-memory companion registration; never edits Jellyfin Web files/settings.</summary>
+public sealed class PluginPageBridge(WebIntegration? dependencies = null) : IPluginPageBridge
 {
+    private readonly WebIntegration integrations = dependencies ?? new();
     private const string PageId = "media-hub-c70297bf-77bd-4ad4-93c9-f67598519777";
+    internal static readonly string[] PageIds = [PageId, PageId + "-watchlist", PageId + "-notifications"];
     private Type? integration;
     public bool Register()
     {
-        integration = AppDomain.CurrentDomain.GetAssemblies().Select(assembly => assembly.GetType("Jellyfin.Plugin.PluginPages.PluginInterface")).FirstOrDefault(type => type is not null);
-        if (integration is null) return false;
-        var register = integration.GetMethod("RegisterPage", BindingFlags.Public | BindingFlags.Static, [typeof(JObject)])
-            ?? throw new InvalidOperationException("Incompatible Plugin Pages registration API");
-        register.Invoke(null, [JObject.FromObject(new { id = PageId, url = "/web/ConfigurationPage?name=mediahub", displayText = "Media Hub", icon = "groups" })]);
+        integration = integrations.PagesApi();
+        if (integration is null || integrations.TransformationApi() is null) { integrations.Unavailable(WebIntegration.PagesId); return false; }
+        try
+        {
+            foreach (var page in new[] { (Id: PageIds[0], Section: "", Label: "Media Hub", Icon: "groups"), (Id: PageIds[1], Section: "watchlist", Label: "Watchlist", Icon: "bookmark"), (Id: PageIds[2], Section: "notifications", Label: "Notifications", Icon: "notifications") })
+                WebIntegration.Register(integration, false, JObject.FromObject(new { id = page.Id, url = "/web/ConfigurationPage?name=mediahub" + (page.Section.Length == 0 ? "" : "&hubSection=" + page.Section), displayText = page.Label, icon = page.Icon }));
+            integrations.Registered(WebIntegration.PagesId);
+        }
+        catch { try { Remove(); } catch { /* Cleanup only our GUID-scoped registrations. */ } integrations.Unavailable(WebIntegration.PagesId, true); throw; }
         return true;
     }
-    public void Remove() => integration?.GetMethod("RemovePage", [typeof(string)])?.Invoke(null, [PageId]);
+    public void Remove()
+    {
+        try { foreach (var id in PageIds) integration?.GetMethod("RemovePage", [typeof(string)])?.Invoke(null, [id]); }
+        finally { integrations.Unavailable(WebIntegration.PagesId); }
+    }
 }
 
 /// <summary>No stateful constructors or unhandled startup/shutdown exceptions at the host boundary.</summary>
@@ -37,9 +47,9 @@ public sealed class PageRegistration(IPluginPageBridge bridge, ILogger<PageRegis
         try
         {
             if (!cancellationToken.IsCancellationRequested) Available = bridge.Register();
-            if (!Available) log.LogInformation("Media Hub: install a Jellyfin-12-compatible Plugin Pages build for the user-facing menu entry.");
+            if (!Available) log.LogWarning("Media Hub: required File Transformation >= {TransformationMinimum} / Plugin Pages >= {PagesMinimum} are missing or incompatible; install their Jellyfin 12.2 builds and restart.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
         }
-        catch { log.LogWarning("Media Hub page registration failed. Jellyfin continues without the optional Media Hub menu entry."); }
+        catch { log.LogWarning("Media Hub page registration failed. Jellyfin continues; required Web integration remains unavailable."); }
         return Task.CompletedTask;
     }
     public Task StopAsync(CancellationToken cancellationToken)

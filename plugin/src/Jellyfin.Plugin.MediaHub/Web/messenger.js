@@ -6,9 +6,11 @@
         const notice = view.querySelector('[data-message-status]'), inbox = view.querySelector('[data-message-inbox]'), preview = view.querySelector('[data-message-preview]');
         let visible = false, generation = 0, timer, busy = false, polling = false, page = 1, requestId, draft = 0, cached;
         const urls = new Set();
+        const reference = view.querySelector('[data-message-reference]');
+        const snowflake = value => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value);
         const fresh = () => { requestId = window.crypto.randomUUID().replaceAll('-', ''); };
         function button(label, action) {
-            const b = document.createElement('button'); b.type = 'button'; b.className = 'raised emby-button'; b.setAttribute('is', 'emby-button'); b.textContent = label;
+            const b = document.createElement('button', 'emby-button'); b.type = 'button'; b.className = 'raised emby-button'; b.setAttribute('is', 'emby-button'); b.textContent = label;
             b.addEventListener('click', () => void perform(b, action)); return b;
         }
         async function perform(b, action) {
@@ -20,6 +22,8 @@
         function hide() {
             generation++; visible = false; clearInterval(timer); busy = false; polling = false; section.hidden = true; clearUrls();
             compose.reset(); filters.reset(); inbox.replaceChildren(); preview.replaceChildren(); view.querySelector('[data-message-deliveries]').replaceChildren(); view.querySelector('[data-message-paging]').replaceChildren(); notice.textContent = ''; compose.elements.channels.replaceChildren(); requestId = undefined; cached = undefined;
+            reference.replaceChildren(); filters.elements.conversation.replaceChildren(); const all = document.createElement('option'); all.value = ''; all.textContent = 'All accessible conversations'; filters.elements.conversation.append(all);
+            view.querySelector('[data-message-diagnostic-result]').textContent = '';
         }
         async function bytes(path, options = {}) {
             const run = generation;
@@ -43,13 +47,22 @@
                 const a = document.createElement('a'); a.href = url; a.download = name; a.rel = 'noopener'; a.textContent = 'Download ' + name; inbox.append(a); a.click();
             }
         }
-        function render(rows) {
-            clearUrls(); inbox.replaceChildren();
+        function conversation(target, label) {
+            if (target.guild && !snowflake(target.guild) || target.peer && !snowflake(target.peer) || target.channel && !snowflake(target.channel)) throw new Error('Invalid conversation reference.');
+            const value = JSON.stringify(target), select = filters.elements.conversation;
+            if (![...select.options].some(option => option.value === value)) { const option = document.createElement('option'); option.value = value; option.textContent = label; select.append(option); }
+            select.value = value; page = 1;
+        }
+        function render(rows, destination = inbox) {
+            if (destination === inbox) { clearUrls(); inbox.replaceChildren(); }
             for (const row of rows) {
-                const article = document.createElement('article'), h = document.createElement('h3'), text = document.createElement('p');
+                const article = document.createElement('article'), h = document.createElement('h3'), text = document.createElement('p'); article.className = 'verticalSection'; h.className = 'sectionTitle'; text.className = 'listItemBodyText';
                 h.textContent = `${row.AuthorName} · ${row.GuildName || 'DM'}${row.DeliveryState ? ' · ' + row.DeliveryState : ''}`;
                 text.textContent = row.Deleted ? 'Message deleted' : row.Content; article.append(h, text);
+                article.append(button('View this conversation', async () => { conversation(row.Guild ? { guild: row.Guild, channel: row.Channel } : { peer: row.Peer || row.Author, channel: row.Channel }, row.ChannelName || row.AuthorName); await refresh(); }));
                 if (!row.Deleted) {
+                    for (const mention of (row.Rich?.mentions || []).slice(0, 25)) if (snowflake(mention.id)) article.append(button('Messages involving ' + String(mention.name || mention.id), async () => { conversation({ peer: mention.id, ...(row.Guild ? { guild: row.Guild } : {}) }, String(mention.name || mention.id)); await refresh(); }));
+                    if (snowflake(row.Rich?.reply?.id)) article.append(button('View retained referenced message', async () => { const message = await api('Messaging/Inbox/' + row.Rich.reply.id); reference.replaceChildren(); render([message], reference); }));
                     for (const embed of row.Rich?.embeds || []) {
                         const e = document.createElement('blockquote'), title = document.createElement('h4'), body = document.createElement('p'); title.textContent = embed.title; body.textContent = embed.description; e.append(title, body);
                         for (const field of embed.fields || []) { const f = document.createElement('p'); f.textContent = `${field.name}: ${field.value}`; e.append(f); }
@@ -58,13 +71,13 @@
                     }
                     for (const asset of row.Rich?.attachments || []) article.append(button('Download ' + asset.filename, () => file(row.Id, asset.key, asset.filename, false)));
                 }
-                inbox.append(article);
+                destination.append(article);
             }
         }
         function deliveries(jobs) {
             const list = view.querySelector('[data-message-deliveries]'); list.replaceChildren();
             for (const job of jobs) {
-                const row = document.createElement('section'), title = document.createElement('h4'); title.textContent = `${job.Mode} · ${new Date(job.Created).toLocaleString()}`; row.append(title);
+                const row = document.createElement('section'), title = document.createElement('h4'); row.className = 'verticalSection'; title.className = 'sectionTitle'; title.textContent = `${job.Mode} · ${new Date(job.Created).toLocaleString()}`; row.append(title);
                 for (const d of job.Deliveries) { const text = document.createElement('p'); text.textContent = `${d.Destination} · ${d.State === 'uncertain' ? 'Not confirmed · check Discord before a new send' : d.State}`; row.append(text); }
                 list.append(row);
             }
@@ -72,16 +85,18 @@
         async function refresh() {
             if (!visible || polling) return; polling = true; const run = generation;
             const params = new window.URLSearchParams({ kind: filters.elements.kind.value, query: filters.elements.query.value.trim(), page: String(page) });
+            params.set('oldest', filters.elements.order.value);
+            if (filters.elements.conversation.value) for (const [key, value] of Object.entries(JSON.parse(filters.elements.conversation.value))) params.set(key, value);
             try {
                 const [messages, jobs] = await Promise.all([api('Messaging/Inbox?' + params), api('Messaging/History')]);
-                if (run !== generation) return; render(messages.Messages); deliveries(jobs);
+                if (run !== generation) return; reference.replaceChildren(); render(messages.Messages); deliveries(jobs);
                 const paging = view.querySelector('[data-message-paging]'); paging.replaceChildren();
                 if (page > 1) paging.append(button('Previous', async () => { page--; await refresh(); }));
                 if (messages.HasNext) paging.append(button('Next', async () => { page++; await refresh(); }));
             } catch (e) {
                 if (run === generation) {
                     if ([401, 403].includes(e.status)) hide();
-                    else { clearUrls(); inbox.replaceChildren(); preview.replaceChildren(); view.querySelector('[data-message-deliveries]').replaceChildren(); }
+                    else { clearUrls(); inbox.replaceChildren(); preview.replaceChildren(); reference.replaceChildren(); view.querySelector('[data-message-deliveries]').replaceChildren(); }
                     notice.textContent = e.message + ([401, 403].includes(e.status) ? '' : ' Your draft was kept.');
                 }
                 throw e;
@@ -89,6 +104,9 @@
             finally { if (run === generation) polling = false; }
         }
         filters.addEventListener('submit', event => { event.preventDefault(); page = 1; void perform(filters.querySelector('button'), refresh); });
+        view.querySelector('[data-message-diagnostics]').addEventListener('click', event => void perform(event.currentTarget, async () => {
+            const totals = await api('Messaging/Diagnostics'); view.querySelector('[data-message-diagnostic-result]').textContent = 'Your deliveries: ' + (Object.entries(totals).map(([key, value]) => key + ' ' + value).join(', ') || 'none') + '. Blocked/uncertain sends are not automatically retried.';
+        }));
         compose.addEventListener('input', () => { draft++; fresh(); cached = undefined; preview.replaceChildren(); });
         compose.addEventListener('change', () => { draft++; fresh(); cached = undefined; preview.replaceChildren(); });
         compose.addEventListener('submit', event => {

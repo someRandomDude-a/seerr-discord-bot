@@ -34,6 +34,22 @@ test('non-operators never load private inboxes or destinations', async () => {
   try { assert.equal(h.view.querySelector('[data-messenger]').hidden, true); assert.deepEqual(h.calls.map(c => c.path), ['Messaging/Access']); }
   finally { h.close(); }
 });
+
+test('mention and retained-reply navigation are explicit authorized reads without automatic fetching or sending', async () => {
+  const h = await harness();
+  try {
+    const row = { Id: '100', Author: '42', AuthorName: 'Sender', Guild: '555', Channel: '123', ChannelName: '#allowed', Content: 'hello', Rich: { mentions: [{ id: '44', name: '<img src=x>' }], reply: { id: '99', channel: '123' } } };
+    h.control.reply = async path => path.startsWith('Messaging/Inbox?') ? { Messages: [row], HasNext: false } : path === 'Messaging/Inbox/99' ? { ...row, Content: 'retained referenced text', Rich: {} } : undefined;
+    await h.timers[0](); await h.settle();
+    assert.equal(h.calls.some(c => c.path === 'Messaging/Inbox/99'), false);
+    [...h.view.querySelectorAll('[data-message-inbox] button')].find(b => b.textContent === 'View retained referenced message').click(); await h.settle();
+    assert.match(h.view.querySelector('[data-message-reference]').textContent, /retained referenced text/);
+    [...h.view.querySelectorAll('[data-message-inbox] button')].find(b => b.textContent.startsWith('Messages involving')).click(); await h.settle();
+    assert.ok(h.calls.some(c => c.path.includes('peer=44') && c.path.includes('guild=555')));
+    assert.equal(h.calls.some(c => c.body), false); assert.equal(h.view.querySelector('[data-message-inbox] img'), null);
+    h.panel.hide(); assert.equal(h.view.querySelector('[data-message-reference]').childElementCount, 0);
+  } finally { h.close(); }
+});
 test('untrusted message content and rich embeds are text, with no automatic asset fetch', async () => {
   const h = await harness();
   try {
@@ -89,7 +105,7 @@ test('native attachment transfers use the supported Authorization header, never 
     h.dom.window.URL.createObjectURL = () => 'blob:test'; h.dom.window.URL.revokeObjectURL = () => {};
     h.dom.window.HTMLAnchorElement.prototype.click = () => {};
     h.dom.window.fetch = async (url, options) => { transfers.push({ url, options }); return { ok: true, blob: async () => new h.dom.window.Blob(['file']) }; };
-    h.view.querySelector('[data-message-inbox] button').click(); await h.settle(); await h.settle();
+    [...h.view.querySelectorAll('[data-message-inbox] button')].find(b => b.textContent === 'Download file.txt').click(); await h.settle(); await h.settle();
     assert.equal(transfers.length, 1);
     assert.match(transfers[0].url.href, /^https:\/\/jellyfin.example\/base\/MediaHub\/Messaging\/Inbox\//);
     assert.equal(transfers[0].options.headers.Authorization, 'MediaBrowser Token="native-token"');
@@ -107,7 +123,7 @@ test('Activity attachment adapter never requires or reads a native bearer', asyn
     h.client.mediaHubTransfer = async path => { transferred = path; return new h.dom.window.Blob(['file']); };
     h.dom.window.URL.createObjectURL = () => 'blob:test'; h.dom.window.URL.revokeObjectURL = () => {};
     h.dom.window.HTMLAnchorElement.prototype.click = () => {};
-    h.view.querySelector('[data-message-inbox] button').click(); await h.settle(); await h.settle();
+    [...h.view.querySelectorAll('[data-message-inbox] button')].find(b => b.textContent === 'Download file.txt').click(); await h.settle(); await h.settle();
     assert.match(transferred, /^Messaging\/Inbox\/100\/Assets\/attachment-0$/);
     assert.equal(h.calls.at(-1).path, 'Messaging/Access');
     assert.equal(h.view.querySelector('[data-message-status]').textContent, '');

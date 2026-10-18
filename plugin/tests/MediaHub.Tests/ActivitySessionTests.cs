@@ -7,7 +7,6 @@ using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.MediaHub;
 using MediaBrowser.Controller;
-using MediaBrowser.Controller.SyncPlay;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
@@ -65,7 +64,7 @@ public sealed class ActivitySessionTests
         using var f = new FeatureFixture(); var oauth = new FakeOAuth(); var sessions = Sessions(f, oauth); var auth = await Authenticate(sessions);
         var collection = new ServiceCollection(); new ServiceRegistrator().RegisterServices(collection, Mock.Of<IServerApplicationHost>());
         collection.AddSingleton(f.Store); collection.AddSingleton(f.Settings); collection.AddSingleton(f.Identity); collection.AddSingleton(f.Bridge); collection.AddSingleton(sessions);
-        collection.AddSingleton(f.Users.Object); collection.AddSingleton(f.Library.Object); collection.AddSingleton(f.Data.Object); collection.AddSingleton(f.Sessions.Object); collection.AddSingleton(Mock.Of<ISyncPlayManager>());
+        collection.AddSingleton(f.Users.Object); collection.AddSingleton(f.Library.Object); collection.AddSingleton(f.Data.Object); collection.AddSingleton(f.Sessions.Object);
         using var services = collection.BuildServiceProvider();
         ActivityController Controller(string method, string? body = null)
         {
@@ -78,6 +77,13 @@ public sealed class ActivitySessionTests
         using (var db = f.Store.Open()) using (var who = HubStore.Command(db, "SELECT user FROM personal")) Assert.Equal(f.User.Id.ToString("N"), who.ExecuteScalar());
         f.User.SetPermission(PermissionKind.IsAdministrator, true);
         var denied = Assert.IsAssignableFrom<ObjectResult>(await Controller("GET").Api("Settings", CancellationToken.None)); Assert.Equal(400, denied.StatusCode);
+        foreach (var route in new[] { "Parties", "Parties/Join", "Parties/legacy/Close", "Players/Prepare", "Players/forged/Confirm" })
+            Assert.Equal(400, Assert.IsAssignableFrom<ObjectResult>(await Controller("POST", "{}").Api(route, CancellationToken.None)).StatusCode);
+        var status = Assert.IsType<OkObjectResult>(await Controller("GET").Api("Status", CancellationToken.None));
+        using (var json = JsonDocument.Parse(JsonSerializer.Serialize(status.Value)))
+            Assert.False(json.RootElement.GetProperty("WatchParty").GetProperty("Available").GetBoolean());
+        var seerr = Assert.IsType<OkObjectResult>(await Controller("GET").Api("SeerrLink", CancellationToken.None));
+        using (var json = JsonDocument.Parse(JsonSerializer.Serialize(seerr.Value))) Assert.Equal("http://seerr", json.RootElement.GetProperty("Url").GetString());
         var noSession = Controller("GET"); noSession.Request.Headers.Remove("X-MediaHub-Session"); noSession.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity([new("Jellyfin-IsApiKey", "True")], "ApiKey"));
         Assert.Equal(401, Assert.IsAssignableFrom<ObjectResult>(await noSession.Api("Me", CancellationToken.None)).StatusCode);
         f.Data.VerifyNoOtherCalls();

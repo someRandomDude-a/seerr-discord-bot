@@ -4,6 +4,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <JellyfinVersion Condition="'$(JellyfinVersion)' == ''">12.0.0</JellyfinVersion>
+    <!-- Latest stable Jellyfin only. Update with the catalog ABI, CI and companion SDK review. -->
+    <SupportedJellyfinVersion>12.2.0</SupportedJellyfinVersion>
+    <SupportedJellyfinReleaseTag>v12.2</SupportedJellyfinReleaseTag>
+    <JellyfinVersion Condition="'$(JellyfinVersion)' == ''">$(SupportedJellyfinVersion)</JellyfinVersion>
   </PropertyGroup>
+  <Target Name="RequireSupportedJellyfin" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(JellyfinVersion)' != '$(SupportedJellyfinVersion)'" Text="Media Hub targets only the latest reviewed stable Jellyfin $(SupportedJellyfinVersion). Older or unreviewed API overrides are not supported." />
+  </Target>
 </Project>

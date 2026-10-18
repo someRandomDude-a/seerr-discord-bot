@@ -31,6 +31,10 @@ public sealed class MessageController(IServiceProvider services) : ControllerBas
         await messages.Inbox(await Actor(cancellation), kind, guild, peer, channel, query, page, oldest, cancellation));
     [HttpGet("History")]
     public Task<IActionResult> History(CancellationToken cancellation, int page = 1) => Safe(async () => await messages.History(await Actor(cancellation), page, cancellation));
+    [HttpGet("Inbox/{id}")]
+    public Task<IActionResult> Message(string id, CancellationToken cancellation) => Safe(async () => await messages.Message(await Actor(cancellation), id, cancellation));
+    [HttpGet("Diagnostics")]
+    public Task<IActionResult> Diagnostics(CancellationToken cancellation) => Safe(async () => await messages.Diagnostics(await Actor(cancellation), cancellation));
     public sealed record Compose(string Mode, string Content, MessageTarget[] Targets, string[] Uploads, string? RequestId = null, bool Members = false);
     [HttpPost("Prepare")]
     [RequestSizeLimit(65536)]
