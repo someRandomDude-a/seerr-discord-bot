@@ -1,6 +1,7 @@
-param([string]$Dotnet = 'dotnet')
+param([string]$Dotnet = 'dotnet', [ValidateSet('Core', 'Discord')][string]$Plugin = 'Core')
 $ErrorActionPreference = 'Stop'
-$project = Join-Path $PSScriptRoot '../src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj'
+$projectName = if ($Plugin -eq 'Discord') { 'Jellyfin.Plugin.MediaHub.Discord' } else { 'Jellyfin.Plugin.MediaHub' }
+$project = Join-Path $PSScriptRoot "../src/$projectName/$projectName.csproj"
 $json = & $Dotnet list $project package --vulnerable --include-transitive --format json
 if ($LASTEXITCODE -ne 0) { throw 'NuGet advisory lookup failed; no clean result was inferred.' }
 try { $report = ($json -join "`n") | ConvertFrom-Json }

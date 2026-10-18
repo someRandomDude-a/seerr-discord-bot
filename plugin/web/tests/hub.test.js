@@ -51,6 +51,34 @@ test('plugin pages inherit Jellyfin components without independent fonts, themes
     assert.equal(h.view.querySelector('[data-personal]').hidden, false); // Optional settings 403 does not clear verified viewer state.
   } finally { h.close(); }
 });
+test('deletion status is passive and personal messages render as text behind Help', async () => {
+  const h = await harness(undefined, ({ control }) => {
+    control.reply = async options => {
+      if (options.url.endsWith('/Deletions')) return [{ Id: 'proposal', Title: 'Movie', State: 'waiting', Owner: 'Anonymous', CanUndo: false }];
+      if (options.url.endsWith('/Me/Consent')) return [{ Id: 'notice', Proposal: 'proposal', Title: 'Movie', Message: '<img src=x> Review this title' }];
+      if (options.url.endsWith('/proposal/Status')) return { RequiredAction: 'consent_required', YourConsent: 'required', ActivityVerified: true, YourLastActivity: null, DelayDays: 2, AutomaticDeletion: false, Notice: 'notice' };
+    };
+  });
+  try {
+    const list = h.view.querySelector('[data-deletion-list]');
+    [...list.querySelectorAll('button')].find(b => b.textContent === 'Status and your required action').click(); await h.settle();
+    assert.match(list.textContent, /Please choose Yes or No/); assert.match(list.textContent, /Automatic removal: off/);
+    const help = h.view.querySelector('[data-consent-list] [aria-controls]'); const details = h.view.querySelector('#' + help.getAttribute('aria-controls'));
+    assert.equal(details.hidden, true); assert.match(details.textContent, /<img src=x>/); assert.equal(details.querySelector('img'), null);
+    assert.equal(h.calls.filter(c => c.body).length, 0);
+  } finally { h.close(); }
+});
+test('notification preferences have a focused user page without administrator settings', async () => {
+  const h = await harness(undefined, ({ control }) => { control.section = 'preferences'; });
+  try {
+    assert.equal(h.view.querySelector('h1').textContent, 'Your notification preferences');
+    assert.equal(h.view.querySelector('[data-preferences-page]').hidden, false);
+    assert.equal(h.view.querySelector('[data-preferences]').hidden, false);
+    assert.equal(h.view.querySelector('[data-watchlist-page]').hidden, true);
+    assert.equal(h.calls.some(call => call.url.endsWith('/Settings')), false);
+    assert.ok(h.view.querySelector('input[name="deletionMessage"][maxlength="300"]'));
+  } finally { h.close(); }
+});
 test('dedicated watchlist and notification pages show only the selected personal surface and do not load settings', async () => {
   for (const section of ['watchlist', 'notifications']) {
     const h = await harness(undefined, ({ control }) => { control.section = section; });
@@ -517,7 +545,8 @@ test('shared queue uses anonymous server projections and owner-only Undo control
     assert.equal(h.view.querySelector('[data-deletions]').hidden, false);
     assert.equal(h.view.querySelector('[data-deletion-list] img'), null);
     assert.match(h.view.querySelector('[data-deletion-list]').textContent, /Anonymous/);
-    assert.equal(h.view.querySelectorAll('[data-deletion-list] button').length, 1);
+    assert.equal([...h.view.querySelectorAll('[data-deletion-list] button')].filter(button => button.textContent === 'Undo').length, 1);
+    assert.equal([...h.view.querySelectorAll('[data-deletion-list] li')][1].textContent.includes('Undo'), false);
     h.view.querySelector('[data-deletion-list] button').click(); await h.settle();
     assert.ok(h.calls.some(call => call.url === '/MediaHub/Deletions/own/Undo'));
     h.view.dispatchEvent(new h.dom.window.Event('viewhide'));

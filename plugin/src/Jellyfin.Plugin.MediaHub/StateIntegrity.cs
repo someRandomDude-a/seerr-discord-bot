@@ -10,7 +10,9 @@ namespace Jellyfin.Plugin.MediaHub;
 /// Whole valid snapshot replay and OS/key compromise remain explicit trust boundaries.</summary>
 internal sealed class StateIntegrity(HubStore store, SettingsService settings)
 {
-    private sealed record Root(string Id, DateTimeOffset? LegacySince, string[] LegacyUsers, string[] LegacyRequests, Dictionary<string, string> Versions, string Signature = "");
+    private sealed record Root(string Id, DateTimeOffset? LegacySince, string[] LegacyUsers, string[] LegacyRequests, Dictionary<string, string> Versions, string Signature = "",
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] Dictionary<string, string>? AuditHeads = null,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] bool? DiscordMigrated = null);
     private const string FileName = "state-auth.json";
     private static readonly Dictionary<string, string[]> Scopes = new()
     {
@@ -24,6 +26,7 @@ internal sealed class StateIntegrity(HubStore store, SettingsService settings)
     {
         var root = SafeJson.Read<Root>(Encoding.UTF8.GetString(StateFiles.ReadBounded(store.DirectoryPath, FileName, 1024 * 1024)), 1024 * 1024);
         if (root.Id.Length != 48 || !root.Id.All(Uri.IsHexDigit) || root.LegacyUsers.Length > 10000 || root.LegacyRequests.Length > 10000 || root.Versions.Count != Scopes.Count || Scopes.Keys.Any(scope => !root.Versions.TryGetValue(scope, out var version) || version.Length != 48 || !version.All(Uri.IsHexDigit)) ||
+            root.AuditHeads is { } heads && (heads.Count > 5000 || heads.Any(pair => pair.Key.Length != 48 || !pair.Key.All(Uri.IsHexDigit) || pair.Value.Length != 64 || !pair.Value.All(Uri.IsHexDigit))) ||
             !settings.Authenticated("MediaHub.StateRoot.v1", JsonSerializer.Serialize(root with { Signature = "" }), root.Signature)) throw new HubError("Protected state root cannot be verified. Restore a consistent stopped backup; nothing was reset.");
         return root;
     }
@@ -110,9 +113,63 @@ internal sealed class StateIntegrity(HubStore store, SettingsService settings)
         using var read = HubStore.Command(db, "SELECT 1 FROM watch_reviews WHERE user=$0", user); read.Transaction = tx; var needed = read.ExecuteScalar() is null; tx.Commit(); return needed;
     }
     internal bool LegacyRequest(string id) => ReadRoot().LegacyRequests.Contains(id);
+    internal bool DiscordConfigurationMigrated() => ReadRoot().DiscordMigrated == true;
+    internal void MarkDiscordConfigurationMigrated()
+    {
+        // Explicit administrator migration only. The immediate writer transaction
+        // serializes with existing root publishers without touching any host database.
+        using var db = store.Open(); using var tx = db.BeginTransaction(); var root = ReadRoot();
+        if (root.DiscordMigrated != true)
+        {
+            root = root with { DiscordMigrated = true, Signature = "" }; root = root with { Signature = RootSignature(root) };
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(root); if (bytes.Length > 1024 * 1024) throw new HubError("Private authentication root reached its supported budget.");
+            StateFiles.Publish(store.DirectoryPath, FileName, bytes, previous: "state-auth.previous.json");
+        }
+        tx.Commit();
+    }
     internal void RequireActivityWindow()
     {
         if (ReadRoot().LegacySince is { } since && DateTimeOffset.UtcNow < since.AddDays(settings.Current.RecentActivityDays))
             throw new HubError("Legacy local activity has no completeness proof. Removal is blocked until a full configured recent-activity window after the protected-state upgrade. Retained history was not reset.");
+    }
+    private static (string Hash, long Count) AuditSnapshot(SqliteConnection db, SqliteTransaction? tx, string proposal)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var read = HubStore.Command(db, "SELECT sequence,CASE WHEN LENGTH(payload)<=32768 THEN payload ELSE NULL END FROM deletion_audit WHERE proposal=$0 ORDER BY sequence LIMIT 10001", proposal); read.Transaction = tx;
+        using var r = read.ExecuteReader(); long count = 0, bytes = 0;
+        while (r.Read())
+        {
+            if (++count > 10000 || r.GetInt64(0) != count || r.IsDBNull(1)) throw new HubError("Deletion audit history is incomplete or exceeds its budget. Nothing was reset.");
+            var row = JsonSerializer.SerializeToUtf8Bytes(new { Sequence = count, Payload = r.GetString(1) }); bytes += row.Length;
+            if (bytes > 4 * 1024 * 1024) throw new HubError("Deletion audit history reached its storage budget. Existing history was preserved.");
+            hash.AppendData(row); hash.AppendData("\n"u8);
+        }
+        return (Convert.ToHexString(hash.GetHashAndReset()), count);
+    }
+    internal string? CheckAudit(SqliteConnection db, SqliteTransaction? tx, string proposal)
+    {
+        var root = ReadRoot(); var current = AuditSnapshot(db, tx, proposal);
+        if (root.AuditHeads?.TryGetValue(proposal, out var expected) == true)
+        {
+            if (current.Count == 0 || expected != current.Hash) throw new HubError("Deletion audit history was changed, omitted or replayed. Restore a consistent stopped backup; no repair or reset was performed.");
+            return expected;
+        }
+        if (current.Count != 0) throw new HubError("Unverifiable deletion audit history was retained without authorizing it.");
+        return null;
+    }
+    internal string SealAudit(SqliteConnection db, SqliteTransaction tx, string proposal)
+    {
+        var root = ReadRoot(); var snapshot = AuditSnapshot(db, tx, proposal);
+        if (snapshot.Count == 0) throw new HubError("An empty audit journal cannot be authenticated.");
+        var heads = root.AuditHeads is null ? new Dictionary<string, string>() : new(root.AuditHeads);
+        heads[proposal] = snapshot.Hash;
+        if (heads.Count > 5000) throw new HubError("Audit proposal capacity reached. Existing state was retained.");
+        root = root with { AuditHeads = heads, Signature = "" }; root = root with { Signature = RootSignature(root) };
+        var encoded = JsonSerializer.SerializeToUtf8Bytes(root);
+        if (encoded.Length > 1024 * 1024) throw new HubError("Private authentication root reached its safe size. Nothing was published.");
+        // Publication precedes SQLite commit, as for other protected scopes. A torn
+        // publication/commit pair fails closed; never auto-promote a previous root.
+        StateFiles.Publish(store.DirectoryPath, FileName, encoded, previous: "state-auth.previous.json");
+        return snapshot.Hash;
     }
 }

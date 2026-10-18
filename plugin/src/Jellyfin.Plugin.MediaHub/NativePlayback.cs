@@ -5,7 +5,6 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Session;
-using Jellyfin.Plugin.PrivateSyncPlay.Api;
 
 namespace Jellyfin.Plugin.MediaHub;
 
@@ -15,7 +14,7 @@ public sealed record PlaybackReceipt(string Id, string State, bool? ObservedPlay
 public sealed record PlaybackHistory(PlaybackPreview Preview, PlaybackReceipt Receipt);
 
 /// <summary>Only a user's existing real players; explicit once-only native commands, never playback reports or synthetic sessions.</summary>
-public sealed class NativePlayback(HubStore store, SettingsService settings, HostIdentity identity, ISessionManager sessions, ILibraryManager library, IWatchPartyService? parties = null)
+public sealed class NativePlayback(HubStore store, SettingsService settings, HostIdentity identity, ISessionManager sessions, ILibraryManager library, INativePlaybackGuard? guard = null)
 {
     private sealed record Plan(string Actor, string Target, string Device, Guid Item, string Title, string Label, int Configuration, DateTimeOffset Expires);
     private readonly SemaphoreSlim slot = new(1);
@@ -126,16 +125,11 @@ public sealed class NativePlayback(HubStore store, SettingsService settings, Hos
             var user = actor.UserId; var actorId = actor.Id; var actorDevice = actor.DeviceId;
             Actor(actor); var row = Read(actor.UserId, id); if (row.State != "prepared") return Receipt(actor, id);
             if (row.Plan.Actor != actor.Id || row.Plan.Expires <= DateTimeOffset.UtcNow || row.Plan.Configuration != settings.Current.Revision) throw new HubError("Playback preview expired or its actor/configuration changed.");
-            if (parties?.IsAvailable == true)
-            {
-                // Native destination playback is not a bypass for companion-owned group controls.
-                var token = budget.Token;
-                pending = Task.Run(async () =>
-                {
-                    if (await parties.GetCurrentPartyAsync(user, actorId, token) is not null || await parties.GetCurrentPartyAsync(user, row.Plan.Target, token) is not null) throw new HubError("Use Private SyncPlay’s own playback/queue controls while either player is in a party.");
-                }, CancellationToken.None);
-                await pending.WaitAsync(budget.Token);
-            }
+            // Playback is an integration feature, not a standalone deletion operation.
+            // A missing/unhealthy integration cannot silently bypass group authority.
+            if (guard is null) throw new HubError("Discord Integration is required for these player controls.");
+            pending = Task.Run(() => guard.Check(user, actorId, row.Plan.Target, budget.Token), CancellationToken.None);
+            await pending.WaitAsync(budget.Token);
             var target = Target(actor, row.Plan.Target, row.Plan.Device); _ = Item(actor, target, row.Plan.Item); await verifyActor(); Actor(actor); budget.Token.ThrowIfCancellationRequested();
             if (actor.UserId != user || actor.Id != actorId || actor.DeviceId != actorDevice) throw new HubError("Your native actor changed. No command was sent.");
             if (!Transition(actor.UserId, id, "prepared", row.Payload, "sending", row.Plan)) return Receipt(actor, id);

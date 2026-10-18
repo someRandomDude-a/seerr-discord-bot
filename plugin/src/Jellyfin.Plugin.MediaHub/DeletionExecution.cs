@@ -8,8 +8,9 @@ public sealed partial class DeletionQueue
     private void BlockProposal(string id)
     {
         using var db = store.Open(); using var tx = db.BeginTransaction(); var row = Get(db, id, tx); var authenticated = HasAuthorization(db, row, tx);
+        if (row.State == "blocked" && row.Eligible is null && row.Due is null) { tx.Commit(); return; }
         using var update = HubStore.Command(db, "UPDATE deletion_queue SET state='blocked',eligible=NULL,due=NULL,revision=revision+1 WHERE id=$0 AND state IN ('waiting','queued','ready','blocked')", id); update.Transaction = tx;
-        if (update.ExecuteNonQuery() == 1 && authenticated) SealQueue(db, id, tx); tx.Commit();
+        if (update.ExecuteNonQuery() == 1 && authenticated) SealQueue(db, id, tx, "blocked", reason: "verification_unavailable"); tx.Commit();
     }
     private (ArrProof Proof, string State)? Run(QueuedDeletion row)
     {
@@ -17,7 +18,7 @@ public sealed partial class DeletionQueue
         using var reader = read.ExecuteReader();
         if (!reader.Read()) return null;
         var state = reader.GetString(1);
-        return (SafeJson.Read<ArrProof>(settings.Unprotect(reader.GetString(0), ProofPurpose(row.Id, row.Owner, row.Item, state))), state);
+        return (SafeJson.Read<ArrProof>(settings.UnprotectDeletionProof(reader.GetString(0), ProofPurpose(row.Id, row.Owner, row.Item, state)), SettingsService.DeletionProofLimit), state);
     }
     private void Checkpoint(string id, string run, string queue)
     {
@@ -27,10 +28,10 @@ public sealed partial class DeletionQueue
         using var db = store.Open(); using var tx = db.BeginTransaction();
         CheckAuthorization(db, row, tx);
         using var write = HubStore.Command(db, "UPDATE deletion_runs SET state=$0,updated=$1,proof=$3 WHERE proposal=$2 AND state=$4", run, Time(DateTimeOffset.UtcNow), id,
-            settings.Protect(JsonSerializer.Serialize(previous.Proof), ProofPurpose(id, row.Owner, row.Item, run)), previous.State);
+            settings.ProtectDeletionProof(JsonSerializer.Serialize(previous.Proof), ProofPurpose(id, row.Owner, row.Item, run)), previous.State);
         write.Transaction = tx; if (write.ExecuteNonQuery() != 1) throw new HubError("Deletion checkpoint changed.");
         using var status = HubStore.Command(db, "UPDATE deletion_queue SET state=$0,revision=revision+1 WHERE id=$1", queue, id);
-        status.Transaction = tx; status.ExecuteNonQuery(); SealQueue(db, id, tx); tx.Commit();
+        status.Transaction = tx; status.ExecuteNonQuery(); SealQueue(db, id, tx, run); tx.Commit();
     }
     private bool Claim(QueuedDeletion row, ArrProof proof)
     {
@@ -39,9 +40,9 @@ public sealed partial class DeletionQueue
         using var queue = HubStore.Command(db, "UPDATE deletion_queue SET state='executing',revision=revision+1 WHERE id=$0 AND owner=$1 AND state='ready' AND revision=$2", row.Id, Key(row.Owner), row.Revision);
         queue.Transaction = tx; if (queue.ExecuteNonQuery() != 1) return false;
         using var intent = HubStore.Command(db, "UPDATE deletion_runs SET state='sending',updated=$0,proof=$2 WHERE proposal=$1 AND state='prepared'", Time(DateTimeOffset.UtcNow), row.Id,
-            settings.Protect(JsonSerializer.Serialize(proof), ProofPurpose(row.Id, row.Owner, row.Item, "sending")));
+            settings.ProtectDeletionProof(JsonSerializer.Serialize(proof), ProofPurpose(row.Id, row.Owner, row.Item, "sending")));
         intent.Transaction = tx; if (intent.ExecuteNonQuery() != 1) return false;
-        SealQueue(db, row.Id, tx); tx.Commit(); return true;
+        SealQueue(db, row.Id, tx, "deletion_claimed"); tx.Commit(); return true;
     }
     public async Task Execute(User owner, CancellationToken cancellation)
     {

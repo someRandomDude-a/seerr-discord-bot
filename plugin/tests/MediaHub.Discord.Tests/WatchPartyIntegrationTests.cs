@@ -1,3 +1,4 @@
+extern alias Integration;
 using System.Security.Claims;
 using System.Text.Json;
 using Jellyfin.Data;
@@ -10,6 +11,11 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Moq;
 using Xunit;
+using WatchPartyIntegration = Integration::Jellyfin.Plugin.MediaHub.DiscordIntegration.WatchPartyIntegration;
+using WatchPartyFailure = Integration::Jellyfin.Plugin.MediaHub.DiscordIntegration.WatchPartyFailure;
+using WatchPartyController = Integration::Jellyfin.Plugin.MediaHub.DiscordIntegration.WatchPartyController;
+using DiscordPartyCommands = Integration::Jellyfin.Plugin.MediaHub.DiscordIntegration.DiscordPartyCommands;
+using DiscordError = Integration::Jellyfin.Plugin.MediaHub.HubError;
 
 namespace MediaHub.Tests;
 
@@ -28,7 +34,9 @@ public sealed class WatchPartyIntegrationTests
     private static WatchPartyInfo Party(FeatureFixture f, Guid? owner = null) => new(Guid.NewGuid(), owner ?? f.User.Id, WatchPartyVisibility.Private, 4, 1, "never-return-this-code");
     private static WatchPartyInvite Invite(Guid party, CreateInviteOptions options, string? url = null) => new(Guid.NewGuid(), party,
         new Uri(url ?? options.ServerBaseUrl.AbsoluteUri.TrimEnd('/') + "/PrivateSyncPlay/Watch#secret-token-long-enough"), false, 1, options.ExpiresAt);
-    private static WatchPartyIntegration Integration(FeatureFixture f, IWatchPartyService provider) => new(provider, f.Identity, f.Sessions.Object, f.Settings);
+    private static WatchPartyIntegration Integration(FeatureFixture f, IWatchPartyService provider) => new(provider, f.Sessions.Object,
+        id => f.Users.Object.GetUserById(id) is { } user && !user.HasPermission(PermissionKind.IsDisabled),
+        () => f.Settings.Current.PublicJellyfinUrl, value => f.Settings.Authenticate("MediaHub.PartyManagement.v1", value), () => true);
     private static WatchPartyManagement OwnerManagement(Guid party, Guid? account = null, Guid? guest = null) => new(party, new(true, false, true, true, 4), guest is null ? 2 : 3, [],
         [new(Guid.NewGuid(), "Owner", 1, true, new(true, true), new(true, true)), new(account ?? Guid.NewGuid(), "Viewer", 1, false, new(true, false), new(true, false))],
         guest is Guid id ? [new(id, "Anonymous lease", 1)] : [], []);
@@ -90,6 +98,15 @@ public sealed class WatchPartyIntegrationTests
         Assert.False(integration.Status().Available);
         Assert.Equal(503, (await Assert.ThrowsAsync<WatchPartyFailure>(() => integration.Current(actor, default))).Status);
         f.Data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task MissingCoreBlocksNativeWatchPartyOperationsEvenWhenPrivateSyncPlayIsRegistered()
+    {
+        using var f = new FeatureFixture(); var actor = await Actor(f); var provider = Provider();
+        var integration = new WatchPartyIntegration(provider.Object, f.Sessions.Object, _ => true, () => "https://jellyfin.example/base", _ => throw new InvalidOperationException("must not sign"), () => false);
+        Assert.False(integration.Status().Available);
+        Assert.Equal(503, (await Assert.ThrowsAsync<WatchPartyFailure>(() => integration.Current(actor, default))).Status);
+        provider.VerifyNoOtherCalls();
     }
     [Fact]
     public async Task CreationUsesExactActiveActorAndAtomicPrivateSignedInOnlyInviteWithTrustedBase()
@@ -182,7 +199,8 @@ public sealed class WatchPartyIntegrationTests
     public async Task NativeControllerRejectsApiKeyAndCannotAcceptActorFromRequestBody()
     {
         using var f = new FeatureFixture(); var actor = await Actor(f); var provider = Provider();
-        using var services = new ServiceCollection().AddSingleton(f.Identity).AddSingleton(Integration(f, provider.Object)).BuildServiceProvider();
+        var identity = new Integration::Jellyfin.Plugin.MediaHub.HostIdentity(new Integration::Jellyfin.Plugin.MediaHub.Rpc(Mock.Of<Jellyfin.Plugin.WatchlistDeletion.Api.IWatchlistDeletionClient>()), f.Users.Object, f.Sessions.Object);
+        using var services = new ServiceCollection().AddSingleton(identity).AddSingleton(Integration(f, provider.Object)).BuildServiceProvider();
         var http = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity([new("Jellyfin-IsApiKey", "True"), new("Jellyfin-UserId", f.User.Id.ToString())], "ApiKey")) };
         var controller = new WatchPartyController(services) { ControllerContext = new() { HttpContext = http } };
         Assert.Equal(403, Assert.IsType<ObjectResult>(await controller.Create(new("not a host"), default)).StatusCode);
@@ -206,5 +224,43 @@ public sealed class WatchPartyIntegrationTests
             Assert.Equal(429, (await Assert.ThrowsAsync<WatchPartyFailure>(() => integration.Current(actor, default))).Status);
         }
         finally { release.Set(); await finished.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+    }
+    [Fact]
+    public async Task DiscordGeneratesProviderInviteForExactLinkedNativeOwnerWithoutImplementingAdmission()
+    {
+        using var f = new FeatureFixture(); var actor = await Actor(f); var provider = Provider(); var party = Party(f);
+        provider.Setup(p => p.GetCurrentPartyAsync(f.User.Id, actor.Id, It.IsAny<CancellationToken>())).ReturnsAsync(party);
+        provider.Setup(p => p.CreateInviteAsync(f.User.Id, actor.Id, party.PartyId, It.IsAny<CreateInviteOptions>(), It.IsAny<CancellationToken>()))
+            .Returns((Guid _, string _, Guid _, CreateInviteOptions options, CancellationToken _) => Task.FromResult(Invite(party.PartyId, options)));
+        var commands = new DiscordPartyCommands(Integration(f, provider.Object), f.Identity.DiscordSession);
+        var link = await commands.Invite("42", f.User.Id, party.PartyId, default);
+        Assert.Equal("https://jellyfin.example/base/PrivateSyncPlay/Watch#secret-token-long-enough", link.Url);
+        Assert.DoesNotContain("AccessToken", JsonSerializer.Serialize(link));
+        provider.Verify(p => p.CreateInviteAsync(f.User.Id, actor.Id, party.PartyId, It.IsAny<CreateInviteOptions>(), It.IsAny<CancellationToken>()), Times.Once);
+        f.Data.VerifyNoOtherCalls();
+    }
+    [Fact]
+    public async Task DiscordRelinkAfterInviteGenerationWithholdsTheLinkWithoutRollbackOrRetry()
+    {
+        using var f = new FeatureFixture(); var actor = await Actor(f); var provider = Provider(); var party = Party(f); var reads = 0;
+        provider.Setup(p => p.GetCurrentPartyAsync(f.User.Id, actor.Id, It.IsAny<CancellationToken>())).ReturnsAsync(party);
+        provider.Setup(p => p.CreateInviteAsync(f.User.Id, actor.Id, party.PartyId, It.IsAny<CreateInviteOptions>(), It.IsAny<CancellationToken>()))
+            .Returns((Guid _, string _, Guid _, CreateInviteOptions options, CancellationToken _) => Task.FromResult(Invite(party.PartyId, options)));
+        var commands = new DiscordPartyCommands(Integration(f, provider.Object), _ =>
+        {
+            if (++reads > 1) throw new DiscordError("Linked player changed.");
+            return Task.FromResult(actor);
+        });
+        await Assert.ThrowsAsync<DiscordError>(() => commands.Invite("42", f.User.Id, party.PartyId, default));
+        provider.Verify(p => p.CreateInviteAsync(f.User.Id, actor.Id, party.PartyId, It.IsAny<CreateInviteOptions>(), It.IsAny<CancellationToken>()), Times.Once);
+        provider.Verify(p => p.RevokeInviteAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+    [Fact]
+    public async Task DiscordCallerSelectedUserCannotReachTheProvider()
+    {
+        using var f = new FeatureFixture(); var actor = await Actor(f); var provider = Provider();
+        var commands = new DiscordPartyCommands(Integration(f, provider.Object), f.Identity.DiscordSession);
+        await Assert.ThrowsAsync<DiscordError>(() => commands.Create("42", Guid.NewGuid(), "not your player", default));
+        provider.VerifyNoOtherCalls();
     }
 }

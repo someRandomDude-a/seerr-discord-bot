@@ -1,0 +1,8 @@
+{
+  "guid": "8456d36a-3c89-4b6d-9959-9a74566cc252",
+  "name": "Media Hub Discord Integration (Preview)",
+  "overview": "Discord transport and Private SyncPlay controls using the standalone Watchlist Deletion API. Development preview.",
+  "description": "Separate Jellyfin 12.2 / .NET 10 integration plugin. Requires Watchlist Deletion API 1.0 and separately installed Private SyncPlay 0.1.5 / API 1.1. Preserves Discord media commands, operator messaging and private notifications through the core API without a core implementation reference or database driver. Owns its encrypted file-only configuration, native administrator settings page, Activity HTTP/assets and short-lived OAuth sessions. Explicit reviewed migration retains original settings, keys, links and durable message/history state under core custody. An authenticated custody marker prevents missing adapter state from reviving old credentials. No provider, playback engine, sidecar or extra listener is bundled. Gateway and native playback control fail closed without both dependencies. Exact-ZIP deployment and live client/service acceptance are not complete. Do not install this development build in production.",
+  "category": "General",
+  "targetAbi": "12.2.0"
+}

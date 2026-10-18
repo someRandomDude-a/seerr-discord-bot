@@ -4,6 +4,7 @@ using Jellyfin.Database.Implementations.Enums;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
+using Jellyfin.Plugin.WatchlistDeletion.Api;
 
 namespace Jellyfin.Plugin.MediaHub;
 
@@ -99,12 +100,22 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     [HttpGet("Items/{item:guid}/DeletionRequests")]
     public Task<IActionResult> ItemDeletionRequests(Guid item, CancellationToken cancellation) => Safe(async () =>
         await provider.GetRequiredService<IRequestAuthority>().FindOwned(identity.Active((await identity.Browser(User)).UserId), item, cancellation));
+    [HttpGet("Me/DeletionPermission")]
+    public Task<IActionResult> DeletionPermission() => Safe(async () => new { Scope = new DeletionPermissions(settings).Scope(await Viewer()).ToString(), NativeTargetVerificationRequired = true });
+    public sealed record NativeProposal(Guid Item);
+    [HttpPost("Deletions/Native")]
+    public Task<IActionResult> ProposeNativeDeletion(NativeProposal proposal, CancellationToken cancellation) => Safe(async () =>
+    {
+        await deletions.Propose(await Viewer(), 0, proposal.Item, cancellation); return new { Saved = true };
+    });
     [HttpGet("Items/{item:guid}/Controls")]
     public Task<IActionResult> ItemControls(Guid item) => Safe(async () => provider.GetRequiredService<IViewerMedia>().Find(await Viewer(), item) ?? throw new HubError("Item unavailable."));
     [HttpPost("Items/{item:guid}/Details")]
     public Task<IActionResult> NativeDetails(Guid item) => Safe(async () => catalog.NativeDetails(await Viewer(), item, true));
     [HttpGet("Deletions")]
     public Task<IActionResult> Deletions() => Safe(async () => deletions.List(identity.Active((await identity.Browser(User)).UserId)));
+    [HttpGet("Deletions/{id}/Status")]
+    public Task<IActionResult> DeletionStatus(string id) => Safe(async () => deletions.Status(await Viewer(), id));
     [HttpGet("Deletions/{id}/Audit")]
     [Authorize(Policy = Policies.RequiresElevation)]
     public Task<IActionResult> DeletionAudit(string id) => Safe(async () => deletions.Audit(identity.Active((await identity.Browser(User)).UserId), id));
@@ -144,7 +155,10 @@ public sealed class HubController(IServiceProvider provider) : ControllerBase
     public Task<IActionResult> Status() => Safe(async () =>
     {
         var browser = await identity.Browser(User);
-        return new { Linked = store.IsLinked(browser.UserId), WatchParty = watchParty.Status(), Party = watchParty.Status(), Web = provider.GetRequiredService<WebIntegration>().Status(), FeatureParityComplete = false };
+        var party = watchParty.Status();
+        return new { Linked = store.IsLinked(browser.UserId), WatchParty = party, Party = party,
+            DiscordIntegration = new { Installed = provider.GetKeyedService<Func<bool>>(CoreApi.DiscordReadyKey) is not null, Ready = party.Available },
+            Web = provider.GetRequiredService<WebIntegration>().Status(), FeatureParityComplete = false };
     });
     public sealed record Approval(string Code, string DiscordId);
     [HttpPost("Link/Approve")]

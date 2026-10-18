@@ -141,6 +141,16 @@ public sealed class IsolationTests : IDisposable
         await page.StopAsync(CancellationToken.None); Assert.False(page.Available);
     }
     [Fact]
+    public async Task FailingLoggingSinkCannotEscapePluginStartupOrCleanupFailureContainment()
+    {
+        var logger = new ThrowingLogger<PageRegistration>(); var bridge = new Mock<IPluginPageBridge>();
+        bridge.Setup(b => b.Register()).Throws(new IOException("Simulated registration failure"));
+        var pages = new PageRegistration(bridge.Object, logger); await pages.StartAsync(default); Assert.False(pages.Available);
+        bridge.Setup(b => b.Register()).Returns(true); bridge.Setup(b => b.Remove()).Throws(new IOException("Simulated cleanup failure"));
+        await pages.StartAsync(default); Assert.True(pages.Available); await pages.StopAsync(default); Assert.False(pages.Available);
+        Assert.Equal(2, logger.Calls);
+    }
+    [Fact]
     public void ForeignDatabaseAndLinkedStatePathsAreRejectedBeforeWrites()
     {
         Directory.CreateDirectory(PluginData);

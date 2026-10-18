@@ -141,6 +141,7 @@
             form.setAttribute('aria-busy', String(busy));
             form.querySelectorAll('input,select,button').forEach(input => { input.disabled = busy; }); selector.disabled = busy;
             for (const d of definitions) if (d.type === 'password') inputs.get(d.name).disabled = busy || get(d.name + 'Action') === 'remove';
+            if (saved?.DiscordConfigurationOwnedByAdapter) for (const key of ['discord', 'activity', 'messaging']) panels.get(key).querySelectorAll('input,select,button').forEach(input => { input.disabled = true; });
             form.querySelector('[type="submit"]').disabled = busy || conflict || !saved || saved.Revision > 0 && !saved.ConfigurationReviewRequired && changes.childElementCount === 0;
         }
         function draw() { for (const [key, panel] of panels) panel.hidden = key !== selector.value; }
@@ -158,6 +159,12 @@
             approvals.replaceChildren(); candidates.replaceChildren(); for (const row of f.ArrDestinations || []) addApproval(row);
             baseline = snapshot(); changes.replaceChildren(); message.textContent = value.ConfigurationReviewRequired ? 'Older unsigned settings require explicit review and Save. Integrations remain blocked until reviewed.' : 'Saved configuration loaded. Connection tests are separate from saving.';
             summary.textContent = value.Revision === 0 ? 'No settings saved yet. Choose the connections you want; optional features stay disabled until you explicitly save them.' : 'Saved revision ' + value.Revision + ' · Discord bot ' + (value.DiscordEnabled ? 'enabled' : 'disabled') + ' · Activity ' + (f.ActivityEnabled ? 'enabled' : 'disabled') + ' · automatic media removal ' + (value.AutomaticDeletion ? 'enabled' : 'disabled') + '. This is configuration status, not a live connection test.';
+            section.querySelector('[data-discord-ownership]')?.remove();
+            if (value.DiscordConfigurationOwnedByAdapter) {
+                summary.textContent = 'Core revision ' + value.Revision + '. Discord fields here are retained legacy values; manage active Discord configuration in the separate plugin.';
+                const link = document.createElement('a'); link.dataset.discordOwnership = ''; link.className = 'button-link'; link.textContent = 'Configure the separate Discord Integration';
+                link.href = '#/configurationpage?name=mediahub-discord'; summary.after(link);
+            }
             callback.textContent = value.PublicJellyfinUrl ? 'OAuth callback: ' + value.PublicJellyfinUrl.replace(/\/$/, '') + '/MediaHub/Link/OAuth/Callback' : 'Save the public Jellyfin address to display its callback.';
             mapping.textContent = value.PublicJellyfinUrl ? 'Activity mapping target: ' + value.PublicJellyfinUrl.replace(/^https:\/\//, '').replace(/\/$/, '') + '/MediaHub/Activity/' : '';
             draw(); controls();

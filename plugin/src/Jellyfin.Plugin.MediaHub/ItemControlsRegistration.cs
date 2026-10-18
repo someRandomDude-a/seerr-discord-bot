@@ -34,7 +34,7 @@ public sealed class ItemControlsRegistration(ILogger<ItemControlsRegistration> l
             if (bridge is null || integrations.PagesApi() is null || cancellationToken.IsCancellationRequested)
             {
                 integrations.Unavailable(WebIntegration.TransformationId);
-                log.LogWarning("Media Hub requires ABI-compatible File Transformation >= {TransformationMinimum} and Plugin Pages >= {PagesMinimum}. Web controls were not registered; the host is unchanged.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
+                log.SafeWarning("Media Hub requires ABI-compatible File Transformation >= {TransformationMinimum} and Plugin Pages >= {PagesMinimum}. Web controls were not registered; the host is unchanged.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
                 return Task.CompletedTask;
             }
             // Share Plugin Pages' exact index.html pipeline. File Transformation selects
@@ -44,13 +44,13 @@ public sealed class ItemControlsRegistration(ILogger<ItemControlsRegistration> l
             registered = true;
             integrations.Registered(WebIntegration.TransformationId);
         }
-        catch { integrations.Unavailable(WebIntegration.TransformationId, true); log.LogWarning("Media Hub dependency registration failed. Check the required native Web plugins and restart Jellyfin; no host files were edited."); }
+        catch { integrations.Unavailable(WebIntegration.TransformationId, true); log.SafeWarning("Media Hub dependency registration failed. Check the required native Web plugins and restart Jellyfin; no host files were edited."); }
         return Task.CompletedTask;
     }
     public Task StopAsync(CancellationToken cancellationToken)
     {
         try { if (registered) bridge?.GetMethod("RemoveTransformation", [typeof(Guid)])?.Invoke(null, [Id]); }
-        catch { log.LogWarning("Media Hub item-control registration cleanup failed."); }
+        catch { log.SafeWarning("Media Hub item-control registration cleanup failed."); }
         finally { registered = false; integrations.Unavailable(WebIntegration.TransformationId); }
         return Task.CompletedTask;
     }

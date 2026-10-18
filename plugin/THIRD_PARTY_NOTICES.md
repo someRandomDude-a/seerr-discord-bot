@@ -1,9 +1,11 @@
 # Third-party notices
 
-The release ZIP includes Discord.Net Core/Rest/WebSocket/Dave and Newtonsoft.Json.
-The public Private SyncPlay API SDK 1.1.0 is also included (not its provider/engine).
-They retain their upstream MIT licenses. Jellyfin/ASP.NET/SQLite host assemblies
-are referenced but are **not redistributed** in this ZIP.
+The standalone core ZIP includes Newtonsoft.Json and our public API assembly.
+The separate Discord Integration ZIP additionally includes Discord.Net
+Core/Rest/WebSocket/Dave and the **Private SyncPlay API SDK 1.1.0** (not its
+provider/engine). The SDK dependency is retained for provider-generated watch-party
+invitation links. Upstream components retain their MIT licenses.
+Jellyfin/ASP.NET/SQLite host assemblies are referenced but **not redistributed**.
 
 The embedded optional Activity bundle includes the Discord Embedded App SDK 2.4.0
 and its browser dependencies. Their complete license notices are included in the

@@ -7,11 +7,13 @@ import { JSDOM } from 'jsdom';
 const id = '11111111222233334444555555555555';
 async function harness(details = false) {
   const dom = new JSDOM(`<html><body><header class="skinHeader"><div class="headerRight"></div></header><div class="card" data-id="${id}" data-type="Movie" data-serverid="server"></div>${details ? '<div class="itemDetailPage"><div class="detailButtons"><button data-native-play>Native play</button></div></div>' : ''}</body></html>`, { pretendToBeVisual: true, url: 'https://jellyfin.example/base/web/index.html' + (details ? '#/details?id=' + id + '&serverId=server' : '') });
-  const calls = [], timers = []; const state = { user: 'viewer', revision: 0, subscribed: false, saved: false, queue: [], consent: [], feed: [], denied: false };
+  const calls = [], timers = []; const state = { user: 'viewer', revision: 0, subscribed: false, saved: false, queue: [], consent: [], feed: [], denied: false, scope: 'OwnRequests' };
   dom.window.ApiClient = { getCurrentUserId: () => state.user, serverId: () => 'server', getUrl: path => '/base/' + path,
     ajax: async options => {
       const body = options.data ? JSON.parse(options.data) : null; calls.push({ path: options.url, body });
       if (state.denied) throw { status: 403 };
+      if (options.url.endsWith('/Me/DeletionPermission')) return { Scope: state.scope };
+      if (options.url.endsWith('/Deletions/Native')) return { Saved: true };
       if (options.url.endsWith('/Me/Consent')) return state.consent;
       if (options.url.includes('/Me/Consent/')) { state.consent = []; return { Saved: true }; }
       if (options.url.endsWith('/Me/Notifications')) return state.feed;
@@ -49,6 +51,41 @@ test('card deletion requires an owned request choice and explicit confirmation',
     assert.equal(h.calls.some(call => call.path.endsWith('/Deletions') && call.body), false);
     controls.querySelector('[data-request-choice]').click(); await h.settle();
     const write = h.calls.find(call => call.path.endsWith('/Deletions') && call.body); assert.equal(write.body.RequestId, 7); assert.equal(write.body.Item, id);
+  } finally { h.close(); }
+});
+test('native item context menu is extended without replacing commands or mutating on open', async () => {
+  const h = await harness();
+  try {
+    const card = h.dom.window.document.querySelector('.card'); const event = new h.dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }); card.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+    const menu = h.dom.window.document.createElement('ul'); menu.className = 'MuiMenu-list'; menu.setAttribute('role', 'menu');
+    const native = h.dom.window.document.createElement('li'); native.className = 'MuiMenuItem-root'; native.setAttribute('role', 'menuitem'); native.textContent = 'Native command'; menu.append(native); h.dom.window.document.body.append(menu); await h.settle();
+    const extra = menu.querySelector('[data-mediahub-context]'); assert.ok(extra); assert.equal(menu.firstChild, native);
+    assert.equal(h.calls.some(c => c.body), false); extra.click(); await h.settle();
+    const dialog = h.dom.window.document.querySelector('[data-mediahub-item-settings]'); assert.ok(dialog); assert.match(dialog.textContent, /Opening this dialog does not record activity/);
+    assert.equal(h.calls.some(c => c.body), false); const subscribe = [...dialog.querySelectorAll('button')].find(b => b.textContent === 'Subscribe to this item'); subscribe.click(); await h.settle();
+    assert.equal(h.calls.filter(c => c.body).length, 1); assert.equal(subscribe.disabled, true);
+    h.state.user = ''; await h.timers[0](); await h.settle(); assert.equal(dialog.isConnected, false); assert.equal(menu.firstChild, native); assert.equal(menu.querySelector('[data-mediahub-context]'), null);
+  } finally { h.close(); }
+});
+test('unsupported and unrelated native menus are left alone', async () => {
+  const h = await harness(true);
+  try {
+    const avatar = h.dom.window.document.createElement('button'); avatar.className = 'MuiIconButton-root'; h.dom.window.document.querySelector('header').append(avatar); avatar.click();
+    const menu = h.dom.window.document.createElement('ul'); menu.className = 'MuiMenu-list'; menu.setAttribute('role', 'menu'); menu.innerHTML = '<li class="MuiMenuItem-root" role="menuitem">Account</li>'; h.dom.window.document.body.append(menu); await h.settle();
+    assert.equal(menu.querySelector('[data-mediahub-context]'), null); assert.equal(h.calls.some(c => c.body), false);
+  } finally { h.close(); }
+});
+test('explicit any-item permission uses only the core verified native proposal endpoint after confirmation', async () => {
+  const h = await harness();
+  try {
+    h.state.scope = 'AnyAccessibleItem'; await h.timers[0](); await h.settle();
+    const controls = h.dom.window.document.querySelector('[data-mediahub-controls]'); controls.querySelector('[data-deletion-propose]').click(); await h.settle();
+    assert.equal(h.calls.some(c => c.body), false); assert.equal(h.calls.some(c => c.path.endsWith('/DeletionRequests')), false);
+    assert.match(controls.querySelector('[data-request-choice]').textContent, /verified item/);
+    controls.querySelector('[data-request-choice]').click(); await h.settle();
+    const writes = h.calls.filter(c => c.body); assert.equal(writes.length, 1); assert.ok(writes[0].path.endsWith('/Deletions/Native')); assert.deepEqual(writes[0].body, { Item: id });
+    h.state.scope = 'Denied'; await h.timers[0](); await h.settle(); assert.equal(controls.querySelector('[data-deletion-propose]').disabled, true);
   } finally { h.close(); }
 });
 test('account changes and stopping remove all plugin-owned controls', async () => {
@@ -121,7 +158,7 @@ test('removal markers describe proposals, never promise deletion, and consent re
     assert.equal(details.hidden, true); assert.equal(help.getAttribute('aria-expanded'), 'false');
     help.click(); assert.equal(details.hidden, false); assert.equal(help.getAttribute('aria-expanded'), 'true');
     assert.match(details.textContent, /Every current recent viewer must agree/); assert.match(details.textContent, /Automatic removal is off/);
-    assert.match(details.textContent, /original requester/); assert.match(details.textContent, /2 days/);
+    assert.match(details.textContent, /own-request or any-accessible-item/); assert.match(details.textContent, /2 days/);
     assert.equal([...menu.querySelectorAll('button')].find(node => node.textContent === 'Yes').classList.contains('button-submit'), true);
     help.click(); assert.equal(details.hidden, true);
     assert.equal(h.calls.some(row => row.body), false);
@@ -219,7 +256,8 @@ test('notification keyboard navigation wraps both directions without focusing th
   const h = await harness();
   try {
     h.dom.window.document.querySelector('[data-notification-bell]').click(); await h.settle();
-    const menu = h.dom.window.document.querySelector('[role="dialog"]'), close = [...menu.querySelectorAll('button')].find(node => node.textContent === 'Close'), all = menu.querySelector('a');
+    const menu = h.dom.window.document.querySelector('[role="dialog"]'), close = [...menu.querySelectorAll('button')].find(node => node.textContent === 'Close'), all = [...menu.querySelectorAll('a')].at(-1);
+    assert.equal(all.textContent, 'Notification preferences');
     all.focus(); all.dispatchEvent(new h.dom.window.KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
     assert.equal(h.dom.window.document.activeElement, close);
     close.dispatchEvent(new h.dom.window.KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));

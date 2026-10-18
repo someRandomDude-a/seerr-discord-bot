@@ -24,7 +24,7 @@ public sealed class PluginPageBridge(WebIntegration? dependencies = null) : IPlu
         if (integration is null || integrations.TransformationApi() is null) { integrations.Unavailable(WebIntegration.PagesId); return false; }
         try
         {
-            foreach (var page in new[] { (Id: PageIds[0], Section: "", Label: "Media Hub", Icon: "groups"), (Id: PageIds[1], Section: "watchlist", Label: "Watchlist", Icon: "bookmark"), (Id: PageIds[2], Section: "notifications", Label: "Notifications", Icon: "notifications") })
+            foreach (var page in new[] { (Id: PageIds[0], Section: "deletions", Label: "Deletion queue", Icon: "delete_sweep"), (Id: PageIds[1], Section: "watchlist", Label: "Watchlist", Icon: "bookmark"), (Id: PageIds[2], Section: "notifications", Label: "Notifications", Icon: "notifications") })
                 WebIntegration.Register(integration, false, JObject.FromObject(new { id = page.Id, url = "/web/ConfigurationPage?name=mediahub" + (page.Section.Length == 0 ? "" : "&hubSection=" + page.Section), displayText = page.Label, icon = page.Icon }));
             integrations.Registered(WebIntegration.PagesId);
         }
@@ -47,15 +47,15 @@ public sealed class PageRegistration(IPluginPageBridge bridge, ILogger<PageRegis
         try
         {
             if (!cancellationToken.IsCancellationRequested) Available = bridge.Register();
-            if (!Available) log.LogWarning("Media Hub: required File Transformation >= {TransformationMinimum} / Plugin Pages >= {PagesMinimum} are missing or incompatible; install their Jellyfin 12.2 builds and restart.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
+            if (!Available) log.SafeWarning("Media Hub: required File Transformation >= {TransformationMinimum} / Plugin Pages >= {PagesMinimum} are missing or incompatible; install their Jellyfin 12.2 builds and restart.", WebIntegration.TransformationMinimum, WebIntegration.PagesMinimum);
         }
-        catch { log.LogWarning("Media Hub page registration failed. Jellyfin continues; required Web integration remains unavailable."); }
+        catch { log.SafeWarning("Media Hub page registration failed. Jellyfin continues; required Web integration remains unavailable."); }
         return Task.CompletedTask;
     }
     public Task StopAsync(CancellationToken cancellationToken)
     {
         try { if (Available) bridge.Remove(); }
-        catch { log.LogWarning("Media Hub page cleanup failed; no host settings or web files were changed."); }
+        catch { log.SafeWarning("Media Hub page cleanup failed; no host settings or web files were changed."); }
         finally { Available = false; }
         return Task.CompletedTask;
     }

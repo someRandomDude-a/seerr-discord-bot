@@ -67,10 +67,7 @@ public sealed class Messaging(HubStore store, SettingsService settings, Operator
         using var plans = HubStore.Command(db, "UPDATE message_plans SET content='',destinations='[]',uploads='[]',state='retained',fingerprint=CASE WHEN json_valid(fingerprint) THEN json_object('Request',json_extract(fingerprint,'$.Request'),'ConfigurationRevision',0,'Files',json('[]'),'Integrity','') ELSE fingerprint END WHERE created<$0", cutoff); plans.Transaction = tx; plans.ExecuteNonQuery();
     }
     internal static string Filename(string name)
-    {
-        name = name.Replace('\\', '/').Split('/').Last(); name = new string(name.Where(c => !char.IsControl(c) && c is not ('"' or ':' or '<' or '>' or '|')).Take(120).ToArray()).Trim();
-        return string.IsNullOrEmpty(name) || name is "." or ".." ? "file" : name;
-    }
+        => Jellyfin.Plugin.WatchlistDeletion.Api.MediaPresentation.Filename(name);
     internal static string Mime(byte[] bytes)
     {
         // Only raster magic is trusted. HTML/SVG and MIME labels supplied by Discord/browser remain downloads.
@@ -161,7 +158,7 @@ public sealed class Messaging(HubStore store, SettingsService settings, Operator
         var id = HubStore.Nonce(); var expires = DateTimeOffset.UtcNow.AddMinutes(2);
         var fileSeals = fileRows.Select(f => new FileSeal(f.Meta.Id, f.Blob.Filename, f.Blob.Mime, f.Blob.Bytes.Length, Convert.ToHexString(SHA256.HashData(f.Blob.Bytes)))).ToArray();
         var preview = new SendPreview(id, mode, content, resolved.Values.ToArray(), fileRows.Select(f => f.Meta).ToArray(), expires, "prepared");
-        var authorization = SealPlan(actor, preview, fingerprint, fileSeals, settings.Current.Revision);
+        var authorization = SealPlan(actor, preview, fingerprint, fileSeals, settings.Current.RuntimeRevision);
         using (var db = store.Open()) using (var tx = db.BeginTransaction())
         {
             Prune(db, tx);
@@ -218,7 +215,7 @@ public sealed class Messaging(HubStore store, SettingsService settings, Operator
             var files = Files(db, actor, preview.Files.Select(f => f.Id).ToArray(), tx: tx); CheckSecrets(preview.Content, files.Select(f => f.Blob));
             using var sealRead = HubStore.Command(db, "SELECT fingerprint FROM message_plans WHERE id=$0", id); sealRead.Transaction = tx;
             var seal = CheckPlan(actor, preview, (string)sealRead.ExecuteScalar()!);
-            if (seal.ConfigurationRevision != settings.Current.Revision) throw new HubError("Integration settings changed after preview. No send was authorized.");
+            if (seal.ConfigurationRevision != settings.Current.RuntimeRevision) throw new HubError("Integration settings changed after preview. No send was authorized.");
             if (files.Any(f => !seal.Files.Any(p => p.Id == f.Meta.Id && p.Filename == f.Blob.Filename && p.Mime == f.Blob.Mime && p.Size == f.Blob.Bytes.Length && p.Digest == Convert.ToHexString(SHA256.HashData(f.Blob.Bytes))))) throw new HubError("Message attachment changed since preview.");
             using var claim = HubStore.Command(db, "UPDATE message_plans SET state='queued',fingerprint=$4 WHERE id=$0 AND actor=$1 AND discord=$2 AND state='prepared' AND expires>$3", id, Actor(actor), actor.Discord, Time(DateTimeOffset.UtcNow), SealPlan(actor, preview with { State = "queued" }, seal.Request, seal.Files, seal.ConfigurationRevision)); claim.Transaction = tx;
             if (claim.ExecuteNonQuery() == 1)
@@ -286,7 +283,7 @@ public sealed class Messaging(HubStore store, SettingsService settings, Operator
                 if (preview.State != "queued" || preview.Content != item.Content || !preview.Destinations.Any(d => d.Target == destination.Target)) throw new HubError("Delivery selection changed after confirmation.");
                 using var authorization = HubStore.Command(db, "SELECT fingerprint FROM message_plans WHERE id=$0", item.Plan); planSignature = (string)authorization.ExecuteScalar()!;
                 var seal = SafeJson.Read<PlanSeal>(planSignature, 8192);
-                if (seal.ConfigurationRevision != settings.Current.Revision) throw new HubError("Integration settings changed after confirmation. Pending delivery is blocked.");
+                if (seal.ConfigurationRevision != settings.Current.RuntimeRevision) throw new HubError("Integration settings changed after confirmation. Pending delivery is blocked.");
                 files = Files(db, item.Actor, item.Uploads, item.Plan); CheckSecrets(item.Content, files.Select(f => f.Blob));
                 if (!files.Select(f => f.Meta.Id).ToHashSet().SetEquals(seal.Files.Select(f => f.Id)) || files.Any(f => !seal.Files.Any(p => p.Id == f.Meta.Id && p.Filename == f.Blob.Filename && p.Mime == f.Blob.Mime && p.Size == f.Blob.Bytes.Length && p.Digest == Convert.ToHexString(SHA256.HashData(f.Blob.Bytes))))) throw new HubError("Message attachment changed after confirmation.");
                 await operators.Check(item.Actor, cancellation);

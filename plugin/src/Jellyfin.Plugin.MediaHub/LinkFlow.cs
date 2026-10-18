@@ -15,7 +15,16 @@ public sealed class LinkFlow(HubStore store, SettingsService settings, HostIdent
 {
     internal static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
     internal static string Browser(ClaimsPrincipal principal, SessionInfo session) => Hash(string.Join('|', principal.FindFirstValue("Jellyfin-Token") ?? "", session.UserId, session.DeviceId));
-    internal string Pin() { var s = settings.Current; return Hash(string.Join('|', s.PublicJellyfinUrl, s.Features.DiscordApplicationId, s.Features.DiscordClientSecretEncrypted, s.Features.OAuthPkce)); }
+    internal string Pin()
+    {
+        var s = settings.Current;
+        // Legacy pins stay byte-compatible. Adapter secrets are rewrapped in memory
+        // under the core key, so pin their authenticated plaintext identity rather
+        // than a process-random GCM nonce. Restart alone must not invalidate proof.
+        var secret = s.AdapterRevision == 0 ? s.Features.DiscordClientSecretEncrypted :
+            settings.Authenticate("MediaHub.Adapter.OAuthConfiguration.v1", settings.Unprotect(s.Features.DiscordClientSecretEncrypted));
+        return Hash(string.Join('|', s.PublicJellyfinUrl, s.Features.DiscordApplicationId, secret, s.Features.OAuthPkce));
+    }
     public string Redirect => settings.Current.PublicJellyfinUrl.TrimEnd('/') + "/MediaHub/Link/OAuth/Callback";
     public string HandoffUrl(string handoff) => settings.Current.PublicJellyfinUrl.TrimEnd('/') + "/MediaHub/Link?handoff=" + Uri.EscapeDataString(handoff);
     public string WebUrl(string handoff) => settings.WebUrl() + "&hubLink=" + Uri.EscapeDataString(handoff);
@@ -81,7 +90,7 @@ public sealed class LinkFlow(HubStore store, SettingsService settings, HostIdent
     public async Task<LinkStatus> Status(ClaimsPrincipal principal, string handoff)
     {
         var session = await identity.Browser(principal); var pending = Pending(principal, session, handoff);
-        return new(pending?.Status ?? "new", pending?.Discord ?? store.PendingDiscord(handoff), identity.Active(session.UserId).Username);
+        return new(pending is { } current && current.Pin == Pin() ? current.Status : "new", pending?.Discord ?? store.PendingDiscord(handoff), identity.Active(session.UserId).Username);
     }
     public async Task Complete(ClaimsPrincipal principal, string handoff, CancellationToken cancellation)
     {

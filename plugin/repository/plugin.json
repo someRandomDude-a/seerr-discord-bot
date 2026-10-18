@@ -1,8 +1,8 @@
 {
   "guid": "c70297bf-77bd-4ad4-93c9-f67598519777",
-  "name": "Media Hub (Preview)",
-  "overview": "In-process media and Discord integration for Jellyfin 12.2. Requires compatible File Transformation and Plugin Pages. Preview.",
-  "description": "Requires separately installed, Jellyfin 12.2-compatible File Transformation (>=2.2.1.0) and Plugin Pages (>=3.0.0.0) for automatic native Web controls and ordinary-user pages. Tested with 3.0.2.0 of both; runtime checks use API capabilities, not exact pins. Engines are not bundled or downloaded by Media Hub. Provides grouped settings, linking, scoped discovery/confirmed requests, native libraries, watchlists/Seerr reconciliation, selected music/book requests, notifications, operator messaging and optional Discord Activity. Removal requires requester ownership, current viewer consent, a full delay and approved Arr destinations; automatic removal defaults off. Optional native watch parties use Private SyncPlay 0.1.5 / API 1.1. Feature completion and remaining live-service acceptance are not certified.",
+  "name": "Watchlist Deletion (Preview)",
+  "overview": "Native Jellyfin watchlists, notifications and consent-based removal queues. Discord is a separate optional plugin. Preview.",
+  "description": "Standalone Jellyfin 12.2 / .NET 10 watchlist and deletion core. Requires separately installed File Transformation (>=2.2.1.0) and Plugin Pages (>=3.0.0.0) for native Web controls and pages. No Discord or Private SyncPlay installation is required for native watchlists, notifications or queue maintenance. Deletion defaults to owned Seerr requests; an explicit administrator grant permits verified accessible native movies or whole series. Recent-viewer consent, the full delay and approved exact Arr file APIs remain mandatory; automatic removal defaults off. Separate administrator evidence and authenticated transition history preserve explicit legacy gaps. The Discord Integration owns its configuration/Activity surfaces and depends on this plugin's versioned API and Private SyncPlay. Retained Media Hub identity and durable state are preserved with additive schema-14 journal and explicit configuration-custody records. Full split runtime acceptance remains pending; this is not a production-certified release.",
   "category": "General",
   "targetAbi": "12.2.0"
 }

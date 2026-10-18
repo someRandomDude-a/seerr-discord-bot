@@ -35,9 +35,9 @@ public sealed class MediaMaintenance(IServiceProvider services, ILogger<MediaMai
                         budget.Token.ThrowIfCancellationRequested(); cursor = key;
                         try
                         {
-                            var user = await identity.Linked(Guid.Parse(key));
+                            var user = identity.Active(Guid.Parse(key));
                             if (!notificationOnly) await services.GetRequiredService<WatchlistSync>().Sync(user, async () =>
-                            { if ((await identity.Linked(user.Id)).Id != user.Id) throw new HubError("Account changed."); }, budget.Token, importNative: false);
+                            { identity.Active(user.Id); await Task.CompletedTask; }, budget.Token, importNative: false);
                         }
                         catch (OperationCanceledException) when (budget.IsCancellationRequested) { throw; }
                         catch { /* Failed or partial reads leave local state/intents intact. */ }
@@ -48,10 +48,10 @@ public sealed class MediaMaintenance(IServiceProvider services, ILogger<MediaMai
                 }
                 catch (OperationCanceledException) when (budget.IsCancellationRequested && !stoppingToken.IsCancellationRequested) { }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { throw; }
-                catch { log.LogWarning("Media Hub personal updates unavailable. Existing state was retained."); }
+                catch { log.SafeWarning("Media Hub personal updates unavailable. Existing state was retained."); }
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
-        catch { log.LogWarning("Media Hub personal worker stopped after a plugin failure. Jellyfin remains available."); }
+        catch { log.SafeWarning("Media Hub personal worker stopped after a plugin failure. Jellyfin remains available."); }
     }
 }

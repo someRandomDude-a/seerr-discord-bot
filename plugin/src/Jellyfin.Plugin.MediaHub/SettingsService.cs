@@ -7,6 +7,10 @@ namespace Jellyfin.Plugin.MediaHub;
 
 public sealed record HubSettings
 {
+    [JsonIgnore] public int AdapterRevision { get; init; }
+    [JsonIgnore] public bool AdapterConfigurationPresent { get; init; }
+    [JsonIgnore] public bool AdapterConfigurationUnavailable { get; init; }
+    [JsonIgnore] public int RuntimeRevision => checked(Revision + AdapterRevision);
     public int FormatVersion { get; init; } = 3;
     public string Integrity { get; init; } = "";
     public int RecentActivityDays { get; init; } = 14;
@@ -20,6 +24,8 @@ public sealed record HubSettings
     public string DiscordTokenEncrypted { get; init; } = "";
     public string SeerrKeyEncrypted { get; init; } = "";
     public ExtendedSettings Features { get; init; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DeletionPermissionSettings? DeletionPermissions { get; init; }
 }
 public sealed record ExtraServiceSettings(string Url = "", string KeyEncrypted = "", string Root = "", int Quality = 0, int Metadata = 0, bool Requests = false, int DailyLimit = 10);
 public sealed record ArrDestination(string Service, int Instance, string Url);
@@ -48,7 +54,7 @@ public sealed record ExtendedUpdate(ExtraServiceUpdate Lidarr, ExtraServiceUpdat
     bool MessageContent = false, bool MembersIntent = false, string[]? InboxChannels = null, int MessageRetentionDays = 7, int MaxRecipients = 100,
     string? DiscordApplicationId = null, string? DiscordClientSecret = null, bool? ActivityEnabled = null, bool? OAuthPkce = null, ArrDestination[]? ArrDestinations = null, string? NotificationHookKey = null);
 public sealed record SettingsUpdate(int Revision, bool DiscordEnabled, string PublicJellyfinUrl, string[] AllowedGuilds,
-    string SeerrUrl, string? DiscordToken, string? SeerrKey, int? RecentActivityDays = null, int? DeletionDelayDays = null, bool? AutomaticDeletion = null, ExtendedUpdate? Features = null);
+    string SeerrUrl, string? DiscordToken, string? SeerrKey, int? RecentActivityDays = null, int? DeletionDelayDays = null, bool? AutomaticDeletion = null, ExtendedUpdate? Features = null, DeletionPermissionSettings? DeletionPermissions = null);
 
 /// <summary>Secrets never enter Jellyfin's generic plugin configuration/readback API.</summary>
 public sealed class SettingsService
@@ -61,6 +67,7 @@ public sealed class SettingsService
     private readonly Action<string>? checkpoint;
     private HubSettings settings;
     internal StateIntegrity Protection { get; }
+    internal Func<SettingsService, HubSettings, HubSettings>? Overlay { get; init; }
     private static readonly JsonSerializerOptions Json = new() { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
     public SettingsService(HubStore store) : this(store, null) { }
     internal SettingsService(HubStore store, Action<string>? checkpoint)
@@ -87,12 +94,14 @@ public sealed class SettingsService
         settings = Load(allowUnsigned: true); // Only an elevated review may activate older unsigned settings.
         Protection = new StateIntegrity(store, this); Protection.Initialize(createdKey);
     }
-    public HubSettings Current { get { lock (gate) { settings = Load(); return settings with { AllowedGuilds = [.. settings.AllowedGuilds], Features = settings.Features with { Operators = [.. settings.Features.Operators], InboxChannels = [.. settings.Features.InboxChannels], ArrDestinations = [.. settings.Features.ArrDestinations] } }; } } }
+    internal HubSettings Retained { get { lock (gate) { settings = Load(); return settings with { DeletionPermissions = settings.DeletionPermissions is { } policy ? policy with { Users = policy.Users is null ? null : [.. policy.Users] } : null, AllowedGuilds = [.. settings.AllowedGuilds], Features = settings.Features with { Operators = [.. settings.Features.Operators], InboxChannels = [.. settings.Features.InboxChannels], ArrDestinations = [.. settings.Features.ArrDestinations] } }; } } }
+    public HubSettings Current { get { var value = Retained; return Overlay?.Invoke(this, value) ?? value; } }
     public object Public() { HubSettings s; lock (gate) s = Load(allowUnsigned: true); s = ReviewOnly(s); return new { s.Revision, s.DiscordEnabled, s.PublicJellyfinUrl, s.AllowedGuilds, s.SeerrUrl, ConfigurationReviewRequired = s.FormatVersion < 3,
         s.RecentActivityDays, s.DeletionDelayDays, s.AutomaticDeletion, Features = new { Lidarr = ExtraPublic(s.Features.Lidarr), Readarr = ExtraPublic(s.Features.Readarr), s.Features.Operators,
             s.Features.SeerrOperators, s.Features.MessageContent, s.Features.MembersIntent, s.Features.InboxChannels, s.Features.MessageRetentionDays, s.Features.MaxRecipients,
             s.Features.DiscordApplicationId, s.Features.ActivityEnabled, s.Features.OAuthPkce, s.Features.ArrDestinations, HasNotificationHookKey = !string.IsNullOrEmpty(s.Features.NotificationHookKeyEncrypted), HasDiscordClientSecret = s.Features.DiscordClientSecretEncrypted.Length > 0 },
-        HasDiscordToken = s.DiscordTokenEncrypted.Length > 0, HasSeerrKey = s.SeerrKeyEncrypted.Length > 0, FeatureParityComplete = false }; }
+        HasDiscordToken = s.DiscordTokenEncrypted.Length > 0, HasSeerrKey = s.SeerrKeyEncrypted.Length > 0, FeatureParityComplete = false,
+        DiscordConfigurationOwnedByAdapter = (Overlay?.Invoke(this, s) ?? s).AdapterConfigurationPresent }; }
     private static string Url(string value, bool https)
     {
         if (value is null) throw new HubError("Specify the service address, or an empty string to disable it.");
@@ -178,6 +187,7 @@ public sealed class SettingsService
         _ = Url(value.PublicJellyfinUrl, true); _ = Url(value.SeerrUrl, false);
         new DeletionRules(value.RecentActivityDays, value.DeletionDelayDays).Validate();
         ValidateFeatures(value.Features);
+        global::Jellyfin.Plugin.MediaHub.DeletionPermissions.Validate(value.DeletionPermissions);
         var botKey = Unprotect(value.DiscordTokenEncrypted); var seerrKey = Unprotect(value.SeerrKeyEncrypted);
         if (botKey.Length > 0) ServiceAddress.Key(botKey); if (seerrKey.Length > 0) ServiceAddress.Key(seerrKey);
         if (value.DiscordEnabled && (value.PublicJellyfinUrl.Length == 0 || value.DiscordTokenEncrypted.Length == 0 || value.AllowedGuilds.Length == 0))
@@ -187,6 +197,9 @@ public sealed class SettingsService
     public void Update(SettingsUpdate update)
     {
         if (update is null || update.AllowedGuilds is null) throw new HubError("Specify the integration settings and allowed servers.");
+        // Never hold the core settings lock while entering the adapter's file lock:
+        // an explicit first migration can read the legacy core snapshot in the other direction.
+        var adapterOwnsConfiguration = Overlay?.Invoke(this, new HubSettings()).AdapterConfigurationPresent == true;
         lock (gate)
         {
             using var lease = StateFiles.Lease(directory, "settings.lock");
@@ -195,6 +208,7 @@ public sealed class SettingsService
             if (update.DiscordToken?.Length > 4096 || update.SeerrKey?.Length > 4096) throw new HubError("Media Hub integration secrets must not exceed 4096 characters.");
             if (update.AllowedGuilds.Length > 100 || update.AllowedGuilds.Any(id => !ulong.TryParse(id, out var snowflake) || snowflake == 0)) throw new HubError("Invalid Discord server IDs.");
             var next = new HubSettings { Revision = checked(settings.Revision + 1), DiscordEnabled = update.DiscordEnabled,
+                DeletionPermissions = update.DeletionPermissions ?? settings.DeletionPermissions,
                 AutomaticDeletion = update.AutomaticDeletion ?? settings.AutomaticDeletion,
                 Features = update.Features is not { } f ? settings.Features : new ExtendedSettings { Lidarr = Extra(f.Lidarr, settings.Features.Lidarr), Readarr = Extra(f.Readarr, settings.Features.Readarr),
                     Operators = f.Operators is null ? throw new HubError("Specify operator IDs.") : [.. f.Operators], SeerrOperators = f.SeerrOperators, MessageContent = f.MessageContent, MembersIntent = f.MembersIntent,
@@ -208,23 +222,44 @@ public sealed class SettingsService
                 PublicJellyfinUrl = Url(update.PublicJellyfinUrl, true), SeerrUrl = Url(update.SeerrUrl, false), AllowedGuilds = [.. update.AllowedGuilds],
                 DiscordTokenEncrypted = update.DiscordToken is null ? settings.DiscordTokenEncrypted : Protect(update.DiscordToken),
                 SeerrKeyEncrypted = update.SeerrKey is null ? settings.SeerrKeyEncrypted : Protect(update.SeerrKey) };
+            if (adapterOwnsConfiguration && DiscordFields(settings) != DiscordFields(next))
+                throw new HubError("Discord settings are owned by the separate Discord Integration configuration page. Retained legacy settings were not changed.");
             new DeletionRules(next.RecentActivityDays, next.DeletionDelayDays).Validate();
             ValidateFeatures(next.Features);
+            global::Jellyfin.Plugin.MediaHub.DeletionPermissions.Validate(next.DeletionPermissions);
             if (update.DiscordToken is { Length: > 0 } botKey) ServiceAddress.Key(botKey); if (update.SeerrKey is { Length: > 0 } seerrKey) ServiceAddress.Key(seerrKey);
             if (next.DiscordEnabled && (next.PublicJellyfinUrl.Length == 0 || next.DiscordTokenEncrypted.Length == 0 || next.AllowedGuilds.Length == 0))
                 throw new HubError("Enabling Discord requires a token, public Jellyfin HTTPS URL, and allowed Discord server IDs.");
             next = next with { Integrity = Signature(next) };
+            var encoded = JsonSerializer.SerializeToUtf8Bytes(next);
+            if (encoded.Length > 65536) throw new HubError("Combined plugin settings exceed 64 KiB. Nothing was saved; reduce account overrides or destination entries.");
             var previous = StateFiles.In(directory, "settings.previous.json");
             if (File.Exists(previous)) _ = Load(previous, allowUnsigned: true);
-            StateFiles.Publish(directory, "settings.json", JsonSerializer.SerializeToUtf8Bytes(next), "settings.previous.json", checkpoint);
+            StateFiles.Publish(directory, "settings.json", encoded, "settings.previous.json", checkpoint);
             settings = next;
         }
     }
+    private static string DiscordFields(HubSettings s) => JsonSerializer.Serialize(new { s.DiscordEnabled, s.DiscordTokenEncrypted, s.AllowedGuilds,
+        s.Features.DiscordApplicationId, s.Features.DiscordClientSecretEncrypted, s.Features.ActivityEnabled, s.Features.OAuthPkce,
+        s.Features.MessageContent, s.Features.MembersIntent, s.Features.Operators, s.Features.SeerrOperators, s.Features.InboxChannels,
+        s.Features.MessageRetentionDays, s.Features.MaxRecipients });
     public string Protect(string value, string? purpose = null)
     {
         CheckKey();
         if (value.Length == 0) return "";
         if (value.Length > 16384) throw new HubError("Media Hub credential exceeds its supported size. No credential was saved.");
+        return Encrypt(value, purpose);
+    }
+    internal const int DeletionProofLimit = 4 * 1024 * 1024;
+    internal string ProtectDeletionProof(string value, string purpose)
+    {
+        CheckKey();
+        if (!purpose.StartsWith("MediaHub.Deletion.v1|", StringComparison.Ordinal) || Encoding.UTF8.GetByteCount(value) > DeletionProofLimit)
+            throw new HubError("Deletion proof exceeds its supported scope or size. No proposal was authorized.");
+        return Encrypt(value, purpose);
+    }
+    private string Encrypt(string value, string? purpose)
+    {
         var nonce = RandomNumberGenerator.GetBytes(12); var plaintext = Encoding.UTF8.GetBytes(value);
         var encrypted = new byte[plaintext.Length]; var tag = new byte[16];
         using var aes = new AesGcm(key, 16); aes.Encrypt(nonce, plaintext, encrypted, tag, Encoding.UTF8.GetBytes(purpose ?? ""));
@@ -238,6 +273,19 @@ public sealed class SettingsService
     {
         CheckKey();
         if (secret is null || secret.Length > 90000) throw new HubError("Invalid or oversized encrypted Media Hub data.");
+        return Decrypt(secret, purpose);
+    }
+    internal string UnprotectDeletionProof(string secret, string purpose)
+    {
+        CheckKey();
+        if (secret is null || !purpose.StartsWith("MediaHub.Deletion.v1|", StringComparison.Ordinal) || secret.Length > ((DeletionProofLimit + 30) / 3) * 4)
+            throw new HubError("Invalid or oversized encrypted deletion proof. Retained state was not reset.");
+        var value = Decrypt(secret, purpose);
+        if (Encoding.UTF8.GetByteCount(value) > DeletionProofLimit) throw new HubError("Retained deletion proof exceeds its supported size.");
+        return value;
+    }
+    private string Decrypt(string secret, string? purpose)
+    {
         if (secret.Length == 0) return "";
         var bytes = Convert.FromBase64String(secret);
         if (bytes.Length < 28) throw new HubError("Invalid encrypted Media Hub credential. Restore a consistent backup; no credential was reset.");

@@ -7,7 +7,7 @@ namespace Jellyfin.Plugin.MediaHub;
 
 public sealed partial class DiscordHost
 {
-    private static readonly HashSet<string> MediaCommands = ["dashboard", "search", "discover", "library", "requests", "watchlist", "deletions", "notifications", "link", "storage", "status", "seerr", "quota", "players"];
+    private static readonly HashSet<string> MediaCommands = ["dashboard", "search", "discover", "library", "requests", "watchlist", "deletions", "notifications", "link", "storage", "status", "seerr", "quota", "players", "watchparty"];
     private MediaCatalog catalog => provider.GetRequiredService<MediaCatalog>();
     private PersonalService personal => provider.GetRequiredService<PersonalService>();
     private DiscordControls controls => provider.GetRequiredService<DiscordControls>();
@@ -22,6 +22,7 @@ public sealed partial class DiscordHost
             if (name is "search" or "library") command.AddOption("query", ApplicationCommandOptionType.String, "Search text", name == "search");
             if (name is "search" or "discover" or "library" or "requests") command.AddOption("page", ApplicationCommandOptionType.Integer, "Page number", false);
             if (name == "requests") command.AddOption("all", ApplicationCommandOptionType.Boolean, "All requests with Seerr permission", false);
+            if (name == "watchparty") command.WithDescription("Review your linked native party and generate a Private SyncPlay invitation").AddOption("name", ApplicationCommandOptionType.String, "Name for a new private party", false);
             if (name == "notifications") {
                 command.AddOption("enabled", ApplicationCommandOptionType.Boolean, "Allow Discord updates, or mute all personal updates", false);
                 command.AddOption("jellyfin", ApplicationCommandOptionType.Boolean, "Show Jellyfin notification updates", false);
@@ -46,6 +47,7 @@ public sealed partial class DiscordHost
         var name = interaction.CommandName;
         var input = new MediaControl(name, Option("kind", name == "library" ? "all" : "movie"), Page: int.TryParse(Option("page"), out var page) ? page : 1, Query: Option("query"), All: Option("all") == "True");
         if (name == "players") input = new("playerHistory");
+        if (name == "watchparty") input = new("watchparty:status", Query: Option("name", "Watch party"));
         if (name == "notifications" && interaction.Data.Options.Any())
         {
             var state = personal.State(user); var p = state.Preferences;
@@ -65,6 +67,7 @@ public sealed partial class DiscordHost
     }
     private async Task RenderMedia(SocketInteraction interaction, User user, MediaControl action)
     {
+        if (action.Action.StartsWith("watchparty:", StringComparison.Ordinal)) { await RenderWatchParty(interaction, user, action); return; }
         if (action.Action.StartsWith("operator:", StringComparison.Ordinal)) { await RenderOperator(interaction, user, action); return; }
         if (action.Action.StartsWith("extra:", StringComparison.Ordinal) || action.Action == "search" && action.Kind is "music" or "book") { await RenderExtra(interaction, user, action); return; }
         var view = HubStore.Nonce(); var builder = new ComponentBuilder(); var embed = new EmbedBuilder(); var gallery = new List<Embed>();
@@ -268,6 +271,25 @@ public sealed partial class DiscordHost
             else { var issues = sync.Issues(user); if (action.Page is < 1 or > 100) throw new HubError("Invalid sync issue page."); embed.WithTitle("Pending watchlist changes"); foreach (var issue in issues.Skip((action.Page - 1) * 15).Take(15)) { embed.AddField(Clip(issue.Title, 100), issue.State + " · intended " + (issue.Desired ? "saved" : "removed")); if (issue.State != "ready") Button("Inspect " + embed.Fields.Count, new("syncReview", issue.Kind, issue.ExternalId)); } if (issues.Count == 0) embed.WithDescription("Nothing pending."); if (action.Page > 1) Button("Earlier changes", action with { Page = action.Page - 1 }); if (action.Page * 15 < issues.Count) Button("More changes", action with { Page = action.Page + 1 }); }
             Button("Watchlist", new("watchlist")); Home();
         }
+        else if (action.Action == "deletionStatus")
+        {
+            var status = await provider.GetRequiredService<DeletionQueue>().Status(user, action.Token ?? "", cancellation);
+            embed.WithTitle(Clip(status.Title, 200)).WithDescription($"{status.State} · action: {status.RequiredAction}\nYour consent: {status.YourConsent}\nYour activity: {(status.ActivityVerified ? status.YourLastActivity?.ToString("u") ?? "none recorded" : "unverified")}\nMinimum delay: {status.DelayDays} days · automatic removal {(status.AutomaticDeletion ? "on" : "off")}\nDeadline: {status.DueAt?.ToString("u") ?? "not scheduled"}. This is a passive snapshot, not upstream execution approval.");
+            Button("Deletion queue", new("deletions")); Home();
+        }
+        else if (action.Action is "nativeRemovalConfirm" or "nativeRemovalPropose")
+        {
+            var queue = provider.GetRequiredService<DeletionQueue>(); var item = action.Native ?? throw new HubError("Choose an accessible movie or whole series.");
+            if ((await queue.Permission(user, cancellation)).Scope != "AnyAccessibleItem") throw new HubError("Your current permission does not allow a native-item proposal.");
+            if (action.Action == "nativeRemovalConfirm") { embed.WithTitle("Review verified native-item removal").WithDescription("No owned request is required under your explicit server grant. The core must verify a unique approved Arr target. This starts a proposal, not immediate removal; unanimous recent-viewer consent and the full delay still apply."); Button("Confirm native-item proposal", action with { Action = "nativeRemovalPropose" }, ButtonStyle.Danger); }
+            else { await VerifyActor(); await queue.ProposeNative(user, item, cancellation); embed.WithTitle("Removal proposed").WithDescription("The core verified the native item and target. Consent and delay checks remain in force."); Button("Deletion queue", new("deletions")); }
+            Home();
+        }
+        else if (action.Action == "removalChoices" && (await provider.GetRequiredService<DeletionQueue>().Permission(user, cancellation)).Scope == "AnyAccessibleItem")
+        {
+            embed.WithTitle("Native-item deletion permission").WithDescription("Your server grant allows verified accessible movies or whole series, without an owned request. Review before proposing; consent and delay are still mandatory.");
+            Button("Review native-item proposal", new("nativeRemovalConfirm", Native: action.Native)); Home();
+        }
         else if (action.Action is "removalChoices" or "removalConfirm" or "removalPropose")
         {
             var item = action.Native ?? throw new HubError("Choose an accessible movie or show.");
@@ -286,7 +308,7 @@ public sealed partial class DiscordHost
             foreach (var entry in entries.Skip((action.Page - 1) * 10).Take(10))
             {
                 if (entry.Notice is { } notice) { embed.AddField(Clip(notice.Title, 100), "Allow deletion? No keeps removal blocked while your activity remains recent."); Button("Yes " + embed.Fields.Count, new("consent", Token: notice.Id, All: true), ButtonStyle.Success); Button("No " + embed.Fields.Count, new("consent", Token: notice.Id)); }
-                else if (entry.Queue is { } row) { embed.AddField(Clip(row.Title, 100), row.State + " · " + row.Owner + (row.DueAt is DateTimeOffset due ? " · <t:" + due.ToUnixTimeSeconds() + ":R>" : "")); if (row.CanUndo) Button("Undo " + embed.Fields.Count, new("undo", Token: row.Id)); }
+                else if (entry.Queue is { } row) { embed.AddField(Clip(row.Title, 100), row.State + " · " + row.Owner + (row.DueAt is DateTimeOffset due ? " · <t:" + due.ToUnixTimeSeconds() + ":R>" : "")); Button("Status " + embed.Fields.Count, new("deletionStatus", Token: row.Id)); if (row.CanUndo) Button("Undo " + embed.Fields.Count, new("undo", Token: row.Id)); }
             }
             if (action.Page > 1) Button("Previous removal page", new("deletions", Page: action.Page - 1)); if (action.Page * 10 < entries.Length) Button("Next removal page", new("deletions", Page: action.Page + 1));
             if (embed.Fields.Count == 0) embed.WithDescription("Nothing pending."); Home();
@@ -304,7 +326,7 @@ public sealed partial class DiscordHost
         else if (action.Action is "storage" or "status")
         {
             using var scope = await provider.GetRequiredService<SeerrBridge>().Open(user, cancellation);
-            var spaces = await provider.GetRequiredService<ArrRegistry>().Storage(cancellation); await scope.Verify(cancellation);
+            var spaces = await provider.GetRequiredService<ArrRegistry>().Storage(user, cancellation); await scope.Verify(cancellation);
             embed.WithTitle(action.Action == "storage" ? "Storage" : "Integration verification").WithDescription("Verified just now · plugin preview features remain incomplete.");
             foreach (var space in spaces.Take(20)) embed.AddField(space.Service + " #" + space.Instance, space.Verified ? $"{space.Free / 1073741824d:F1} / {space.Total / 1073741824d:F1} GiB free" : "Not verified"); Home();
         }
@@ -329,5 +351,5 @@ public sealed partial class DiscordHost
             new RequestOptions { RetryMode = RetryMode.AlwaysFail, Timeout = 15000 });
         controls.Bind(view, message.Id);
     }
-    internal static string? DiscordPoster(string? path) => path is not null && System.Text.RegularExpressions.Regex.IsMatch(path, "\\A/[A-Za-z0-9_-]{1,100}\\.(jpg|png|webp)\\z") ? "https://image.tmdb.org/t/p/w185" + path : null;
+    internal static string? DiscordPoster(string? path) => Jellyfin.Plugin.WatchlistDeletion.Api.MediaPresentation.Poster(path);
 }

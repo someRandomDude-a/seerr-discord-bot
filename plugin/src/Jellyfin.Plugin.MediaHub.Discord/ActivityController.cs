@@ -5,6 +5,9 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
+using HubController = Jellyfin.Plugin.MediaHub.ActivityRequests;
+using MessageController = Jellyfin.Plugin.MediaHub.ActivityRequests;
+using Jellyfin.Plugin.MediaHub.DiscordIntegration;
 
 namespace Jellyfin.Plugin.MediaHub;
 
@@ -23,10 +26,10 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
         var native = new Uri(s.PublicJellyfinUrl).GetLeftPart(UriPartial.Authority);
         if (value != native && value != "https://" + s.Features.DiscordApplicationId + ".discordsays.com") throw new HubError("Activity origin denied.", "activity_denied");
     }
-    private async Task<IActionResult> Safe(Func<Task<object>> operation)
+    private async Task<IActionResult> Safe(Func<Task<object>> operation, bool verifySession = false)
     {
         Response.Headers["Cache-Control"] = "no-store"; Response.Headers["Referrer-Policy"] = "no-referrer"; Response.Headers["X-Content-Type-Options"] = "nosniff";
-        try { Origin(); var result = await operation(); return result is IActionResult response ? response : Ok(result); }
+        try { Origin(); var result = await operation(); if (verifySession) await Service<ActivitySessions>().Require(Token, HttpContext.RequestAborted); return result is IActionResult response ? response : Ok(result); }
         catch (HubError e) { return StatusCode(e.Code == "activity_denied" ? 401 : e.Code == "operator_denied" ? 403 : 400, new { Error = e.Message }); }
         catch { return StatusCode(503, new { Error = "Verification unavailable. No automatic retry was performed." }); }
     }
@@ -45,7 +48,7 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
     public Task<IActionResult> Logout() => Safe(() => { Service<ActivitySessions>().Logout(Token); return Task.FromResult<object>(new { LoggedOut = true }); });
     private IActionResult Resource(string name, string mime)
     {
-        var stream = GetType().Assembly.GetManifestResourceStream("Jellyfin.Plugin.MediaHub.Web." + name) ?? throw new HubError("Activity assets are not built. Build plugin/activity before packaging."); return File(stream, mime);
+        var stream = GetType().Assembly.GetManifestResourceStream("Jellyfin.Plugin.MediaHub.Discord.Web." + name) ?? throw new HubError("Activity assets are not built. Build plugin/activity before packaging."); return File(stream, mime);
     }
     [HttpGet(""), HttpGet("App")]
     public Task<IActionResult> App() => Safe(() =>
@@ -97,7 +100,7 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
         if (match.Success && !post)
         {
             var kind = match.Groups[1].Value; var id = int.Parse(match.Groups[2].Value); var card = await catalog.Details(user, kind, id, cancellation);
-            var image = await Service<PosterAssets>().Download(card.Poster ?? "", cancellation); await Verify();
+            var image = await Service<PosterAssets>().Download(user, kind, id, cancellation); await Verify();
             if ((await catalog.Details(user, kind, id, cancellation)).Poster != card.Poster) throw new HubError("Artwork changed.");
             Response.Headers["X-Content-Type-Options"] = "nosniff"; Response.Headers["Content-Security-Policy"] = "sandbox; default-src 'none'"; return File(image.Bytes, image.Mime);
         }
@@ -120,7 +123,7 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
         if (route == "Me/Notifications" && !post) return await Service<NotificationFeed>().ListAsync(user, cancellation);
         if (route == "Me/Notifications/Diagnostics" && !post) return Service<NotificationFeed>().Diagnostics(user);
         match = Regex.Match(route, "^Me/Notifications/([0-9a-f]{48})/Seen$"); if (match.Success && post) { Service<NotificationFeed>().Seen(user, match.Groups[1].Value); return new { Saved = true }; }
-        if (route == "Storage" && !post) { using var scope = await Service<SeerrBridge>().Open(user, cancellation); var spaces = await Service<ArrRegistry>().Storage(cancellation); await scope.Verify(cancellation); return spaces; }
+        if (route == "Storage" && !post) { using var scope = await Service<SeerrBridge>().Open(user, cancellation); var spaces = await Service<ArrRegistry>().Storage(user, cancellation); await scope.Verify(cancellation); return spaces; }
         match = Regex.Match(route, "^Extras/(music|book)/Search$"); if (match.Success && !post) return await extras.Search(user, match.Groups[1].Value, Q("query"), Page(), cancellation);
         match = Regex.Match(route, "^Extras/(music|book)/([^/]+)/Details$"); if (match.Success) return await extras.Details(user, match.Groups[1].Value, match.Groups[2].Value, post, cancellation);
         if (route == "Extras/Requests/Prepare" && post) { var selection = Read<HubController.ExtraSelection>(); return await extras.Prepare(user, selection.Kind, selection.ForeignId, selection.Edition, cancellation); }
@@ -129,7 +132,10 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
         match = Regex.Match(route, "^Me/ExtraWatchlist/(music|book)/([^/]+)$");
         if (match.Success && post) { var update = Read<HubController.ExternalWatchUpdate>(); var recorded = await extras.Follow(user, match.Groups[1].Value, match.Groups[2].Value, update.Subscribed, update.Revision, Verify, cancellation, update.SaveOnly); return personal.State(user) with { Activity = recorded }; }
         if (route == "Deletions") { if (!post) return queue.List(user); var selection = Read<HubController.Proposal>(); await queue.Propose(user, selection.RequestId, selection.Item, cancellation); return new { Saved = true }; }
+        if (route == "Me/DeletionPermission" && !post) return await queue.Permission(user, cancellation);
+        if (route == "Deletions/Native" && post) { await queue.ProposeNative(user, Read<HubController.NativeProposal>().Item, cancellation); return new { Saved = true }; }
         if (route == "Deletions/Refresh" && post) { await queue.Refresh(user, cancellation); return queue.List(user); }
+        match = Regex.Match(route, "^Deletions/([0-9a-f]{48})/Status$"); if (match.Success && !post) return await queue.Status(user, match.Groups[1].Value, cancellation);
         match = Regex.Match(route, "^Deletions/([0-9a-f]{48})/Undo$"); if (match.Success && post) { queue.Undo(user, match.Groups[1].Value); return new { Saved = true }; }
         if (route == "Me/Consent" && !post) return queue.Notices(user);
         match = Regex.Match(route, "^Me/Consent/([0-9a-f]{48})$"); if (match.Success && post) { await queue.Respond(user, match.Groups[1].Value, Read<HubController.ConsentResponse>().Approve, cancellation); return new { Saved = true }; }
@@ -156,5 +162,5 @@ public sealed class ActivityController(IServiceProvider services) : ControllerBa
             Response.Headers["Content-Security-Policy"] = "sandbox; default-src 'none'"; return Q("preview") == "true" && blob.Mime == "image/png" ? File(blob.Bytes, blob.Mime) : File(blob.Bytes, "application/octet-stream", blob.Filename);
         }
         throw new HubError("Unknown Activity operation.");
-    });
+    }, verifySession: true);
 }

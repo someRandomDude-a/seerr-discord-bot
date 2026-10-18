@@ -20,14 +20,22 @@ public interface IArrDeletion
 }
 
 /// <summary>Arr owns all filesystem operations. This class only makes bounded, non-retrying HTTP calls.</summary>
-public sealed class ArrDeletion : IArrDeletion, IDisposable
+public sealed class ArrDeletion : IArrDeletion, INativeDeletionResolver, IDisposable
 {
     private readonly SettingsService settings;
     private readonly HttpClient http;
     private readonly SemaphoreSlim slots = new(2);
-    public ArrDeletion(SettingsService settings) : this(settings, ServiceAddress.Handler()) { }
-    internal ArrDeletion(SettingsService settings, HttpMessageHandler handler)
-    { this.settings = settings; http = new(handler) { Timeout = TimeSpan.FromSeconds(20), MaxResponseContentBufferSize = 8 * 1024 * 1024 }; }
+    private readonly NativeDeletionReader? native;
+    public ArrDeletion(SettingsService settings, NativeDeletionReader? native = null) : this(settings, ServiceAddress.Handler(), native) { }
+    internal ArrDeletion(SettingsService settings, HttpMessageHandler handler, NativeDeletionReader? native = null)
+    { this.settings = settings; this.native = native; http = new(handler) { Timeout = TimeSpan.FromSeconds(20), MaxResponseContentBufferSize = 8 * 1024 * 1024 }; }
+    private void NativeAuthority(Guid owner, ArrRequest request)
+    {
+        var source = request.Native ?? throw new HubError("Native deletion authority is missing.");
+        if (source.User != owner || source.Item == Guid.Empty || request.RequestId != 0 || request.MediaId != 0 || request.Instance is null) throw new HubError("Native proposal identity changed.");
+        var current = (native ?? throw new HubError("Native deletion verification is unavailable.")).Read(owner, source.Item);
+        if (current.Kind != request.Kind || current.Provider != request.Provider || current.Tmdb != request.Tmdb || MediaPath(current.Path) != MediaPath(request.NativePath)) throw new HubError("Native target identity or access changed.");
+    }
     private async Task<JsonNode?> Send(HttpMethod method, string url, string key, JsonNode? body, CancellationToken cancellation)
     {
         ServiceAddress.Key(key);
@@ -66,8 +74,13 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
     private async Task<(string Url, string Key, int Id)> Destination(User owner, ArrRequest r, CancellationToken cancellation, bool afterRemoval = false)
     {
         Resource(r); var revision = settings.Current.Revision;
-        if (r.RequestId <= 0 || r.MediaId <= 0 || r.Provider <= 0 || r.Tmdb <= 0 || r.Instance < 0) throw new HubError("Invalid pinned request identity.");
+        if (r.Provider <= 0 || r.Tmdb <= 0 || r.Instance < 0) throw new HubError("Invalid pinned request identity.");
         if (settings.Current.SeerrUrl.TrimEnd('/') != r.Origin) throw new HubError("Seerr destination changed.");
+        if (r.Native is not null) NativeAuthority(owner.Id, r);
+        else
+        {
+        new DeletionPermissions(settings).Require(owner, native: false);
+        if (r.RequestId <= 0 || r.MediaId <= 0) throw new HubError("Invalid pinned request identity.");
         var request = await Seerr("request/" + r.RequestId, cancellation);
         var user = await Seerr("user/" + Number(request["requestedBy"]!, "id"), cancellation);
         if (Number(request, "status") is not (2 or 5) || Number(request, "id") != r.RequestId || Number(user, "id") != Number(request["requestedBy"]!, "id") ||
@@ -78,6 +91,7 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
             throw new HubError("Request ownership or target changed.");
         var instance = request["media"]![r.Is4k ? "serviceId4k" : "serviceId"]?.GetValue<int>();
         if (instance != r.Instance && !(afterRemoval && instance is null && r.Instance is not null)) throw new HubError("Arr destination changed.");
+        }
         if (r.Kind == "tv")
         {
             var details = await Seerr("tv/" + r.Tmdb, cancellation);
@@ -94,6 +108,7 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
         var key = Text(row, "apiKey"); if (key.Length == 0) throw new HubError("Arr key is missing.");
         if (revision != settings.Current.Revision) throw new HubError("Integration settings changed during destination verification.");
         settings.RequireArr(Name(r), Number(row, "id"), url);
+        if (r.Native is not null) NativeAuthority(owner.Id, r);
         return (url, key, Number(row, "id"));
     }
     private async Task<JsonObject?> Entry(ArrRequest r, string url, string key, CancellationToken cancellation)
@@ -148,12 +163,38 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
         var added = Text(entry, "added"); if (!DateTimeOffset.TryParse(added, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out _)) throw new HubError("Invalid Arr entry identity.");
         return new(r, d.Url, Hash(d.Key), d.Id, Number(entry, "id"), MediaPath(Text(entry, "path")), files, added);
     }
+    public async Task<VerifiedDeletionTarget> Discover(User owner, Guid item, CancellationToken cancellation)
+    {
+        var selected = (native ?? throw new HubError("Native deletion verification is unavailable.")).Read(owner.Id, item);
+        var revision = settings.Current.Revision; var service = selected.Kind == "movie" ? "radarr" : "sonarr";
+        var approved = settings.Current.Features.ArrDestinations.Where(d => d.Service == service).ToArray();
+        if (approved.Length == 0) throw new HubError("No approved Arr destination is configured for this item.");
+        var configured = (await Seerr("settings/" + service, cancellation)).AsArray();
+        if (configured.Count > 100 || configured.Any(row => row is null) || configured.Select(row => Number(row!, "id")).Distinct().Count() != configured.Count) throw new HubError("Arr destination discovery is incomplete or ambiguous.");
+        var matches = new List<ArrRequest>();
+        foreach (var destination in approved)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            var instance = configured.SingleOrDefault(row => Number(row!, "id") == destination.Instance) ?? throw new HubError("An approved destination is no longer configured. Uniqueness cannot be verified.");
+            var request = new ArrRequest(settings.Current.SeerrUrl.TrimEnd('/'), 0, 0, selected.Kind, instance["is4k"]?.GetValue<bool>() ?? false,
+                destination.Instance, selected.Provider, selected.Tmdb, selected.Path, new(owner.Id, item));
+            var target = await Destination(owner, request, cancellation); var entry = await Entry(request, target.Url, target.Key, cancellation);
+            if (entry is null) continue;
+            var files = await Files(request, entry, target.Url, target.Key, cancellation);
+            if (files.Count == 0 || (selected.Kind == "movie" ? !files.Any(file => file.Path == MediaPath(selected.Path)) : MediaPath(Text(entry, "path")) != MediaPath(selected.Path))) continue;
+            if (selected.Kind == "movie" && files.Count != 1) throw new HubError("The selected movie has ambiguous Arr file editions.");
+            await Scope(request, entry, files, cancellation); matches.Add(request);
+        }
+        if (matches.Count != 1 || revision != settings.Current.Revision) throw new HubError("No unique, complete and currently approved Arr target could be verified.");
+        var match = matches[0]; NativeAuthority(owner.Id, match);
+        return new(item, "native-v1|" + match.Origin + "|" + match.Kind + "|" + match.Provider + "|" + match.Instance + "|" + Hash(MediaPath(match.NativePath)), match);
+    }
     private async Task Scope(ArrRequest r, JsonObject entry, IReadOnlyList<ArrFile> files, CancellationToken cancellation)
     {
         if (r.Kind == "tv")
         {
-            var request = await Seerr("request/" + r.RequestId, cancellation);
-            var requested = request["seasons"]?.AsArray() ?? throw new HubError("Request season scope unavailable.");
+            var requested = r.Native is null ? (await Seerr("request/" + r.RequestId, cancellation))["seasons"]?.AsArray() ?? throw new HubError("Request season scope unavailable.")
+                : entry["seasons"]?.AsArray() ?? throw new HubError("Native series season scope unavailable.");
             var covered = requested.Select(season => Number(season!, "seasonNumber")).ToHashSet();
             var seasons = entry["seasons"]?.AsArray() ?? throw new HubError("Arr season scope unavailable.");
             if (requested.Count is 0 or > 1000 || covered.Count != requested.Count || covered.Any(n => n < 0) || seasons.Count > 1000 || seasons.Select(s => Number(s!, "seasonNumber")).Distinct().Count() != seasons.Count)
@@ -184,6 +225,7 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
     public async Task Delete(PreparedArr prepared, CancellationToken cancellation)
     {
         var p = prepared.Proof; var movie = p.Request.Kind == "movie";
+        if (p.Request.Native is { } source) NativeAuthority(source.User, p.Request);
         Resource(p.Request); settings.RequireArr(Name(p.Request), p.Instance, p.Url);
         var config = settings.Current;
         if (!config.AutomaticDeletion || prepared.ConfigurationRevision != config.Revision || Hash(prepared.ApiKey) != p.KeyHash) throw new HubError("Deletion authorization or configuration changed. No deletion was sent.");
@@ -215,7 +257,8 @@ public sealed class ArrDeletion : IArrDeletion, IDisposable
         async Task<JsonArray> Episodes()
         {
             var rows = (await Send(HttpMethod.Get, url + "episode?seriesId=" + proof.LibraryId, current.Key, null, cancellation))?.AsArray() ?? throw new HubError("Episode scan incomplete.");
-            var request = await Seerr("request/" + r.RequestId, cancellation); var covered = request["seasons"]?.AsArray().Select(s => Number(s!, "seasonNumber")).ToHashSet() ?? throw new HubError("Season scope unavailable.");
+            var scope = r.Native is null ? (await Seerr("request/" + r.RequestId, cancellation))["seasons"]?.AsArray() : entry["seasons"]?.AsArray();
+            var covered = scope?.Select(s => Number(s!, "seasonNumber")).ToHashSet() ?? throw new HubError("Season scope unavailable.");
             if (rows.Count > 10000 || rows.Any(ep => ep is null || Number(ep, "seriesId") != proof.LibraryId || Number(ep, "id") <= 0 || Number(ep, "seasonNumber") < 0 || ep["monitored"] is null ||
                 ep["monitored"]!.GetValue<bool>() && !covered.Contains(Number(ep, "seasonNumber"))) || rows.Select(ep => Number(ep!, "id")).Distinct().Count() != rows.Count) throw new HubError("Invalid, incomplete or unowned episode scope.");
             return rows;

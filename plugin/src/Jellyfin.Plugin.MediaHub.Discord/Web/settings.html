@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><title>Discord Integration</title></head><body>
+<div id="mediaHubDiscordPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-select" data-controller="__plugin/mediahub-discord.js">
+  <div data-role="content"><div class="content-primary">
+    <h1>Discord Integration</h1>
+    <p class="fieldDescription">Discord configuration is owned by this plugin. Watchlists, deletion permissions and consent remain in Watchlist Deletion. No save changes Jellyfin accounts, libraries or network settings.</p>
+    <p data-discord-notice role="status" aria-live="polite"></p>
+    <form data-discord-configuration><div data-discord-fields></div>
+      <button is="emby-button" type="submit" class="raised button-submit emby-button" data-discord-save>Save Discord settings</button>
+      <button is="emby-button" type="button" class="raised emby-button" data-discord-reload>Reload saved settings</button>
+    </form>
+  </div></div>
+</div>
+</body></html>

@@ -1,0 +1,40 @@
+name: Discord integration CI
+on:
+  push:
+    paths: ['plugin/**', '.github/workflows/plugin-discord.yml']
+  pull_request:
+    paths: ['plugin/**', '.github/workflows/plugin-discord.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  adapter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install pinned Activity dependencies
+        run: npm ci --ignore-scripts
+        working-directory: plugin/activity
+      - name: Build the adapter-owned embedded Activity
+        run: npm run build
+        working-directory: plugin/activity
+      - name: Test independent adapter and dependency boundaries
+        run: dotnet test plugin/tests/MediaHub.Discord.Tests/MediaHub.Discord.Tests.csproj -c Release --nologo -p:RequireActivityBundle=true -p:ContinuousIntegrationBuild=true
+      - name: Check adapter NuGet advisories
+        shell: pwsh
+        run: ./plugin/tools/Test-Dependencies.ps1 -Plugin Discord
+      - name: Build adapter separately
+        run: dotnet build plugin/src/Jellyfin.Plugin.MediaHub.Discord/Jellyfin.Plugin.MediaHub.Discord.csproj -c Release --nologo -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -p:ContinuousIntegrationBuild=true -o plugin/artifacts/discord-build
+      - name: Package development bytes, without publication
+        run: dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --plugin discord --input plugin/artifacts/discord-build --output plugin/artifacts/discord-repository --metadata plugin/repository/discord.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: discord-integration-development-only
+          path: plugin/artifacts/discord-repository
+          if-no-files-found: error

@@ -1,4 +1,26 @@
-# Media Hub for Jellyfin 12 · new plugin preview
+# Watchlist Deletion for Jellyfin 12 · development preview
+
+**Two-plugin split in progress:** native watchlists/notifications/deletion queues
+keep the existing plugin GUID and retained state. The separate
+[Discord Integration](discord/README.md) uses the [public API](PUBLIC_API.md).
+The core no longer bundles Discord.Net or the Private SyncPlay SDK, and native
+background queue maintenance does not require a Discord link. Separate packaging
+and tests exist. Independent encrypted adapter configuration, administrator settings,
+Activity routes/assets and OAuth-session ownership are now implemented; dual-plugin
+exact-ZIP acceptance is not complete. The r13 evidence below predates this split
+and must not be represented as split-build acceptance.
+
+The initial [administrator monitoring workspace](ADMIN_MONITORING.md) now browses
+backlog/retained proposal history and private identity/activity/consent evidence.
+It explicitly distinguishes current checkpoints from the complete historical
+transition journal that older builds never recorded.
+
+The newer [deletion experience increment](DELETION_EXPERIENCE.md) adds passive
+personal status/required actions and a focused notification-preferences page with
+customizable deletion-notice text. Configurable deletion permissions, verified native
+movie/whole-series proposals, a native-menu extension and authenticated transition
+history are implemented in source; their full runtime acceptance remains unfinished. Source tests are not
+production or exact-ZIP browser acceptance.
 
 Media Hub is an **in-process C#/.NET 10 plugin** for Jellyfin 12. It uses Jellyfin's existing
 authenticated pages and listener, with no additional runtime, sidecar or admin port.
@@ -49,7 +71,7 @@ Use one plugin instance per Discord application token.
 Regression tests use host database/configuration fixtures and a real .NET generic host to
 verify unchanged host files and fail-closed startup/shutdown with broken plugin state. A real
 Jellyfin 12.2 local-ZIP install/restart/native-uninstall/reinstall smoke test now passes on an
-isolated Docker fixture; see [ACCEPTANCE.md](ACCEPTANCE.md). Catalog/upgrade/provider/client
+  isolated Docker fixture for the historical monolith; see [ACCEPTANCE.md](ACCEPTANCE.md). This does not certify the split builds. Catalog/upgrade/provider/client
 acceptance remains required. No in-process extension can
 honestly guarantee zero possible host impact: assembly-loading, shared-runtime/resource faults,
 Jellyfin's normal plugin bookkeeping and required restarts remain host-level concerns. These
@@ -70,13 +92,27 @@ remaining real-skin acceptance limits.
   retained unsigned watches require review, older request write plans stay read-only, and legacy
   removal activity is quarantined for a full configured recent-activity window. Restore matching
   whole-directory stopped backups rather than deleting authentication records.
+- Schema 14 adds an encrypted, authenticated deletion-event journal without rewriting
+  schema-13 roots or inventing earlier events. Private audit heads detect journal
+  omission/replay. Interrupted root-publication/database-commit pairs fail closed,
+  requiring a consistent stopped backup rather than automatic checkpoint promotion.
+- Plugin file/database writes check a 256 MiB free-space reserve. This is a bounded
+  best-effort guard, not a disk quota or a guarantee against external disk exhaustion.
+- The adapter's first confirmed configuration save adds an authenticated custody
+  marker without resetting existing roots/seals. Missing adapter state afterwards
+  cannot reactivate legacy credentials. Core-native watchlists remain available when
+  adapter configuration is corrupt. Back up/restore both plugin directories as a
+  matching stopped snapshot; see [adapter migration](discord/README.md).
 
 - Explicit item activity through `/hub-item`, `/hub-follow`, watchlist subscription and
   the authenticated item-activity API. Uses Jellyfin's timestamp-only user-data DTO;
   completion, progress, play count and favorites are not supplied or reset. No fake player.
   Bot interest is journaled in the plugin DB before the host update; a failed host write is
   reported without replay. Native player concurrency still needs real-host acceptance.
-- Durable shared deletion proposals with live Seerr requester/Jellyfin identity and TMDB
+- Durable shared deletion proposals with default own-request authority and explicit,
+  administrator-configurable denied/own-request/any-accessible-item account scopes.
+  The any-item grant uses fresh native movie/whole-series provider/path identity,
+  not fabricated Seerr request IDs. Live Seerr requester/Jellyfin identity and TMDB
   checks, native recent-activity scans (including series children), private consent inbox,
   agree/decline, owner-only Undo, anonymous viewer projections and a separate elevated audit
   endpoint. A supervised minute-cycle rechecks consent/aging while users are offline.

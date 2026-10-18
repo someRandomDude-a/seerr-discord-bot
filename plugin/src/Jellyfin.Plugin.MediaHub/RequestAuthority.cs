@@ -6,7 +6,8 @@ using MediaBrowser.Controller.Library;
 namespace Jellyfin.Plugin.MediaHub;
 
 public sealed record ArrRequest(string Origin, int RequestId, int MediaId, string Kind, bool Is4k, int? Instance,
-    int Provider, int Tmdb, string NativePath);
+    int Provider, int Tmdb, string NativePath,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] NativeDeletionSource? Native = null);
 public sealed record VerifiedDeletionTarget(Guid Item, string Pin, ArrRequest? Arr = null);
 public interface IRequestAuthority
 {
@@ -21,14 +22,16 @@ public sealed class RequestAuthority : IRequestAuthority, IDisposable
     private readonly SettingsService settings;
     private readonly ILibraryManager library;
     private readonly HttpClient http;
-    public RequestAuthority(SettingsService settings, ILibraryManager library) : this(settings, library, ServiceAddress.Handler()) { }
-    internal RequestAuthority(SettingsService settings, ILibraryManager library, HttpMessageHandler handler)
+    private readonly INativeDeletionResolver? native;
+    public RequestAuthority(SettingsService settings, ILibraryManager library, INativeDeletionResolver? native = null) : this(settings, library, ServiceAddress.Handler(), native) { }
+    internal RequestAuthority(SettingsService settings, ILibraryManager library, HttpMessageHandler handler, INativeDeletionResolver? native = null)
     {
-        this.settings = settings; this.library = library;
+        this.settings = settings; this.library = library; this.native = native;
         http = new(handler) { Timeout = TimeSpan.FromSeconds(15), MaxResponseContentBufferSize = 1024 * 1024 };
     }
     public async Task<IReadOnlyList<OwnedRequest>> FindOwned(User actor, Guid itemId, CancellationToken cancellation)
     {
+        new DeletionPermissions(settings).Require(actor, native: false);
         var item = library.GetItemById(itemId);
         if (item is null || !item.IsVisibleStandalone(actor)) throw new HubError("Item unavailable.");
         item = MediaActivity.Root(item);
@@ -53,7 +56,9 @@ public sealed class RequestAuthority : IRequestAuthority, IDisposable
     }
     public async Task<VerifiedDeletionTarget> Verify(User actor, int requestId, Guid itemId, CancellationToken cancellation)
     {
-        if (requestId <= 0) throw new HubError("Invalid request.");
+        new DeletionPermissions(settings).Require(actor, native: requestId == 0);
+        if (requestId == 0) return await (native ?? throw new HubError("Native deletion verification is unavailable.")).Discover(actor, itemId, cancellation);
+        if (requestId < 0) throw new HubError("Invalid request.");
         var config = settings.Current;
         if (config.SeerrUrl.Length == 0 || config.SeerrKeyEncrypted.Length == 0) throw new HubError("Seerr is not configured.");
         var item = library.GetItemById(itemId);

@@ -4,22 +4,17 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="Jellyfin.Plugin.PrivateSyncPlay.Api">
-      <HintPath>../../lib/PrivateSyncPlay.Api-1.1.0/Jellyfin.Plugin.PrivateSyncPlay.Api.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
+    <ProjectReference Include="../Jellyfin.Plugin.WatchlistDeletion.Api/Jellyfin.Plugin.WatchlistDeletion.Api.csproj" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
     <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" ExcludeAssets="runtime" />
-    <PackageReference Include="Discord.Net.WebSocket" Version="3.20.2" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <EmbeddedResource Include="Web/*" />
+    <EmbeddedResource Remove="Web/activity.bundle.js;Web/activity.css" />
     <AssemblyMetadata Include="PluginGuid" Value="c70297bf-77bd-4ad4-93c9-f67598519777" />
     <AssemblyMetadata Include="JellyfinVersion" Value="$(JellyfinVersion)" />
     <InternalsVisibleTo Include="MediaHub.Tests" />
+    <InternalsVisibleTo Include="MediaHub.Discord.Tests" />
   </ItemGroup>
-  <Target Name="ValidateActivityBundle" BeforeTargets="BeforeBuild" Condition="'$(RequireActivityBundle)' == 'true'">
-    <Error Condition="!Exists('Web/activity.bundle.js')" Text="Build the bundled Activity with npm ci --ignore-scripts and npm run build in plugin/activity before packaging." />
-  </Target>
 </Project>

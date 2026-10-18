@@ -3,6 +3,7 @@ param(
     [ValidatePattern('^mediahub-test-[a-z0-9-]{1,35}$')][string]$Name = 'mediahub-test-brave-otter',
     [ValidateRange(1024, 65535)][int]$Port = 18096,
     [string]$Package,
+    [ValidateSet('Core', 'LegacyMonolith')][string]$PackageKind = 'Core',
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$PackageVersion = '0.1.0.0',
     [ValidatePattern('^(|/[a-z0-9-]{1,32})$')][string]$BasePath = '',
     [string]$Image = 'jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037'
@@ -13,14 +14,14 @@ $stateFile = Join-Path $root ($Name + '.json')
 $url = 'http://127.0.0.1:' + $Port
 $dockerExe = (Get-Command docker -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 function Docker {
-    $result = & $dockerExe @args
-    if ($LASTEXITCODE -ne 0) { throw ('Docker acceptance operation failed: ' + $args[0]) }
-    return $result
+    $flat = @($args | ForEach-Object { foreach ($argument in $_) { [string]$argument } })
+    return & (Join-Path $PSScriptRoot 'Invoke-TestDocker.ps1') -Arguments $flat -TimeoutSeconds 90
 }
 function OwnContainer {
-    $labels = (Docker @('inspect', '--format', '{{json .Config.Labels}}', $Name)) | ConvertFrom-Json
-    $owner = $labels.'org.mediahub.acceptance'
-    if ($owner -ne $Name) { throw 'Refusing to touch a container not owned by this acceptance test.' }
+    # Docker's summary API returns the exact label and avoids a retained
+    # container-config inspection lock. No unlabelled or partial name match is accepted.
+    $owned = @(Docker @('ps', '-a', '--filter', ('name=^/' + $Name + '$'), '--filter', ('label=org.mediahub.acceptance=' + $Name), '--format', '{{.Names}}'))
+    if ($owned.Count -ne 1 -or $owned[0] -cne $Name) { throw 'Refusing to touch a container not owned by this acceptance test.' }
 }
 function Secret {
     $bytes = New-Object byte[] 32
@@ -181,7 +182,11 @@ if ($Mode -eq 'Install') {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $Package))
     try {
-        $allowed = @('Jellyfin.Plugin.MediaHub.dll', 'Jellyfin.Plugin.MediaHub.deps.json', 'Discord.Net.Core.dll', 'Discord.Net.Dave.dll', 'Discord.Net.Rest.dll', 'Discord.Net.WebSocket.dll', 'Newtonsoft.Json.dll', 'Jellyfin.Plugin.PrivateSyncPlay.Api.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+        $allowed = if ($PackageKind -eq 'LegacyMonolith') {
+            @('Jellyfin.Plugin.MediaHub.dll', 'Jellyfin.Plugin.MediaHub.deps.json', 'Discord.Net.Core.dll', 'Discord.Net.Dave.dll', 'Discord.Net.Rest.dll', 'Discord.Net.WebSocket.dll', 'Newtonsoft.Json.dll', 'Jellyfin.Plugin.PrivateSyncPlay.Api.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+        } else {
+            @('Jellyfin.Plugin.MediaHub.dll', 'Jellyfin.Plugin.MediaHub.deps.json', 'Jellyfin.Plugin.WatchlistDeletion.Api.dll', 'Newtonsoft.Json.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+        }
         $seen = @{}; $expanded = 0L
         foreach ($entry in $zip.Entries) {
             if ($entry.FullName -cnotin $allowed -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 33554432) { throw 'Unexpected, duplicate or oversized archive entry.' }
@@ -263,9 +268,15 @@ $admin = Api 'MediaHub/Me' $null $state.AdminToken
 if ($admin.Preferences.Muted -or !$saved.Preferences.Muted) { throw 'Per-user preference isolation failed.' }
 Expect-Status 'MediaHub/Me' 401
 Expect-Status 'MediaHub/Settings' 403 $state.ViewerToken
+if ($PackageKind -eq 'Core') {
+    Expect-Status 'MediaHub/Admin/Deletions' 403 $state.ViewerToken
+    Expect-Status 'MediaHub/Admin/Deletions' 200 $state.AdminToken 'mediahub-acceptance-admin'
+}
 Expect-Status 'MediaHub/Messaging/Access' 403 $state.ViewerToken
-Expect-Status 'MediaHub/Activity/Config' 401
-Expect-Status 'MediaHub/Activity/Api/Me' 401
+$adapterInstalled = @($plugins | Where-Object { [Guid]$_.Id -eq [Guid]'8456d36a-3c89-4b6d-9959-9a74566cc252' -and $_.Status -eq 'Active' }).Count -eq 1
+$activityStatus = if ($PackageKind -eq 'LegacyMonolith' -or $adapterInstalled) { 401 } else { 404 }
+Expect-Status 'MediaHub/Activity/Config' $activityStatus
+Expect-Status 'MediaHub/Activity/Api/Me' $activityStatus
 Expect-Status 'MediaHub/Players' 401
 Expect-Status 'MediaHub/Players/History' 200 $state.ViewerToken 'mediahub-acceptance-viewer'
 Expect-Status 'web/ConfigurationPage?name=mediahub' 200 $state.AdminToken 'mediahub-acceptance-admin'

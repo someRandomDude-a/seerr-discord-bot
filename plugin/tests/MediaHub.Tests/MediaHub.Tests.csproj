@@ -1,10 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><IsTestProject>true</IsTestProject><IsPackable>false</IsPackable></PropertyGroup>
   <ItemGroup>
-    <Reference Include="Jellyfin.Plugin.PrivateSyncPlay.Api">
-      <HintPath>../../lib/PrivateSyncPlay.Api-1.1.0/Jellyfin.Plugin.PrivateSyncPlay.Api.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
     <ProjectReference Include="../../src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj" />
     <ProjectReference Include="../../tools/MediaHub.Packager/MediaHub.Packager.csproj" />
     <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" />

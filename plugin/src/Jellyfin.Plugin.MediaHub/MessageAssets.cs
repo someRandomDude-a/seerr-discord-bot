@@ -8,12 +8,7 @@ public sealed class MessageAssets : IDisposable
     public MessageAssets() : this(ServiceAddress.Handler()) { }
     internal MessageAssets(HttpMessageHandler handler) => http = new(handler) { Timeout = TimeSpan.FromSeconds(10) };
     internal static bool Allowed(string url)
-    {
-        if (url is null || url.Length > 4096 || url.Any(c => char.IsControl(c) || c == '\\') || !Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" || !uri.IsDefaultPort || uri.UserInfo.Length != 0 || uri.Fragment.Length != 0 ||
-            uri.Host is not ("cdn.discordapp.com" or "media.discordapp.net")) return false;
-        var path = Uri.UnescapeDataString(uri.AbsolutePath);
-        return System.Text.RegularExpressions.Regex.IsMatch(path, "\\A/(attachments|avatars|embed/avatars|emojis)/[A-Za-z0-9_./-]+\\z") && !path.Contains("..");
-    }
+        => Jellyfin.Plugin.WatchlistDeletion.Api.MediaPresentation.DiscordAsset(url);
     public async Task<MessageBlob> Download(string url, string filename, CancellationToken cancellation)
     {
         if (!Allowed(url)) throw new HubError("Only retained Discord CDN attachments can be fetched.");

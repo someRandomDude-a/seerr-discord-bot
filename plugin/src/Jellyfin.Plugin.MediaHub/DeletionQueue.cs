@@ -76,7 +76,7 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
             using (var db = store.Open())
             using (var tx = db.BeginTransaction())
             {
-                using var duplicate = HubStore.Command(db, "SELECT 1 FROM deletion_queue WHERE target=$0 AND state NOT IN ('cancelled','completed')", target.Pin); duplicate.Transaction = tx;
+                using var duplicate = HubStore.Command(db, "SELECT 1 FROM deletion_queue WHERE (target=$0 OR (item=$1 AND (request_id=0 OR $2=0))) AND state NOT IN ('cancelled','completed')", target.Pin, Key(item), request); duplicate.Transaction = tx;
                 if (duplicate.ExecuteScalar() is not null) throw new HubError("Deletion is already proposed.");
                 var id = HubStore.Nonce();
                 using var write = HubStore.Command(db, "INSERT INTO deletion_queue VALUES($0,$1,$2,$3,$4,'waiting',NULL,NULL,0,$5,$6)", id, Key(viewer.Id), Key(item), request, target.Pin, Time(now), delay);
@@ -84,11 +84,11 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
                 if (proof is not null)
                 {
                     using var intent = HubStore.Command(db, "INSERT INTO deletion_runs VALUES($0,$1,'prepared',$2)", id,
-                        settings.Protect(System.Text.Json.JsonSerializer.Serialize(proof), ProofPurpose(id, viewer.Id, item, "prepared")), Time(now));
+                        settings.ProtectDeletionProof(System.Text.Json.JsonSerializer.Serialize(proof), ProofPurpose(id, viewer.Id, item, "prepared")), Time(now));
                     intent.Transaction = tx; intent.ExecuteNonQuery();
                 }
                 foreach (var own in viewers.Where(v => v.UserId == viewer.Id)) Vote(db, tx, id, viewer.Id, own.LastActivity, true);
-                SealQueue(db, id, tx);
+                SealQueue(db, id, tx, "proposed", viewer.Id, title: media.Find(viewer, item)?.Title ?? throw new HubError("Item access changed before the proposal was saved."));
                 tx.Commit();
             }
         }
@@ -113,6 +113,7 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
                 var config = settings.Current; var rules = new DeletionRules(config.RecentActivityDays, config.DeletionDelayDays);
                 var now = DateTimeOffset.UtcNow; IReadOnlyList<RecentViewer> viewers = [];
                 DeletionDecision decision;
+                string? reason = null;
                 var delay = Math.Clamp(Math.Max(row.Delay, personal.State(viewer).EffectiveDeletionDelayDays), rules.DefaultDelayDays, rules.RecentActivityDays);
                 try
                 {
@@ -127,27 +128,31 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
                         delay, row.Eligible, row.Due);
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
-                catch { decision = new(DeletionStage.Unavailable); }
+                catch (Exception error) { decision = new(DeletionStage.Unavailable); reason = error is HubError { Code: "deletion_denied" } ? "permission_revoked" : "target_or_activity_unavailable"; }
                 using var db = store.Open(); using var tx = db.BeginTransaction();
                 CheckAuthorization(db, row, tx);
                 var state = decision.Stage switch { DeletionStage.AwaitingConsent => "waiting", DeletionStage.Queued => "queued", DeletionStage.Ready => "ready", _ => "blocked" };
-                using var update = HubStore.Command(db, "UPDATE deletion_queue SET state=$0,eligible=$1,due=$2,revision=revision+1,delay=MAX(delay,$5) WHERE id=$3 AND revision=$4",
-                    state, Time(decision.EligibleSince), Time(decision.DueAt), id, row.Revision, delay); update.Transaction = tx;
-                if (update.ExecuteNonQuery() != 1) throw new HubError("Proposal changed. Refresh.");
+                var noticesAdded = 0;
                 foreach (var watcher in viewers.Where(v => v.LastActivity >= now.AddDays(-rules.RecentActivityDays)))
                 {
                     using var notice = HubStore.Command(db, "INSERT OR IGNORE INTO deletion_notices VALUES($0,$1,$2,$3)", HubStore.Nonce(), Key(watcher.UserId), id, Time(watcher.LastActivity));
-                    notice.Transaction = tx; notice.ExecuteNonQuery();
+                    notice.Transaction = tx; noticesAdded += notice.ExecuteNonQuery();
                 }
-                SealQueue(db, id, tx); tx.Commit();
+                if (state == row.State && decision.EligibleSince == row.Eligible && decision.DueAt == row.Due && delay == row.Delay && noticesAdded == 0)
+                { tx.Commit(); continue; } // Polling is not a new audit event or revision.
+                using var update = HubStore.Command(db, "UPDATE deletion_queue SET state=$0,eligible=$1,due=$2,revision=revision+1,delay=MAX(delay,$5) WHERE id=$3 AND revision=$4",
+                    state, Time(decision.EligibleSince), Time(decision.DueAt), id, row.Revision, delay); update.Transaction = tx;
+                if (update.ExecuteNonQuery() != 1) throw new HubError("Proposal changed. Refresh.");
+                SealQueue(db, id, tx, state == "blocked" ? "blocked" : "refreshed", reason: reason); tx.Commit();
             }
         }
         finally { gate.Release(); }
     }
     public IReadOnlyList<ConsentNotice> Notices(User viewer)
     {
+        var preferences = personal.State(viewer).Preferences;
         using var db = store.Open(); using var cmd = HubStore.Command(db, """
-            SELECT n.id,n.proposal,q.item FROM deletion_notices n JOIN deletion_queue q ON q.id=n.proposal
+            SELECT n.id,n.proposal,q.item,q.delay FROM deletion_notices n JOIN deletion_queue q ON q.id=n.proposal
             WHERE n.user=$0 AND q.state IN ('waiting','blocked','queued','ready')
             AND n.activity>=$1
             AND n.activity=(SELECT MAX(newer.activity) FROM deletion_notices newer WHERE newer.user=n.user AND newer.proposal=n.proposal)
@@ -157,7 +162,8 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
         while (r.Read())
         {
             var item = Guid.Parse(r.GetString(2)); var visible = media.Find(viewer, item) ?? media.FindForConsent(viewer, item);
-            if (visible is not null) result.Add(new(r.GetString(0), r.GetString(1), visible.Id, visible.Title, "Allow deletion?"));
+            if (visible is not null) result.Add(new(r.GetString(0), r.GetString(1), visible.Id, visible.Title,
+                DeletionMessages.Render(preferences.DeletionMessage, visible.Title, Math.Max(r.GetInt32(3), settings.Current.DeletionDelayDays), settings.Current.RecentActivityDays)));
         }
         return result;
     }
@@ -173,12 +179,13 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
             if (row.State is not ("waiting" or "blocked" or "queued" or "ready") || (media.Find(viewer, row.Item) ?? media.FindForConsent(viewer, row.Item)) is null) throw new HubError("Proposal unavailable.");
             var latest = activity.Read(row.Item).Where(v => v.UserId == viewer.Id).MaxBy(v => v.LastActivity);
             if (latest is null || latest.LastActivity != at) throw new HubError("Activity changed. Refresh notifications.");
+            CheckAuthorization(db, row);
             using var previous = HubStore.Command(db, "SELECT approved FROM deletion_votes WHERE proposal=$0 AND user=$1 AND activity=$2", id, Key(viewer.Id), Time(at));
             if (previous.ExecuteScalar() is long saved && saved == (approve ? 1 : 0)) return;
             using var tx = db.BeginTransaction(); CheckAuthorization(db, row, tx); Vote(db, tx, id, viewer.Id, at, approve);
             // Any response invalidates the old deadline until the owner's full live recheck.
             using var reset = HubStore.Command(db, "UPDATE deletion_queue SET state='waiting',eligible=NULL,due=NULL,revision=revision+1 WHERE id=$0 AND revision=$1 AND state NOT IN ('cancelled','completed')", id, row.Revision);
-            reset.Transaction = tx; if (reset.ExecuteNonQuery() != 1) throw new HubError("Proposal changed. Refresh."); SealQueue(db, id, tx); tx.Commit();
+            reset.Transaction = tx; if (reset.ExecuteNonQuery() != 1) throw new HubError("Proposal changed. Refresh."); SealQueue(db, id, tx, approve ? "consent_yes" : "consent_no", viewer.Id); tx.Commit();
         }
         finally { gate.Release(); }
     }
@@ -187,6 +194,6 @@ public sealed partial class DeletionQueue(HubStore store, SettingsService settin
         using var db = store.Open(); using var tx = db.BeginTransaction(); var authenticated = HasAuthorization(db, Get(db, id, tx), tx);
         using var undo = HubStore.Command(db, "UPDATE deletion_queue SET state='cancelled',eligible=NULL,due=NULL,revision=revision+1 WHERE id=$0 AND owner=$1 AND state IN ('waiting','queued','ready','blocked')", id, Key(viewer.Id)); undo.Transaction = tx;
         if (undo.ExecuteNonQuery() != 1) throw new HubError("Only the requester can undo this proposal.");
-        if (authenticated) SealQueue(db, id, tx); tx.Commit();
+        if (authenticated) SealQueue(db, id, tx, "cancelled", viewer.Id); tx.Commit();
     }
 }

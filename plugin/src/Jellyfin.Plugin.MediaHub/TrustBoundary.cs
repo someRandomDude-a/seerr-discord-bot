@@ -10,7 +10,7 @@ namespace Jellyfin.Plugin.MediaHub;
 internal static class SafeJson
 {
     private static readonly JsonSerializerOptions Options = new() { MaxDepth = 32, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
-    public static void Validate(ReadOnlySpan<byte> bytes, int maximum = 8 * 1024 * 1024)
+    public static void Validate(ReadOnlySpan<byte> bytes, int maximum = 8 * 1024 * 1024, int maximumStringBytes = 131072)
     {
         if (bytes.Length is 0 || bytes.Length > maximum) throw new HubError("JSON input exceeds its supported size or is empty.");
         try
@@ -19,7 +19,7 @@ internal static class SafeJson
             var objects = new Stack<HashSet<string>>(); var tokens = 0;
             while (reader.Read())
             {
-                if (++tokens > 250000 || reader.TokenType == JsonTokenType.String && reader.ValueSpan.Length > 131072)
+                if (++tokens > 250000 || reader.TokenType == JsonTokenType.String && reader.ValueSpan.Length > maximumStringBytes)
                     throw new HubError("JSON input is too complex.");
                 if (reader.TokenType == JsonTokenType.StartObject) objects.Push(new(StringComparer.OrdinalIgnoreCase));
                 else if (reader.TokenType == JsonTokenType.EndObject) objects.Pop();

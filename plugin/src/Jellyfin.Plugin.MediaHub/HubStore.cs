@@ -14,7 +14,7 @@ public sealed class HubError(string message, string? code = null) : Exception(me
 public sealed class HubStore
 {
     // V3 protects extended preferences; V4 adds activity, proposals, votes and notices.
-    public const int SchemaVersion = 13;
+    public const int SchemaVersion = 14;
     public const int ApplicationId = 0x4D485542; // MHUB, only inside hub.db.
     public string DirectoryPath { get; }
     internal bool NewDatabaseCreated { get; private set; }
@@ -54,7 +54,8 @@ public sealed class HubStore
         ["deletion_authorizations"] = "proposal,integrity",
         ["playback_operations"] = "id,user,state,payload",
         ["state_seals"] = "scope,integrity",
-        ["watch_reviews"] = "user,payload"
+        ["watch_reviews"] = "user,payload",
+        ["deletion_audit"] = "proposal,sequence,payload"
     };
     public HubStore(IApplicationPaths paths) : this(Path.Combine(paths.DataPath, "media-hub")) { }
     public HubStore(string directory) : this(directory, null) { }
@@ -206,6 +207,12 @@ public sealed class HubStore
             command.CommandText = "CREATE TABLE IF NOT EXISTS state_seals(scope TEXT PRIMARY KEY,integrity TEXT NOT NULL); CREATE TABLE IF NOT EXISTS watch_reviews(user TEXT PRIMARY KEY,payload TEXT NOT NULL)";
             command.ExecuteNonQuery();
         }
+        if (version < 14)
+        {
+            // Additive journal only. Never fabricate events or reseal old proposal state.
+            command.CommandText = "CREATE TABLE IF NOT EXISTS deletion_audit(proposal TEXT NOT NULL,sequence INTEGER NOT NULL CHECK(sequence>0),payload TEXT NOT NULL,PRIMARY KEY(proposal,sequence))";
+            command.ExecuteNonQuery();
+        }
         command.CommandText = "PRAGMA user_version=" + SchemaVersion; command.ExecuteNonQuery();
         command.CommandText = "PRAGMA application_id=" + ApplicationId; command.ExecuteNonQuery();
         Integrity(db, transaction);
@@ -214,6 +221,7 @@ public sealed class HubStore
     }
     private void CreateDatabase()
     {
+        StateFiles.RequireSpace(DirectoryPath, 4 * 1024 * 1024);
         var temp = StateFiles.In(DirectoryPath, "hub." + Nonce() + ".db.tmp"); var created = false;
         try
         {
@@ -228,6 +236,7 @@ public sealed class HubStore
     }
     private void BackupBeforeUpgrade()
     {
+        StateFiles.RequireSpace(DirectoryPath, checked(new FileInfo(databasePath).Length * 2));
         var directory = Path.Combine(DirectoryPath, "backups"); StateFiles.Check(directory);
         if (!Directory.Exists(directory))
         {
@@ -320,7 +329,7 @@ public sealed class HubStore
         // Adopt only the exact known native preview, never an arbitrary unmarked database.
         using var tables = Command(db, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
         var names = new List<string>(); using (var reader = tables.ExecuteReader()) while (reader.Read()) names.Add(reader.GetString(0));
-        var required = version >= 13 ? Columns.Keys : version >= 12 ? Columns.Keys.Take(30) : version >= 11 ? Columns.Keys.Take(29) : version >= 10 ? Columns.Keys.Take(28) : version >= 9 ? Columns.Keys.Take(27) : version >= 8 ? Columns.Keys.Take(21) : version >= 7 ? Columns.Keys.Take(16) : version >= 6 ? Columns.Keys.Take(15) : version >= 5 ? Columns.Keys.Take(13) : version >= 4 ? Columns.Keys.Take(11) : version >= 2 ? Columns.Keys.Take(7) : Columns.Keys.Take(5);
+        var required = version >= 14 ? Columns.Keys : version >= 13 ? Columns.Keys.Take(32) : version >= 12 ? Columns.Keys.Take(30) : version >= 11 ? Columns.Keys.Take(29) : version >= 10 ? Columns.Keys.Take(28) : version >= 9 ? Columns.Keys.Take(27) : version >= 8 ? Columns.Keys.Take(21) : version >= 7 ? Columns.Keys.Take(16) : version >= 6 ? Columns.Keys.Take(15) : version >= 5 ? Columns.Keys.Take(13) : version >= 4 ? Columns.Keys.Take(11) : version >= 2 ? Columns.Keys.Take(7) : Columns.Keys.Take(5);
         if (required.Except(names, StringComparer.Ordinal).Any() || names.Except(Columns.Keys, StringComparer.Ordinal).Any())
             throw new HubError("Unrecognized Media Hub database schema. It was not changed.");
         foreach (var name in names)
@@ -340,6 +349,9 @@ public sealed class HubStore
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
     private SqliteConnection Connect()
     {
+        // Leave host-disk headroom before opening a plugin-owned read/write connection.
+        // This is a local guard, not a host volume/quota/configuration modification.
+        StateFiles.RequireSpace(DirectoryPath, 32L * 1024 * 1024);
         var db = new SqliteConnection(connectionString);
         try { db.Open(); Configure(db); return db; } catch { db.Dispose(); throw; }
     }
@@ -361,6 +373,8 @@ public sealed class HubStore
         using var db = Open(); using var command = Command(db, "SELECT user FROM links WHERE discord=$0", discord);
         return command.ExecuteScalar() is string value ? Guid.Parse(value) : throw new HubError("Link your account first with /hub-link, then approve it in Jellyfin.");
     }
+    internal bool HasDiscordLink(string discord)
+    { using var db = Open(); using var read = Command(db, "SELECT 1 FROM links WHERE discord=$0", discord); return read.ExecuteScalar() is not null; }
     public (Guid User, string Token, string Device) Credential(string discord)
     {
         using var db = Open(); using var command = Command(db, "SELECT user,token,device FROM links WHERE discord=$0", discord);

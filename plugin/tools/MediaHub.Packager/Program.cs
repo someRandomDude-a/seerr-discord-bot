@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 namespace MediaHub.Packager;
 
 public sealed record PackageResult(string Archive, string Manifest, string Sha256);
+public enum PluginPackage { Core, Discord }
 
 public static partial class CatalogBuilder
 {
@@ -19,6 +20,11 @@ public static partial class CatalogBuilder
     public static readonly string[] RuntimeFiles =
     [
         "Jellyfin.Plugin.MediaHub.dll", "Jellyfin.Plugin.MediaHub.deps.json",
+        "Jellyfin.Plugin.WatchlistDeletion.Api.dll", "Newtonsoft.Json.dll"
+    ];
+    public static readonly string[] DiscordRuntimeFiles =
+    [
+        "Jellyfin.Plugin.MediaHub.Discord.dll", "Jellyfin.Plugin.MediaHub.Discord.deps.json", "Jellyfin.Plugin.WatchlistDeletion.Api.dll",
         "Discord.Net.Core.dll", "Discord.Net.Dave.dll", "Discord.Net.Rest.dll", "Discord.Net.WebSocket.dll", "Newtonsoft.Json.dll",
         "Jellyfin.Plugin.PrivateSyncPlay.Api.dll"
     ];
@@ -72,8 +78,12 @@ public static partial class CatalogBuilder
     }
 
     public static PackageResult Create(string input, string output, string metadataPath, string repository,
-        string version, string? previousManifest = null)
+        string version, string? previousManifest = null, PluginPackage plugin = PluginPackage.Core)
     {
+        if (!Enum.IsDefined(plugin)) throw new ArgumentException("Unknown plugin package.");
+        var runtimeFiles = plugin == PluginPackage.Core ? RuntimeFiles : DiscordRuntimeFiles;
+        var assemblyName = plugin == PluginPackage.Core ? "Jellyfin.Plugin.MediaHub" : "Jellyfin.Plugin.MediaHub.Discord";
+        var tagPrefix = plugin == PluginPackage.Core ? "plugin-v" : "discord-v";
         if (!RepositoryPattern().IsMatch(repository)) throw new ArgumentException("Repository must be owner/name.");
         if (!VersionPattern().IsMatch(version) || !Version.TryParse(version, out var parsed) ||
             new[] { parsed.Major, parsed.Minor, parsed.Build, parsed.Revision }.Any(part => part > 65534))
@@ -84,20 +94,23 @@ public static partial class CatalogBuilder
         if (!Version.TryParse(targetAbi, out var abi) || abi != new Version(12, 2, 0)) throw new InvalidDataException("Only the latest reviewed Jellyfin 12.2.0 target ABI can be packaged.");
         foreach (var field in new[] { "name", "overview", "description", "category" })
             if (string.IsNullOrWhiteSpace(metadata[field]?.GetValue<string>())) throw new InvalidDataException("Missing metadata: " + field);
-        foreach (var name in RuntimeFiles)
+        foreach (var name in runtimeFiles)
             if (!File.Exists(Path.Combine(input, name))) throw new FileNotFoundException("Required release dependency missing: " + name);
+        if (plugin == PluginPackage.Discord)
         using (var sdk = File.OpenRead(Path.Combine(input, "Jellyfin.Plugin.PrivateSyncPlay.Api.dll")))
             if (Convert.ToHexString(SHA256.HashData(sdk)).ToLowerInvariant() != "0cf21a33c9d44fbb294503e52ad61479501811c2447d3e5dd925b49dd62ca136")
                 throw new InvalidDataException("Private SyncPlay public SDK differs from the reviewed 1.1.0 release.");
-        if (AssemblyName.GetAssemblyName(Path.Combine(input, RuntimeFiles[0])).Version != parsed)
+        if (AssemblyName.GetAssemblyName(Path.Combine(input, runtimeFiles[0])).Version != parsed)
             throw new InvalidDataException("Manifest version must match the actual plugin assembly version.");
         // Read PE metadata without loading the plugin or its privileged host dependencies.
-        var assemblyMetadata = AssemblyMetadata(Path.Combine(input, RuntimeFiles[0]));
+        var assemblyMetadata = AssemblyMetadata(Path.Combine(input, runtimeFiles[0]));
         if (!Guid.TryParse(assemblyMetadata.GetValueOrDefault("PluginGuid"), out var assemblyGuid) || assemblyGuid != guid)
             throw new InvalidDataException("Manifest GUID must match the plugin assembly.");
+        if (guid != Guid.Parse(plugin == PluginPackage.Core ? "c70297bf-77bd-4ad4-93c9-f67598519777" : "8456d36a-3c89-4b6d-9959-9a74566cc252"))
+            throw new InvalidDataException("Package kind must match the plugin identity.");
         if (!Version.TryParse(assemblyMetadata.GetValueOrDefault("JellyfinVersion"), out var builtAbi) || builtAbi != abi)
             throw new InvalidDataException("Manifest target ABI must match the Jellyfin API used to build the plugin.");
-        var dependencies = ReadJson(Path.Combine(input, RuntimeFiles[1])).AsObject();
+        var dependencies = ReadJson(Path.Combine(input, runtimeFiles[1])).AsObject();
         if (dependencies is null) throw new InvalidDataException("Invalid dependency manifest.");
 
         JsonArray catalog = previousManifest is null ? [] : ReadJson(previousManifest).AsArray();
@@ -109,7 +122,8 @@ public static partial class CatalogBuilder
         if (entry is not null && entry["versions"] is not JsonArray) throw new InvalidDataException("Invalid previous versions. Refusing to erase history.");
         var versions = entry?["versions"]?.AsArray() ?? [];
         if (versions.Count > 1000) throw new InvalidDataException("Release history exceeds its safe size.");
-        if (previousManifest is not null && (entry is null || versions.Count == 0))
+        if (previousManifest is not null && (entry is null || versions.Count == 0) &&
+            !(plugin == PluginPackage.Discord && entry is null && catalog.Any(row => row?["guid"]?.GetValue<string>() == "c70297bf-77bd-4ad4-93c9-f67598519777" && row["versions"] is JsonArray { Count: > 0 })))
             throw new InvalidDataException("Previous manifest has no Media Hub release history. Refusing to replace it.");
         foreach (var row in versions)
         {
@@ -120,7 +134,7 @@ public static partial class CatalogBuilder
                 throw new InvalidOperationException("New releases must increase the published version; repository history cannot move backwards.");
             var checksum = row["checksum"]?.GetValue<string>() ?? "";
             var previousVersion = row["version"]!.GetValue<string>();
-            var expectedSource = $"https://github.com/{repository}/releases/download/plugin-v{previousVersion}/Jellyfin.Plugin.MediaHub_{previousVersion}.zip";
+            var expectedSource = $"https://github.com/{repository}/releases/download/{tagPrefix}{previousVersion}/{assemblyName}_{previousVersion}.zip";
             if (checksum.Length != 32 || !checksum.All(Uri.IsHexDigit) ||
                 row["sourceUrl"]?.GetValue<string>() != expectedSource ||
                 !Version.TryParse(row["targetAbi"]?.GetValue<string>(), out _) ||
@@ -129,8 +143,8 @@ public static partial class CatalogBuilder
         }
         if (versions.Select(row => row!["version"]!.GetValue<string>()).Distinct(StringComparer.Ordinal).Count() != versions.Count)
             throw new InvalidDataException("Duplicate published versions in previous catalog.");
-        var tag = "plugin-v" + version;
-        var archiveName = "Jellyfin.Plugin.MediaHub_" + version + ".zip";
+        var tag = tagPrefix + version;
+        var archiveName = assemblyName + "_" + version + ".zip";
         var source = $"https://github.com/{repository}/releases/download/{tag}/{archiveName}";
         Directory.CreateDirectory(output);
         if (Directory.EnumerateFileSystemEntries(output).Any()) throw new IOException("Use an empty output directory; existing files will not be overwritten.");
@@ -138,7 +152,7 @@ public static partial class CatalogBuilder
         using (var file = new FileStream(archive, FileMode.CreateNew, FileAccess.Write))
         using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
         {
-            foreach (var name in RuntimeFiles.Order(StringComparer.Ordinal))
+            foreach (var name in runtimeFiles.Order(StringComparer.Ordinal))
             {
                 var item = zip.CreateEntry(name, CompressionLevel.Optimal);
                 item.LastWriteTime = new DateTimeOffset(1980, 1, 1, 0, 0, 0, TimeSpan.Zero);
@@ -191,11 +205,12 @@ public static class Program
         {
             var options = new Dictionary<string, string>(StringComparer.Ordinal);
             if (args.Length % 2 != 0) throw new ArgumentException("Use --input DIR --output DIR --metadata FILE --repository OWNER/REPO --version A.B.C.D [--previous FILE].");
-            var allowed = new[] { "--input", "--output", "--metadata", "--repository", "--version", "--previous" };
+            var allowed = new[] { "--input", "--output", "--metadata", "--repository", "--version", "--previous", "--plugin" };
             for (var i = 0; i < args.Length; i += 2)
                 if (!allowed.Contains(args[i]) || !options.TryAdd(args[i], args[i + 1])) throw new ArgumentException("Unknown or repeated option.");
             foreach (var required in allowed[..5]) if (!options.ContainsKey(required)) throw new ArgumentException("Missing option: " + required);
-            var result = CatalogBuilder.Create(options["--input"], options["--output"], options["--metadata"], options["--repository"], options["--version"], options.GetValueOrDefault("--previous"));
+            var plugin = options.GetValueOrDefault("--plugin", "core") switch { "core" => PluginPackage.Core, "discord" => PluginPackage.Discord, _ => throw new ArgumentException("Use --plugin core or discord.") };
+            var result = CatalogBuilder.Create(options["--input"], options["--output"], options["--metadata"], options["--repository"], options["--version"], options.GetValueOrDefault("--previous"), plugin);
             Console.WriteLine("Created " + result.Archive); Console.WriteLine("Created " + result.Manifest); return 0;
         }
         catch (Exception error) { Console.Error.WriteLine("Packaging failed: " + error.Message); return 1; }

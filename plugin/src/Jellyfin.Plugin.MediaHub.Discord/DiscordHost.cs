@@ -3,6 +3,7 @@ using Discord.WebSocket;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
+using Jellyfin.Plugin.MediaHub.DiscordIntegration;
 
 namespace Jellyfin.Plugin.MediaHub;
 
@@ -32,6 +33,12 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
                 try
                 {
                     var config = settings.Current;
+                    if (!provider.GetRequiredService<IntegrationDependencies>().Ready)
+                    {
+                        await Disconnect(); revision = -1;
+                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                        continue;
+                    }
                     retrySeconds = 5;
                     if (config.Revision != revision)
                     {
@@ -55,7 +62,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
                                  await connection.StartAsync().WaitAsync(TimeSpan.FromSeconds(15), stoppingToken);
                                  connectionRevision = config.Revision;
                             }
-                            catch { configured = false; log.LogWarning("Media Hub Discord startup failed. Check the plugin settings and outbound connectivity."); }
+                            catch { configured = false; log.SafeWarning("Media Hub Discord startup failed. Check the plugin settings and outbound connectivity."); }
                         }
                         revision = configured ? config.Revision : -1;
                     }
@@ -70,7 +77,8 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
                             var buttons = new ComponentBuilder().WithButton("Agree", "mediahub:consent:" + notice.Id + ":yes", ButtonStyle.Success)
                                 .WithButton("Decline", "mediahub:consent:" + notice.Id + ":no", ButtonStyle.Secondary).Build();
                             var title = notice.Title.Length > 256 ? notice.Title[..256] : notice.Title;
-                            await recipient.SendMessageAsync(embed: new EmbedBuilder().WithTitle(title).WithDescription("Allow deletion?").Build(),
+                            var personalMessage = System.Text.RegularExpressions.Regex.Replace(Clip(notice.Message, 1500), @"([\\`*_{}\[\]()#+\-.!|>~])", @"\$1");
+                            await recipient.SendMessageAsync(embed: new EmbedBuilder().WithTitle(title).WithDescription(notice.Message == "Allow deletion?" ? notice.Message : "Allow deletion?\n" + personalMessage).Build(),
                                 components: buttons, allowedMentions: AllowedMentions.None,
                                 options: new RequestOptions { CancelToken = cancellation, RetryMode = RetryMode.AlwaysFail, Timeout = 15000 });
                          }, deliveryBudget.Token);
@@ -89,14 +97,14 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
                 }
                 catch
                 {
-                    log.LogWarning("Media Hub configuration/state could not be loaded. Discord remains unavailable; Jellyfin will continue running. Restore the plugin data/key or check permissions.");
+                    log.SafeWarning("Media Hub configuration/state could not be loaded. Discord remains unavailable; Jellyfin will continue running. Restore the plugin data/key or check permissions.");
                     await Disconnect(); revision = -1; retrySeconds = Math.Min(60, retrySeconds * 2);
                 }
                 await Task.Delay(TimeSpan.FromSeconds(retrySeconds), stoppingToken);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
-        catch { log.LogWarning("Media Hub Discord worker stopped after a plugin failure. Jellyfin remains available."); }
+        catch { log.SafeWarning("Media Hub Discord worker stopped after a plugin failure. Jellyfin remains available."); }
         finally { await Disconnect(); }
     }
     private async Task GuardEvent(DiscordSocketClient connection, int expectedRevision, Func<Task> action)
@@ -109,7 +117,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             if (!ReferenceEquals(client, connection) || settings.Current is not { DiscordEnabled: true } current || current.Revision != expectedRevision) return;
             await action();
         }
-        catch { log.LogWarning("Media Hub Discord event could not be completed. No automatic resend was performed."); }
+        catch { log.SafeWarning("Media Hub Discord event could not be completed. No automatic resend was performed."); }
         finally { operation.Value = previous; eventSlots.Release(); }
     }
     private async Task Disconnect()
@@ -117,11 +125,11 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
         var connection = client; client = null; connectionRevision = -1;
         if (connection is null) return;
         try { await connection.StopAsync().WaitAsync(TimeSpan.FromSeconds(3)); }
-        catch { log.LogWarning("Media Hub Discord disconnect was not confirmed; disposing only the plugin connection."); }
+        catch { log.SafeWarning("Media Hub Discord disconnect was not confirmed; disposing only the plugin connection."); }
         finally
         {
             try { connection.Dispose(); }
-            catch { log.LogWarning("Media Hub Discord connection cleanup failed; host services were not disposed."); }
+            catch { log.SafeWarning("Media Hub Discord connection cleanup failed; host services were not disposed."); }
         }
     }
     private async Task Register(DiscordSocketClient connection)
@@ -159,6 +167,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             else if (interaction is SocketMessageComponent control && control.Data.CustomId.StartsWith("mediahub:control:", StringComparison.Ordinal)) await MediaClick(control);
             else if (interaction is SocketMessageComponent button) await LegacyOrConsentButton(button);
         }
+        catch (WatchPartyFailure error) { await interaction.FollowupAsync(error.Message, ephemeral: true, allowedMentions: AllowedMentions.None); }
         catch (HubError error) { await interaction.FollowupAsync(error.Message, ephemeral: true, allowedMentions: AllowedMentions.None); }
         catch { await interaction.FollowupAsync("Not confirmed. Check the result before retrying.", ephemeral: true, allowedMentions: AllowedMentions.None); }
     }
@@ -168,10 +177,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             throw new HubError("Use this command in an allowed Discord server.");
         if (OperatorCommands.Contains(interaction.CommandName)) { await OperatorSlash(interaction); return; }
         if (MediaCommands.Contains(interaction.CommandName)) { await MediaSlash(interaction); return; }
-        if (interaction.CommandName is not ("hub-link" or "watchparty" or "hub-item" or "hub-follow")) throw new HubError("Unknown command.");
-        // An older installation may still have this command registered in Discord. Do not
-        // publish more invitations or remove commands belonging to the companion plugin.
-        if (interaction.CommandName == "watchparty") throw provider.GetRequiredService<WatchPartyIntegration>().Unavailable();
+        if (interaction.CommandName is not ("hub-link" or "hub-item" or "hub-follow")) throw new HubError("Unknown command.");
         if (interaction.CommandName == "hub-link")
         {
             var code = store.BeginLink(interaction.User.Id.ToString());
@@ -212,7 +218,7 @@ public sealed partial class DiscordHost(IServiceProvider provider, ILogger<Disco
             return;
         }
         if (interaction.Data.CustomId.StartsWith("mediahub:join:", StringComparison.Ordinal))
-            throw provider.GetRequiredService<WatchPartyIntegration>().Unavailable();
+            throw new HubError("This legacy invitation is retired. Generate a new provider invitation with /watchparty.", "watchparty_unavailable");
         throw new HubError("Unknown control.");
     }
 }

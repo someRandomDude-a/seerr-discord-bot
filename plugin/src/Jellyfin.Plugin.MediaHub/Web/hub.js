@@ -7,16 +7,17 @@
         const preferencesForm = view.querySelector('[data-preferences]');
         const personalNotice = view.querySelector('[data-personal-notice]');
         const watchlist = view.querySelector('[data-watchlist]');
-        const section = ['watchlist', 'notifications'].includes(params?.hubSection) ? params.hubSection : 'all';
+        const section = ['deletions', 'watchlist', 'notifications', 'preferences'].includes(params?.hubSection) ? params.hubSection : 'all';
         function applySection() {
             if (section === 'all') return;
-            view.querySelector('h1').textContent = section === 'watchlist' ? 'Your watchlist' : 'Notifications';
+            view.querySelector('h1').textContent = section === 'deletions' ? 'Deletion queue' : section === 'preferences' ? 'Your notification preferences' : section === 'watchlist' ? 'Your watchlist' : 'Notifications';
             for (const node of view.querySelectorAll('section')) {
-                if (node === personalSection || section === 'notifications' && node.hasAttribute('data-deletions')) continue;
+                if (section === 'deletions' ? node.hasAttribute('data-deletions') : node === personalSection || section === 'notifications' && node.hasAttribute('data-deletions')) continue;
                 node.hidden = true;
             }
-            preferencesForm.hidden = true; view.querySelector('[data-follow]').hidden = true;
-            view.querySelector('[data-preferences-page]').hidden = true;
+            if (section === 'deletions') return;
+            preferencesForm.hidden = section !== 'preferences'; view.querySelector('[data-follow]').hidden = true;
+            view.querySelector('[data-preferences-page]').hidden = section !== 'preferences';
             view.querySelector('[data-watchlist-page]').hidden = section !== 'watchlist';
             view.querySelector('[data-watchlist-page] h2').hidden = section === 'watchlist';
             view.querySelector('[data-notifications-page]').hidden = section !== 'notifications';
@@ -25,7 +26,7 @@
         let generation = 0, timer;
         let account, personalState, personalBusy = false, preferencesDirty = false, preferencesRevision, watchSignature, draftVersion = 0;
         let refreshBusy = false;
-        let visible = false;
+        let visible = false, integrationAvailable = false;
         const normalize = value => String(value || '').replaceAll('-', '').toLowerCase();
         const status = text => { notice.textContent = text; };
         const configuration = window.JellyfinMediaSettings?.(view, api, checkAccount);
@@ -33,6 +34,23 @@
         view.addEventListener('mediahubsettingshidden', () => { view.querySelectorAll('[data-admin-audit]').forEach(node => node.remove()); });
         const messenger = window.JellyfinMediaMessenger?.(view, api);
         const watchParty = window.JellyfinMediaWatchParty?.(view, api, checkAccount);
+        const monitoring = window.JellyfinDeletionMonitoring?.(view, api, checkAccount);
+        const permissions = window.JellyfinDeletionPermissions?.(view, api, checkAccount);
+        for (const button of view.querySelectorAll('[data-open-notification-preferences]')) button.addEventListener('click', () => {
+            checkAccount(); const target = '#/userpluginsettings.html?pageUrl=' + encodeURIComponent('/web/ConfigurationPage?name=mediahub') + '&hubSection=preferences';
+            if (window.MediaHubOpenNative) void window.MediaHubOpenNative(window.MediaHubNativeUrl + target); else window.location.hash = target;
+        });
+        async function applyIntegration(data) {
+            // Older clients/test responses omit this field; current standalone servers send false.
+            const previous = integrationAvailable;
+            integrationAvailable = data.DiscordIntegration?.Installed !== false;
+            view.querySelector('[data-link-section]').hidden = !integrationAvailable || section !== 'all';
+            view.querySelector('[data-native-players]').hidden = !integrationAvailable || Boolean(window.MediaHubNativeUrl) || section !== 'all';
+            view.querySelector('[data-sync-activity-theme]').hidden = !integrationAvailable || Boolean(window.MediaHubNativeUrl);
+            preferencesForm.elements.discord.closest('.checkboxContainer').hidden = !integrationAvailable;
+            if (integrationAvailable && section === 'all') { if (!previous) watchParty?.show(); await watchParty?.refresh(); }
+            else { watchParty?.hide(); view.querySelector('[data-watchparty]').hidden = true; messenger?.hide(); }
+        }
         const clearPersonal = () => {
             personalSection.hidden = true; preferencesForm.reset(); view.querySelector('[data-follow]').reset();
              watchlist.replaceChildren(); personalNotice.textContent = ''; personalState = undefined;
@@ -43,12 +61,15 @@
         };
         function hide() {
             visible = false; generation += 1; clearInterval(timer);
+            integrationAvailable = false;
             clearSettings(); clearPersonal();
             clearDeletions();
             clearCatalog();
             view.querySelector('[data-native-players]').hidden = true; view.querySelector('[data-player-history]').replaceChildren();
             messenger?.hide();
             watchParty?.hide();
+            monitoring?.hide();
+            permissions?.hide();
             view.querySelector('[data-handoff-controls]').replaceChildren(); view.querySelector('[data-handoff-notice]').textContent = '';
         }
         const expandedConsentHelp = new Set();
@@ -279,11 +300,21 @@
         }));
         function renderQueue(rows) {
             const list = view.querySelector('[data-deletion-list]'); list.replaceChildren();
+            if (!rows.length) { const empty = document.createElement('li'); empty.className = 'listItem'; empty.textContent = 'No active deletion proposals for your accessible items. Open a title in Jellyfin to request deletion without entering IDs.'; list.append(empty); }
             for (const row of rows) {
                 const item = document.createElement('li'); item.className = 'listItem';
                 const state = { waiting: 'Waiting for consent', queued: 'Queued', ready: row.AutomaticDeletion ? 'Ready' : 'Ready · automatic removal off', blocked: 'Blocked', executing: 'Removing', checking: 'Confirming removal', cleanup: 'Unmonitoring', uncertain: 'Check required' }[row.State] || row.State;
                 const body = document.createElement('div'); body.className = 'listItemBody listItemBodyText'; body.textContent = `${row.Title} · ${state} · ${row.Owner}${row.DueAt ? ' · ' + new Date(row.DueAt).toLocaleString() : ''} `; item.append(body);
                 if (row.CanUndo) item.append(queueButton('Undo', 'Deletions/' + encodeURIComponent(row.Id) + '/Undo', {}));
+                const details = document.createElement('div'); details.className = 'fieldDescription';
+                item.append(actionButton('Status and your required action', async () => {
+                    const data = await api('Deletions/' + encodeURIComponent(row.Id) + '/Status');
+                    if (!item.isConnected) return;
+                    const actions = { consent_required: 'Please choose Yes or No.', blocked_by_your_choice: 'Your No blocks deletion while your activity remains recent.', review_required: 'Verification or an uncertain outcome requires review. Do not repeat deletion.', automatic_deletion_off: 'The delay elapsed, but automatic removal is off.', wait: 'No action is required from you right now. Checks, consent or the delay are still pending.', none: 'This proposal is closed.' };
+                    const text = document.createElement('p'); text.textContent = `${actions[data.RequiredAction] || 'Refresh to review.'} Your consent: ${data.YourConsent}. ${data.ActivityVerified ? 'Your last recorded activity: ' + (data.YourLastActivity ? new Date(data.YourLastActivity).toLocaleString() : 'none recorded') : 'Your activity could not be verified.'} Deadline: ${data.DueAt ? new Date(data.DueAt).toLocaleString() : 'not scheduled'}. Minimum delay: ${data.DelayDays} days. Automatic removal: ${data.AutomaticDeletion ? 'on' : 'off'}.`;
+                    details.replaceChildren(text);
+                    if (data.Notice && ['required', 'no', 'yes'].includes(data.YourConsent)) for (const approve of [true, false]) details.append(queueButton(approve ? 'Yes' : 'No', 'Me/Consent/' + encodeURIComponent(data.Notice), { Approve: approve }));
+                }), details);
                 if (configuration?.authorized()) {
                     const auditButton = actionButton('View administrator audit', async () => {
                     const audit = await api('Deletions/' + encodeURIComponent(row.Id) + '/Audit');
@@ -311,8 +342,9 @@
                 const help = document.createElement('button'); help.type = 'button'; help.className = 'paper-icon-button-light'; help.setAttribute('is', 'paper-icon-button-light'); help.setAttribute('aria-label', 'Help about deletion'); help.title = 'Help about deletion'; help.setAttribute('aria-expanded', 'false');
                 const icon = document.createElement('span'); icon.className = 'material-icons'; icon.setAttribute('aria-hidden', 'true'); icon.textContent = 'help_outline'; help.append(icon);
                 const details = document.createElement('div'); details.className = 'fieldDescription'; details.hidden = !expandedConsentHelp.has(row.Id); details.id = title.id + '-help';
+                if (row.Message && row.Message !== 'Allow deletion?') { const custom = document.createElement('p'); custom.textContent = row.Message; details.append(custom); }
                 help.dataset.consentFocusKey = row.Id + ':help'; help.setAttribute('aria-controls', details.id); help.setAttribute('aria-expanded', String(!details.hidden));
-                for (const text of ['Every current recent viewer must agree or age out of the configured activity window (14 days by default). No blocks deletion while your activity remains recent. New activity invalidates consent.', 'Yes is consent, not immediate deletion. The full configured delay (at least 2 days by default) must pass; existing deadlines never silently shorten.', 'Only the original requester can propose deletion or Undo; administrators cannot bypass ownership. Verified, approved Radarr/Sonarr destinations handle file removal after all checks pass.', 'Automatic removal is off by default. When off, nothing is automatically deleted. Unverified or uncertain state blocks deletion. Opening this page or Help does not vote, mark updates read, or record activity.']) { const paragraph = document.createElement('p'); paragraph.textContent = text; details.append(paragraph); }
+                for (const text of ['Every current recent viewer must agree or age out of the configured activity window (14 days by default). No blocks deletion while your activity remains recent. New activity invalidates consent.', 'Yes is consent, not immediate deletion. The full configured delay (at least 2 days by default) must pass; existing deadlines never silently shorten.', 'Proposal permissions are server-configured: own requests by default, or explicitly granted accessible items. Only the proposer can Undo. Verified, approved Radarr/Sonarr destinations handle file removal after all checks pass; administrators cannot bypass these checks.', 'Automatic removal is off by default. When off, nothing is automatically deleted. Unverified or uncertain state blocks deletion. Opening this page or Help does not vote, mark updates read, or record activity.']) { const paragraph = document.createElement('p'); paragraph.textContent = text; details.append(paragraph); }
                 help.addEventListener('click', () => { details.hidden = !details.hidden; help.setAttribute('aria-expanded', String(!details.hidden)); if (details.hidden) expandedConsentHelp.delete(row.Id); else expandedConsentHelp.add(row.Id); });
                 const no = queueButton('No', path, { Approve: false }); no.dataset.consentFocusKey = row.Id + ':no';
                 const actions = document.createElement('div'); actions.setAttribute('role', 'group'); actions.setAttribute('aria-label', 'Allow deletion?'); actions.setAttribute('aria-describedby', title.id); actions.append(yes, no, help);
@@ -350,9 +382,9 @@
             const run = generation;
             try {
                 await Promise.all([
-                    api('Status').then(data => { const text = view.querySelector('[data-web-dependencies]'); text.hidden = !data.Web || data.Web.RegistrationsReady; text.textContent = data.Web && !data.Web.RegistrationsReady ? 'Web integration unavailable. Install Jellyfin 12.2-compatible File Transformation and Plugin Pages, then restart. See setup for requirements.' : ''; }), section === 'all' && watchParty?.refresh(), section === 'all' && configuration?.verifyAccess(),
+                    api('Status').then(async data => { const text = view.querySelector('[data-web-dependencies]'); text.hidden = !data.Web || data.Web.RegistrationsReady; text.textContent = data.Web && !data.Web.RegistrationsReady ? 'Web integration unavailable. Install Jellyfin 12.2-compatible File Transformation and Plugin Pages, then restart. See setup for requirements.' : ''; await applyIntegration(data); }), section === 'all' && configuration?.verifyAccess(),
                     api('Me').then(data => applyPersonal(data)),
-                     api('Deletions').then(renderQueue), api('Me/Consent').then(renderConsent), api('Me/Notifications').then(renderNotifications)
+                     api('Deletions').then(renderQueue), api('Me/Consent').then(renderConsent), api('Me/Notifications').then(renderNotifications), monitoring?.refresh()
                 ]);
             } finally { if (run === generation) { refreshBusy = false; applySection(); } }
         }
@@ -374,6 +406,7 @@
             const delay = preferencesForm.elements.deletionDelay;
             delay.min = rules.DefaultDelayDays; delay.max = rules.RecentActivityDays;
             delay.value = personalState.EffectiveDeletionDelayDays ?? p.DeletionDelayDays ?? rules.DefaultDelayDays;
+            if (preferencesForm.elements.deletionMessage) preferencesForm.elements.deletionMessage.value = p.DeletionMessage || '';
             preferencesRevision = personalState.Revision; preferencesDirty = false; personalNotice.textContent = '';
             updatePersonalControls();
         }
@@ -508,6 +541,7 @@
             void mutatePersonal('Me', { Preferences: { ...personalState?.Preferences, JellyfinNotifications: preferencesForm.elements.jellyfin.checked,
                 DiscordNotifications: preferencesForm.elements.discord.checked, Muted: preferencesForm.elements.muted.checked,
                 OwnRequestNotifications: preferencesForm.elements.ownRequests.checked,
+                DeletionMessage: preferencesForm.elements.deletionMessage?.value.trim() || null,
                 DeletionDelayDays: Number(preferencesForm.elements.deletionDelay.value) } }, true);
         });
         view.querySelector('[data-reload-preferences]').addEventListener('click', loadPreferences);
@@ -549,19 +583,16 @@
             }
             try {
                 account = currentAccount();
-                if (section === 'all') watchParty?.show();
                 await refresh();
-                    view.querySelector('[data-sync-activity-theme]').hidden = Boolean(window.MediaHubNativeUrl);
-                    view.querySelector('[data-native-players]').hidden = Boolean(window.MediaHubNativeUrl);
-                if (section === 'all') void messenger?.show();
-                try { if (section === 'all') await handoffLink(); }
+                if (section === 'all' && integrationAvailable) void messenger?.show();
+                try { if (section === 'all' && integrationAvailable) await handoffLink(); }
                 catch (error) { if (run !== generation) return; view.querySelector('[data-handoff-controls]').replaceChildren(); view.querySelector('[data-handoff-notice]').textContent = error.message; }
                 timer = setInterval(() => { if (!document.hidden) void refresh().catch(error => { if (run === generation) status(error.message); }); }, 10000);
                 // Do not render/rebuild forms during status updates: preserve drafts.
             } catch (error) { if (run === generation) status(error.message); }
             // Local elevated settings must remain repairable when untrusted old integration state is blocked.
             if (run === generation && section === 'all' && !window.MediaHubNativeUrl) try {
-                const config = await api('Settings'); configuration?.ready(config);
+                const config = await api('Settings'); configuration?.ready(config); monitoring?.show(); permissions?.show();
             } catch { if (run === generation) clearSettings(); }
             applySection();
         }

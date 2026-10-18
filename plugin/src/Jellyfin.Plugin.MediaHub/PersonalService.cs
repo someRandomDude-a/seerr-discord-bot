@@ -6,7 +6,8 @@ using Microsoft.Data.Sqlite;
 namespace Jellyfin.Plugin.MediaHub;
 
 public sealed record ActivityTheme(string Background, string Text, string Accent, string Surface);
-public sealed record PersonalPreferences(bool JellyfinNotifications = true, bool DiscordNotifications = false, bool Muted = false, int? DeletionDelayDays = null, ActivityTheme? Theme = null, bool OwnRequestNotifications = true);
+public sealed record PersonalPreferences(bool JellyfinNotifications = true, bool DiscordNotifications = false, bool Muted = false, int? DeletionDelayDays = null, ActivityTheme? Theme = null, bool OwnRequestNotifications = true,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? DeletionMessage = null);
 public sealed record VisibleItem(Guid Id, string Title, string Kind);
 public sealed record FollowedItem(Guid ItemId, string Title, string Kind, bool Subscribed);
 public sealed record PersonalState(long Revision, PersonalPreferences Preferences, IReadOnlyList<FollowedItem> Watchlist,
@@ -93,6 +94,7 @@ public sealed class PersonalService(HubStore store, IViewerMedia media, Settings
     internal static void Validate(PersonalPreferences preferences)
     {
         if (preferences is null || preferences.DeletionDelayDays is < 1 or > 3650) throw new HubError("Invalid personal preferences.");
+        DeletionMessages.Validate(preferences.DeletionMessage);
         if (preferences.Theme is { } theme && new[] { theme.Background, theme.Text, theme.Accent, theme.Surface }.Any(value => value is null || !System.Text.RegularExpressions.Regex.IsMatch(value, "\\A#[0-9a-fA-F]{6}\\z"))) throw new HubError("Activity appearance accepts only host-derived color values, not arbitrary CSS.");
     }
     private static void Ensure(SqliteConnection db, SqliteTransaction transaction, User viewer)

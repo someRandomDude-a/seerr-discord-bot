@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><Version>0.1.0</Version><CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies></PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../Jellyfin.Plugin.WatchlistDeletion.Api/Jellyfin.Plugin.WatchlistDeletion.Api.csproj" />
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Discord.Net.WebSocket" Version="3.20.2" />
+    <Reference Include="Jellyfin.Plugin.PrivateSyncPlay.Api"><HintPath>../../lib/PrivateSyncPlay.Api-1.1.0/Jellyfin.Plugin.PrivateSyncPlay.Api.dll</HintPath><Private>true</Private></Reference>
+    <Compile Include="../Jellyfin.Plugin.MediaHub/TrustBoundary.cs" Link="Shared/TrustBoundary.cs" />
+    <Compile Include="../Jellyfin.Plugin.MediaHub/HubRequestBoundary.cs" Link="Shared/HubRequestBoundary.cs" />
+    <Compile Include="../Jellyfin.Plugin.MediaHub/StateFiles.cs" Link="Shared/StateFiles.cs" />
+    <Compile Include="../Jellyfin.Plugin.MediaHub/PluginLog.cs" Link="Shared/PluginLog.cs" />
+    <EmbeddedResource Include="Web/*" />
+    <EmbeddedResource Include="../Jellyfin.Plugin.MediaHub/Web/hub.html;../Jellyfin.Plugin.MediaHub/Web/hub.js;../Jellyfin.Plugin.MediaHub/Web/messenger.js;../Jellyfin.Plugin.MediaHub/Web/activity.bundle.js;../Jellyfin.Plugin.MediaHub/Web/activity.css" LogicalName="Jellyfin.Plugin.MediaHub.Discord.Web.%(Filename)%(Extension)" />
+    <AssemblyMetadata Include="PluginGuid" Value="8456d36a-3c89-4b6d-9959-9a74566cc252" />
+    <AssemblyMetadata Include="JellyfinVersion" Value="$(JellyfinVersion)" />
+    <InternalsVisibleTo Include="MediaHub.Discord.Tests" />
+  </ItemGroup>
+  <Target Name="ValidateActivityBundle" BeforeTargets="BeforeBuild" Condition="'$(RequireActivityBundle)' == 'true'">
+    <Error Condition="!Exists('../Jellyfin.Plugin.MediaHub/Web/activity.bundle.js')" Text="Build plugin/activity before packaging the Discord Integration." />
+  </Target>
+</Project>

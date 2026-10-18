@@ -39,7 +39,7 @@ public sealed class PosterAssets : IDisposable
     }
     public async Task<MessageBlob> Download(string path, CancellationToken cancellation)
     {
-        var url = DiscordHost.DiscordPoster(path) ?? throw new HubError("No verified poster is available.");
+        var url = Jellyfin.Plugin.WatchlistDeletion.Api.MediaPresentation.Poster(path) ?? throw new HubError("No verified poster is available.");
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellation); budget.CancelAfter(TimeSpan.FromSeconds(10)); cancellation = budget.Token;
         await slots.WaitAsync(cancellation);
         try

@@ -11,7 +11,7 @@ process.on('unhandledRejection', () => { console.error('Native UI acceptance fai
 const [stateFile, playwrightModule, screenshot, axeFile] = process.argv.slice(2);
 if (!stateFile || !playwrightModule || !screenshot) throw new Error('Provide owned fixture state, playwright-core module and screenshot path.');
 const state = JSON.parse(await readFile(stateFile, 'utf8'));
-if (!(state.Name === 'mediahub-test-settings' && state.Port === 18296 && !state.BasePath || state.Name === 'mediahub-test-completion' && state.Port === 18396 && state.BasePath === '/mediahub')) throw new Error('Only specifically owned native UI fixtures are authorized by this tool.');
+if (!(state.Name === 'mediahub-test-settings' && state.Port === 18296 && !state.BasePath || state.Name === 'mediahub-test-completion' && state.Port === 18396 && state.BasePath === '/mediahub' || state.Name === 'mediahub-test-split' && state.Port === 18596 && !state.BasePath)) throw new Error('Only specifically owned native UI fixtures are authorized by this tool.');
 const basePath = state.BasePath || '', origin = 'http://127.0.0.1:' + state.Port, server = origin + basePath;
 const { chromium } = await import(pathToFileURL(resolve(playwrightModule)).href);
 stage = 'browser launch';
@@ -58,6 +58,10 @@ try {
   });
   stage = 'settings loading'; await page.evaluate(() => { window.Dashboard.navigate('configurationpage?name=mediahub'); });
   const section = page.locator('[data-settings]'); await section.waitFor({ state: 'visible' });
+  stage = 'administrator deletion monitoring';
+  await page.locator('[data-monitoring]').waitFor({ state: 'visible' });
+  await page.getByText('No proposals match these filters.', { exact: true }).waitFor({ state: 'visible' });
+  assert.equal(await page.locator('[data-monitor-list] button').count(), 0);
   assert.equal(await page.locator('[data-tutorial-start],[data-onboarding]').count(), 0);
   const selector = page.locator('[data-settings-section]'); await selector.selectOption('discord');
   stage = 'section draft retention';
@@ -153,7 +157,7 @@ try {
    for (let index = 0; index < 8; index++) { await page.keyboard.press('Tab'); assert.equal(await preview.evaluate(node => node.contains(document.activeElement)), true, 'Modal keyboard focus must not escape to the background'); }
    await page.screenshot({ path: resolve(screenshot).replace(/\.png$/i, '-consent-help-preview.png'), fullPage: true });
    assert.equal(viewerWrites, 0); await viewerContext.close();
-   console.log(JSON.stringify({ Fixture: state.Name, BasePath: basePath, NativeSettingsVisible: true, NativeGeneratedLabels: true, SectionDraftPreserved: true, ContextualHelp: true, NarrowSettingsSelectorFits: true, NativeKeyboardFocus: true, ModalKeyboardContainment: true, NotificationDeepLinkReload: true, Accessibility: accessibility, NavigationClearsPrivateDrafts: true, VisibleNativeTopBell: true, MobileNotificationDialog: true, DedicatedWatchlistPage: true, OrdinaryViewerPages: true, DependencyRegistrationsReady: true, CompactConsentPreviewUsesMockData: true, ItemResourceLoadedExplicitly: false, ImplicitSettingsWrites: saves, ImplicitViewerWrites: viewerWrites, CredentialsLogged: false }));
+    console.log(JSON.stringify({ Fixture: state.Name, BasePath: basePath, NativeSettingsVisible: true, AdministratorEmptyBacklogVisible: true, NativeGeneratedLabels: true, SectionDraftPreserved: true, ContextualHelp: true, NarrowSettingsSelectorFits: true, NativeKeyboardFocus: true, ModalKeyboardContainment: true, NotificationDeepLinkReload: true, Accessibility: accessibility, NavigationClearsPrivateDrafts: true, VisibleNativeTopBell: true, MobileNotificationDialog: true, DedicatedWatchlistPage: true, OrdinaryViewerPages: true, DependencyRegistrationsReady: true, CompactConsentPreviewUsesMockData: true, ItemResourceLoadedExplicitly: false, ImplicitSettingsWrites: saves, ImplicitViewerWrites: viewerWrites, CredentialsLogged: false }));
 } catch {
   if (page && !page.isClosed()) {
     const selectors = {};

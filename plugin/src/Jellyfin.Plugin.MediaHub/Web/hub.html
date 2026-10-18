@@ -25,6 +25,33 @@
         <button is="emby-button" class="raised emby-button" type="button" data-settings-reload>Reload saved settings</button>
       </form>
     </section>
+    <section class="verticalSection" data-monitoring hidden aria-labelledby="hubMonitorTitle">
+      <h2 class="sectionTitle" id="hubMonitorTitle">Deletion administration</h2>
+      <p class="fieldDescription">Private administrator workspace · identities, activity, consent evidence, execution checkpoints and retained proposal history. Browsing is read-only; permission changes below require an explicit save.</p>
+      <form data-monitor-filters>
+        <div class="selectContainer"><select is="emby-select" label="Queue or history" id="hubMonitorState" name="state"><option value="backlog">Active backlog</option><option value="history">Completed and cancelled history</option><option value="all">All retained proposals</option><option value="waiting">Waiting for consent</option><option value="queued">Queued</option><option value="ready">Ready</option><option value="blocked">Blocked</option><option value="uncertain">Uncertain · review required</option><option value="executing">Removing files</option><option value="checking">Confirming removal</option><option value="cleanup">Monitoring cleanup</option></select></div>
+        <div class="selectContainer"><select is="emby-select" label="Requester" id="hubMonitorOwner" name="owner"><option value="">All requesters</option></select></div>
+        <div class="inputContainer"><input is="emby-input" label="Proposal or Seerr request ID" id="hubMonitorQuery" name="query" maxlength="100" /></div>
+        <div class="selectContainer"><select is="emby-select" label="Order" id="hubMonitorSort" name="sort"><option value="oldest">Oldest first</option><option value="newest">Newest first</option><option value="due">Earliest deadline</option></select></div>
+        <div class="checkboxContainer"><label class="emby-checkbox-label"><input is="emby-checkbox" type="checkbox" name="live" /><span>Refresh monitoring while this page is visible</span></label></div>
+        <button is="emby-button" class="raised emby-button" type="submit">Browse / refresh snapshot</button>
+      </form>
+      <p data-monitor-notice role="status" aria-live="polite"></p><div data-monitor-summary></div>
+      <ul class="paperList" data-monitor-list></ul><div data-monitor-paging></div><div data-monitor-detail></div>
+      <section class="verticalSection" data-deletion-permissions hidden aria-labelledby="hubDeletionPermissionsTitle">
+        <h3 class="sectionTitle" id="hubDeletionPermissionsTitle">Deletion request permissions</h3>
+        <p class="fieldDescription">Own requests is the default. Any accessible item allows verified movies/whole series without an owned request; it never bypasses visibility, unanimous recent-viewer consent, delays or approved file APIs. Administrators have no implicit exception.</p>
+        <form data-deletion-permission-form>
+          <div class="selectContainer"><select is="emby-select" label="Default permission for users without an override" id="hubDeletionDefault" name="defaultScope"><option value="1">Own approved requests</option><option value="0">Cannot request deletion</option><option value="2">Any accessible supported item</option></select></div>
+          <div class="selectContainer"><select is="emby-select" label="Native account" id="hubDeletionAccount" name="account"></select></div>
+          <div class="selectContainer"><select is="emby-select" label="Account override" id="hubDeletionOverride" name="scope"><option value="inherit">Use server default</option><option value="0">Cannot request deletion</option><option value="1">Own approved requests</option><option value="2">Any accessible supported item</option></select></div>
+          <button is="emby-button" class="raised emby-button" type="button" data-deletion-set-override>Apply account choice to draft</button>
+          <ul class="paperList" data-deletion-overrides></ul>
+          <button is="emby-button" class="raised button-submit emby-button" type="submit">Save deletion permissions</button>
+          <button is="emby-button" class="raised emby-button" type="button" data-deletion-reload-permissions>Reload saved permissions</button>
+        </form><p data-deletion-permission-notice role="status" aria-live="polite"></p>
+      </section>
+    </section>
     <section class="verticalSection" data-link-section>
       <h2 class="sectionTitle">Connect your Discord account</h2>
       <p data-handoff-notice role="status"></p><div data-handoff-controls></div>
@@ -62,6 +89,8 @@
         <p data-personal-notice role="status" aria-live="polite"></p>
         <div class="inputContainer"><input is="emby-input" label="Your minimum media-removal delay (days)" id="hubPersonalDelay" name="deletionDelay" type="number" min="2" max="14" step="1" required /></div>
         <p class="fieldDescription">Longer delays extend pending proposals. Existing deadlines are never shortened.</p>
+        <div class="inputContainer"><input is="emby-input" label="Your deletion notification message · optional" id="hubDeletionMessage" name="deletionMessage" maxlength="300" aria-describedby="hubDeletionMessageHelp" /></div>
+        <p class="fieldDescription" id="hubDeletionMessageHelp">Plain text for your account only. Use {title}, {delayDays}, {activityDays}. Blank uses the default. Your wording never changes consent, deadlines or permissions; Jellyfin shows it under Help.</p>
         <button is="emby-button" class="raised button-submit emby-button" type="submit">Save personal preferences</button>
         <button is="emby-button" class="raised emby-button" type="button" data-reload-preferences>Reload personal preferences</button>
         <button is="emby-button" class="raised emby-button" type="button" data-sync-activity-theme>Use Jellyfin colors in Discord Activity</button>
@@ -80,7 +109,8 @@
       <button is="emby-button" class="raised emby-button" type="button" data-legacy-review hidden>Review retained watchlist before sync</button>
       <p data-sync-status role="status" aria-live="polite"></p>
       </div><div data-notifications-page>
-      <h3 class="sectionTitle">Your updates</h3><ul class="paperList" data-notification-feed></ul>
+       <h3 class="sectionTitle">Your updates</h3><ul class="paperList" data-notification-feed></ul>
+       <button is="emby-button" class="raised emby-button" type="button" data-open-notification-preferences>Notification preferences and message</button>
       <button is="emby-button" class="raised emby-button" type="button" data-notification-diagnostics>View your notification delivery status</button><p data-notification-diagnostic-result role="status"></p>
       </div>
     </section>
@@ -107,13 +137,16 @@
     </section>
     <section class="verticalSection" data-deletions hidden>
       <h2 class="sectionTitle">Media removal proposals</h2>
-      <p>Only propose your own requests. Recent viewers must agree or age out. Radarr/Sonarr handles file removal.</p>
+      <p>Recent viewers must agree or age out. Deadlines are not promises of immediate removal: current permissions, target verification and the full delay must all pass. Other viewers’ identities and activity stay private.</p>
+      <details><summary>Advanced: propose by request and item ID</summary>
       <form data-propose>
         <div class="inputContainer"><input is="emby-input" label="Your Seerr request ID" id="hubDeleteRequest" name="requestId" type="number" min="1" step="1" required /></div>
         <div class="inputContainer"><input is="emby-input" label="Jellyfin movie or show ID" id="hubDeleteItem" name="mediaId" required /></div>
         <button is="emby-button" class="raised emby-button" type="submit">Propose media removal</button>
       </form>
+      </details>
       <button is="emby-button" class="raised emby-button" type="button" data-review-deletions>Refresh removal proposals</button>
+      <button is="emby-button" class="raised emby-button" type="button" data-open-notification-preferences>Your delay and notification preferences</button>
       <ul class="paperList" data-deletion-list></ul>
       <h3 class="sectionTitle">Your consent requests</h3><ul class="paperList" data-consent-list></ul>
     </section>
@@ -160,7 +193,7 @@
           page.dispatchEvent(new Event('viewshow'));
       };
       const load = function (name, ready) { return ready ? Promise.resolve() : new Promise((resolve, reject) => { const script = document.createElement('script'); script.src = ApiClient.getUrl('web/ConfigurationPage', { name: name }); script.onload = resolve; script.onerror = reject; document.head.append(script); }); };
-      Promise.all([load('mediahub.js', window.JellyfinMediaHub), load('mediahub.settings.js', window.JellyfinMediaSettings), load('mediahub.messenger.js', window.JellyfinMediaMessenger), load('mediahub.watchparty.js', window.JellyfinMediaWatchParty)]).then(mount).catch(() => { page.querySelector('[data-notice]').textContent = 'Unable to load Media Hub. Refresh the page.'; });
+      Promise.all([load('mediahub.js', window.JellyfinMediaHub), load('mediahub.settings.js', window.JellyfinMediaSettings), load('mediahub.messenger.js', window.JellyfinMediaMessenger), load('mediahub.watchparty.js', window.JellyfinMediaWatchParty), load('mediahub.monitoring.js', window.JellyfinDeletionMonitoring), load('mediahub.permissions.js', window.JellyfinDeletionPermissions)]).then(mount).catch(() => { page.querySelector('[data-notice]').textContent = 'Unable to load Media Hub. Refresh the page.'; });
   })();
   </script>
 </div></body></html>

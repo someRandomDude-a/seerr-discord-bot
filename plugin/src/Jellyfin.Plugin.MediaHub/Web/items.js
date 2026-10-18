@@ -3,9 +3,11 @@
     'use strict';
     if (window.mediaHubItemControls) return;
     const normalize = value => String(value || '').replaceAll('-', '').toLowerCase();
-    let account = '', revision, watches = [], proposals = [], consent = [], notifications = [], busy = false, generation = 0, scheduled = false, detail, menu, menuRefresh, menuDismiss, menuOpening = false;
+    let account = '', revision, watches = [], proposals = [], consent = [], notifications = [], deletionScope = 'OwnRequests', busy = false, generation = 0, scheduled = false, detail, menu, menuRefresh, menuDismiss, menuOpening = false;
     const nodes = new Set();
+    let contextOrigin, itemSettings;
     function clear() {
+        contextOrigin = undefined; itemSettings?.remove(); itemSettings = undefined;
         generation += 1; menu?.replaceChildren(); try { menuDismiss?.(false); } catch { menu?.remove(); } menu = undefined; menuRefresh = undefined; menuDismiss = undefined; menuOpening = false; nodes.forEach(node => node.remove()); nodes.clear(); watches = []; proposals = []; consent = []; notifications = []; revision = undefined; detail = undefined;
     }
     function client() { return window.ApiClient; }
@@ -27,6 +29,76 @@
         const node = document.createElement('button', 'emby-button'); node.type = 'button'; node.setAttribute('is', 'emby-button');
         node.className = 'raised emby-button'; node.textContent = label; return node;
     }
+    async function notificationSettings(id) {
+        if (itemSettings?.isConnected || !account || current() !== account) return;
+        const run = generation, focus = document.activeElement;
+        const dialog = document.createElement('dialog'); itemSettings = dialog; dialog.className = 'dialog formDialog'; dialog.style.color = 'inherit';
+        dialog.dataset.mediahubItemSettings = ''; dialog.setAttribute('aria-modal', 'true'); dialog.setAttribute('aria-labelledby', 'mediaHubItemSettingsTitle');
+        const panel = document.createElement('div'); panel.className = 'formDialogContent smoothScrollY padded-left padded-right';
+        const title = document.createElement('h2'); title.id = 'mediaHubItemSettingsTitle'; title.className = 'sectionTitle'; title.textContent = 'Item notification settings';
+        const status = document.createElement('p'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); status.textContent = 'Verifying your current item access…';
+        const close = button('Close'); close.addEventListener('click', () => { dialog.remove(); if (itemSettings === dialog) itemSettings = undefined; if (run === generation && focus?.isConnected) focus.focus(); });
+        panel.append(title, status, close); dialog.append(panel); document.body.append(dialog);
+        if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', ''); close.focus();
+        dialog.addEventListener('cancel', event => { event.preventDefault(); close.click(); });
+        dialog.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.preventDefault(); close.click(); }
+            if (event.key !== 'Tab') return;
+            const controls = [...dialog.querySelectorAll('button:not(:disabled),a[href],input:not(:disabled)')];
+            if (event.shiftKey && document.activeElement === controls[0]) { event.preventDefault(); controls.at(-1)?.focus(); }
+            else if (!event.shiftKey && document.activeElement === controls.at(-1)) { event.preventDefault(); controls[0]?.focus(); }
+        });
+        try {
+            const [item, state] = await Promise.all([api('Items/' + id + '/Controls'), api('Me')]);
+            if (run !== generation || !dialog.isConnected || normalize(item.Id) !== id) return;
+            const saved = state.Watchlist.find(row => normalize(row.ItemId) === id); const on = saved?.Subscribed === true;
+            title.textContent = 'Notifications · ' + item.Title; status.textContent = `${on ? 'Subscribed' : 'Not subscribed'}. Opening this dialog does not record activity or change notifications. Subscribing explicitly records your interest; unsubscribing keeps a saved title.`;
+            const toggle = button(on ? 'Unsubscribe from this item' : 'Subscribe to this item');
+            toggle.addEventListener('click', async () => {
+                if (toggle.disabled) return; toggle.disabled = true;
+                try {
+                    await api('Me/Watchlist/' + id + '/Bell', { Revision: state.Revision, Subscribed: !on });
+                    if (run !== generation || !dialog.isConnected) return;
+                    status.textContent = on ? 'Unsubscribed. The saved title was retained.' : 'Subscribed. Your interest was recorded; native progress and favorites were not changed.';
+                    await refresh();
+                } catch (error) { if (run === generation && dialog.isConnected) status.textContent = error.message + ' Close and reopen to review current state before another change. No automatic retry was sent.'; }
+                // A stale/uncertain dialog never sends a second mutation. Reopen explicitly.
+            });
+            const preferences = document.createElement('a'); preferences.className = 'button-link'; preferences.href = hubUrl('preferences'); preferences.textContent = 'Your notification preferences and message';
+            panel.append(toggle, preferences);
+        } catch (error) { if (run === generation && dialog.isConnected) status.textContent = error.message; }
+    }
+    function contextSource(event) {
+        if (!account || current() !== account || event.target.closest?.('[data-mediahub-controls],[data-mediahub-menu],[data-mediahub-item-settings]')) return;
+        if (event.type === 'click' && !event.target.closest?.('[data-action="menu"],.btnMoreCommands,.MuiIconButton-root')) return;
+        if (event.type === 'keydown' && !(event.key === 'ContextMenu' || event.key === 'F10' && event.shiftKey)) return;
+        contextOrigin = undefined;
+        const card = event.target.closest?.('.card[data-id][data-type]');
+        const target = card ? { id: normalize(card.dataset.id), host: card, kind: card.dataset.type } : event.target.closest?.('.itemDetailPage') && detail && detailTarget()?.id === detail.id ? detail : null;
+        if (!target || !/^[0-9a-f]{32}$/.test(target.id) || !['Movie', 'Series', 'Episode', 'MusicAlbum', 'Audio', 'Book', 'AudioBook'].includes(target.kind) || card?.dataset.serverid && normalize(card.dataset.serverid) !== normalize(client().serverId?.())) return;
+        contextOrigin = { ...target, at: Date.now(), run: generation };
+        // Observe native menu creation only. Never prevent, replace or execute native commands.
+    }
+    function extendNativeContextMenu() {
+        const source = contextOrigin;
+        if (!source || source.run !== generation || Date.now() - source.at > 2000 || !source.host.isConnected || current() !== account) return;
+        const menus = [...document.querySelectorAll('.MuiMenu-list[role="menu"]')].filter(node => !node.closest('[hidden],[aria-hidden="true"]'));
+        if (menus.length !== 1) return; const list = menus[0];
+        const previous = list.querySelector('[data-mediahub-context]');
+        if (previous?.dataset.item === source.id) return;
+        if (previous) { previous.remove(); nodes.delete(previous); }
+        const peer = list.querySelector('.MuiMenuItem-root[role="menuitem"]'); if (!peer) return;
+        const entry = document.createElement('li'); entry.className = [...peer.classList].filter(value => !['Mui-selected', 'Mui-disabled', 'Mui-focusVisible'].includes(value)).join(' ');
+        entry.dataset.mediahubContext = ''; entry.dataset.item = source.id; entry.setAttribute('role', 'menuitem'); entry.tabIndex = -1; entry.textContent = 'Item notification settings';
+        const open = event => {
+            event.preventDefault(); event.stopPropagation();
+            if (source.run !== generation || current() !== account || !source.host.isConnected) return;
+            list.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            void notificationSettings(source.id);
+        };
+        entry.addEventListener('click', open); entry.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') open(event); });
+        nodes.add(entry); list.append(entry);
+    }
     function deletionHelp(proposal) {
         const help = document.createElement('button'); help.type = 'button'; help.className = 'paper-icon-button-light'; help.setAttribute('is', 'paper-icon-button-light');
         help.setAttribute('aria-label', 'Help about deletion'); help.title = 'Help about deletion'; help.setAttribute('aria-expanded', 'false');
@@ -36,7 +108,7 @@
             proposal ? proposalText(proposal) + '.' : 'Your answer applies only to this deletion proposal.',
             'Every current recent viewer must agree or age out of the configured activity window (14 days by default). No blocks deletion while your activity remains recent. New activity invalidates consent.',
             'Deletion also requires the full configured delay (at least 2 days by default). A Yes is consent, not an immediate deletion. Existing deadlines never silently shorten.',
-            'Only the original requester can propose deletion or Undo. There is no administrator ownership bypass. Files are removed only through verified, approved Radarr/Sonarr destinations after all checks pass.',
+            'The server grants own-request or any-accessible-item proposal permission. Only the proposer can Undo. Administrators cannot bypass consent, delays or verified, approved Radarr/Sonarr file checks.',
             'Automatic removal is off by default. When it is off, nothing is automatically deleted, even after consent and the delay. Unverified or uncertain state blocks deletion.',
             'Opening notifications or Help does not vote, mark updates read, or record media activity.'
         ]) { const paragraph = document.createElement('p'); paragraph.textContent = text; details.append(paragraph); }
@@ -128,6 +200,7 @@
                     }); actions.append(choice);
                 }
                 const explanation = deletionHelp(proposals.find(row => row.Id === notice.Proposal));
+                if (notice.Message && notice.Message !== 'Allow deletion?') { const custom = document.createElement('p'); custom.textContent = notice.Message; explanation.details.prepend(custom); }
                 explanation.details.id = title.id + '-help'; explanation.details.hidden = !expandedHelp.has(notice.Id);
                 explanation.help.setAttribute('aria-controls', explanation.details.id); explanation.help.setAttribute('aria-expanded', String(!explanation.details.hidden)); explanation.help.dataset.focusKey = 'help:' + notice.Id;
                 explanation.help.addEventListener('click', () => { if (explanation.details.hidden) expandedHelp.delete(notice.Id); else expandedHelp.add(notice.Id); });
@@ -145,7 +218,8 @@
         };
         render(); menuRefresh = () => { const focused = document.activeElement; const key = list.contains(focused) ? focused.dataset.focusKey : null; render(); if (key) ([...list.querySelectorAll('[data-focus-key]')].find(node => node.dataset.focusKey === key) || close).focus(); };
         const all = document.createElement('a'); all.className = 'button-link'; all.href = hubUrl('notifications'); all.textContent = 'All notifications';
-        panel.append(heading, close, list, status, all); dialog.append(panel);
+        const preferences = document.createElement('a'); preferences.className = 'button-link'; preferences.href = hubUrl('preferences'); preferences.textContent = 'Notification preferences';
+        panel.append(heading, close, list, status, all, preferences); dialog.append(panel);
         dialog.addEventListener('close', cleanup, { once: true });
         dialog.addEventListener('keydown', event => {
             if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dismiss(true); }
@@ -161,10 +235,11 @@
     async function refresh() {
         const run = generation, user = account;
         const before = JSON.stringify([proposals, consent, notifications]);
-        const [data, queue, notices, feed] = await Promise.all([api('Me'), api('Deletions'), api('Me/Consent'), api('Me/Notifications')]);
+        const [data, queue, notices, feed, permission] = await Promise.all([api('Me'), api('Deletions'), api('Me/Consent'), api('Me/Notifications'), api('Me/DeletionPermission')]);
         if (run !== generation || account !== user || current() !== user) return;
         if (revision === undefined || data.Revision >= revision) { revision = data.Revision; watches = data.Watchlist; }
         proposals = Array.isArray(queue) ? queue : []; consent = Array.isArray(notices) ? notices : []; notifications = Array.isArray(feed) ? feed : [];
+        deletionScope = ['Denied', 'OwnRequests', 'AnyAccessibleItem'].includes(permission?.Scope) ? permission.Scope : 'OwnRequests';
         const target = detailTarget(); detail = undefined;
         if (target) { const item = await api('Items/' + target.id + '/Controls'); if (normalize(item.Id) === target.id) detail = { ...target, kind: item.Kind }; }
         if (run !== generation || account !== user || current() !== user) return;
@@ -197,13 +272,14 @@
                 const bell = controls.querySelector('[data-bell]'); const followed = watches.find(item => normalize(item.ItemId) === id)?.Subscribed === true;
                 bell.textContent = followed ? 'Unsubscribe' : 'Subscribe'; bell.setAttribute('aria-pressed', String(followed));
                 const badge = controls.querySelector('[data-removal-marker]'), pending = proposals.filter(row => normalize(row.Item) === id); updateMarker(badge, pending);
+                const propose = controls.querySelector('[data-deletion-propose]'); if (propose) propose.disabled = deletionScope === 'Denied';
                 continue;
             }
             controls = document.createElement('div'); controls.dataset.mediahubControls = ''; controls.dataset.item = id; nodes.add(controls);
             const bell = button('Subscribe'); bell.dataset.bell = ''; const status = document.createElement('span'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
             controls.addEventListener('click', event => { event.stopPropagation(); });
             controls.addEventListener('keydown', event => { event.stopPropagation(); });
-            const marker = document.createElement('a'); marker.dataset.removalMarker = ''; marker.className = 'mediaInfoItem mediaInfoText button-link'; marker.href = hubUrl('notifications'); marker.setAttribute('aria-label', 'Review media removal proposal');
+            const marker = document.createElement('a'); marker.dataset.removalMarker = ''; marker.className = 'mediaInfoItem mediaInfoText button-link'; marker.href = hubUrl('deletions'); marker.setAttribute('aria-label', 'Review media removal proposal');
             const add = button('Add to watchlist'); add.dataset.watchAdd = ''; add.addEventListener('click', async event => {
                 event.preventDefault(); if (busy) return; busy = true; add.disabled = true; const run = generation;
                 try { const result = await api('Me/Watchlist/' + id + '/Add', { Revision: revision }); revision = result.Revision; watches = result.Watchlist; status.textContent = 'Saved to your watchlist. Notification choice unchanged.'; }
@@ -221,12 +297,24 @@
                 finally { busy = false; bell.disabled = false; }
             });
             controls.append(bell);
+            if (card === detail?.host) { const settings = button('Notification settings'); settings.addEventListener('click', event => { event.preventDefault(); void notificationSettings(id); }); controls.append(settings); }
             if (['Movie', 'Series'].includes(kind)) {
                 const deletion = button('Propose deletion');
+                deletion.dataset.deletionPropose = ''; deletion.disabled = deletionScope === 'Denied';
                 deletion.addEventListener('click', async event => {
                     event.preventDefault(); if (busy) return; busy = true; deletion.disabled = true; const run = generation;
                     try {
                         controls.querySelectorAll('[data-request-choice]').forEach(node => node.remove());
+                        if (deletionScope === 'AnyAccessibleItem') {
+                            status.textContent = 'This proposes verified movie/whole-series removal, not immediate deletion. All recent-viewer consent and the full delay apply.';
+                            const confirm = button('Confirm verified item deletion proposal'); confirm.dataset.requestChoice = '';
+                            confirm.addEventListener('click', async () => {
+                                if (busy) return; busy = true; confirm.disabled = true;
+                                try { await api('Deletions/Native', { Item: id }); status.textContent = 'Deletion proposed. Consent and delay checks remain in force.'; await refresh(); }
+                                catch (error) { if (run === generation) status.textContent = error.message; }
+                                finally { busy = false; confirm.disabled = false; }
+                            }); controls.append(confirm); return;
+                        }
                         const choices = await api('Items/' + id + '/DeletionRequests');
                         if (!choices.length) status.textContent = 'No owned request found.';
                         for (const choice of choices) {
@@ -254,7 +342,7 @@
         if (scheduled) return; scheduled = true;
         queueMicrotask(() => { scheduled = false; scan(); });
     }
-    const observer = new MutationObserver(records => { if (records.some(record => !record.target.closest?.('[data-mediahub-controls],[data-mediahub-navigation],[data-mediahub-menu]'))) schedule(); });
+    const observer = new MutationObserver(records => { extendNativeContextMenu(); if (records.some(record => !record.target.closest?.('[data-mediahub-controls],[data-mediahub-navigation],[data-mediahub-menu],[data-mediahub-item-settings]'))) schedule(); });
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-id'] });
     let refreshing = false;
     async function tick() {
@@ -283,6 +371,7 @@
         if (event.persisted) { clear(); account = ''; } else window.mediaHubItemControls.stop();
     };
     const restore = () => { void tick(); };
-    window.mediaHubItemControls = { stop: () => { observer.disconnect(); clearInterval(timer); window.removeEventListener('hashchange', navigate); window.removeEventListener('pagehide', unload); window.removeEventListener('pageshow', restore); clear(); } };
+    for (const type of ['contextmenu', 'click', 'keydown']) document.addEventListener(type, contextSource, true);
+    window.mediaHubItemControls = { stop: () => { observer.disconnect(); clearInterval(timer); window.removeEventListener('hashchange', navigate); window.removeEventListener('pagehide', unload); window.removeEventListener('pageshow', restore); for (const type of ['contextmenu', 'click', 'keydown']) document.removeEventListener(type, contextSource, true); clear(); } };
     window.addEventListener('pagehide', unload); window.addEventListener('pageshow', restore);
 })();

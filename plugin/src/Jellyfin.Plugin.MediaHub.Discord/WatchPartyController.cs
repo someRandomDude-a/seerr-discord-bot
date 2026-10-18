@@ -3,7 +3,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace Jellyfin.Plugin.MediaHub;
+namespace Jellyfin.Plugin.MediaHub.DiscordIntegration;
 
 [ApiController, Authorize, Route("MediaHub/WatchParty")]
 [RequestSizeLimit(4096), ServiceFilter(typeof(HubRequestBoundary), Order = int.MinValue)]

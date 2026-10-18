@@ -95,9 +95,11 @@ public sealed class ArrDeletionTests : IDisposable
         await Assert.ThrowsAsync<HubError>(() => client.Unmonitor(owner, proof, CancellationToken.None));
         Assert.Equal(0, server.Puts); Assert.Equal(0, server.Deletes);
     }
-    private sealed class ArrServer(Guid owner, bool tv) : HttpMessageHandler
+    internal sealed class ArrServer(Guid owner, bool tv) : HttpMessageHandler
     {
         public int Deletes, Puts, FileId = 5, EntryId = 10, Port = 7878;
+        public int RequestReads;
+        public bool SecondDestination, FailSecondDestination;
         public string Path = tv ? "/tv/show" : "/movies/title";
         public bool Gone, Monitored = true, SeasonsOff, EpisodesOff, FailAfterDelete, AdditionalSeason, ClearInstance, EntryMissing, BadEpisodes;
         public string Future = "all";
@@ -106,12 +108,14 @@ public sealed class ArrDeletionTests : IDisposable
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var url = request.RequestUri!; var path = url.AbsolutePath;
+            if (path.StartsWith("/api/v1/request/", StringComparison.Ordinal)) RequestReads++;
+            if (url.Host == "arr2" && FailSecondDestination) throw new HttpRequestException("Fixture destination unavailable");
             Assert.Equal(url.Host == "seerr" ? "seerr-key" : "arr-key", Assert.Single(request.Headers.GetValues("X-Api-Key")));
             object body;
             if (path == "/api/v1/request/22") body = new { id = 22, status = 2, type = tv ? "tv" : "movie", is4k = false, requestedBy = new { id = 7 }, media = new { id = 2, tmdbId = 123, tvdbId = 444, serviceId = ClearInstance ? (int?)null : 0 }, seasons = new[] { new { seasonNumber = 1 } } };
             else if (path == "/api/v1/user/7") body = new { id = 7, jellyfinUserId = owner.ToString() };
             else if (path == "/api/v1/tv/123") body = new { externalIds = new { tvdbId = 444 } };
-            else if (path.StartsWith("/api/v1/settings/")) body = new[] { new { id = 0, hostname = "arr", port = Port, useSsl = false, baseUrl = "", apiKey = "arr-key", is4k = false, isDefault = false } };
+            else if (path.StartsWith("/api/v1/settings/")) body = SecondDestination ? [new { id = 0, hostname = "arr", port = Port, useSsl = false, baseUrl = "", apiKey = "arr-key", is4k = false, isDefault = false }, new { id = 1, hostname = "arr2", port = Port, useSsl = false, baseUrl = "", apiKey = "arr-key", is4k = false, isDefault = false }] : new[] { new { id = 0, hostname = "arr", port = Port, useSsl = false, baseUrl = "", apiKey = "arr-key", is4k = false, isDefault = false } };
             else if (request.Method == HttpMethod.Delete)
             {
                 DeletePaths.Add(path); Deletes++;

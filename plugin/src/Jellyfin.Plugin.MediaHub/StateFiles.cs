@@ -3,6 +3,20 @@ namespace Jellyfin.Plugin.MediaHub;
 /// <summary>Only plugin-owned files. Never chmod, follow or overwrite a linked state path.</summary>
 internal static class StateFiles
 {
+    internal const long FreeSpaceReserve = 256L * 1024 * 1024;
+    internal static void CheckSpaceBudget(long available, long additional)
+    {
+        if (additional < 0 || additional > 1024L * 1024 * 1024 || available < FreeSpaceReserve || additional > available - FreeSpaceReserve)
+            throw new HubError("Plugin storage is below its safety reserve. No write/reset is authorized; free space or restore storage availability before retrying.");
+    }
+    internal static void RequireSpace(string directory, long additional = 0)
+    {
+        Check(directory);
+        try { CheckSpaceBudget(new DriveInfo(Path.GetFullPath(directory)).AvailableFreeSpace, additional); }
+        catch (HubError) { throw; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+        { throw new HubError("Plugin storage availability could not be verified. No write/reset is authorized."); }
+    }
     public static void Check(string path)
     {
         if (string.IsNullOrEmpty(path) || path.Length > 4096) throw new HubError("Invalid or oversized Media Hub state path.");
@@ -47,6 +61,7 @@ internal static class StateFiles
     }
     public static void Publish(string directory, string name, ReadOnlySpan<byte> bytes, string? previous = null, Action<string>? checkpoint = null)
     {
+        RequireSpace(directory, checked(bytes.Length * 2L));
         var target = In(directory, name);
         var backup = previous is null ? null : In(directory, previous);
         var temp = In(directory, name + "." + HubStore.Nonce() + ".tmp");

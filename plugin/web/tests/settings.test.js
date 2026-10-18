@@ -89,6 +89,18 @@ test('one explicit save includes settings from every section and blank passwords
     assert.equal(h.form.elements.discordToken.value, ''); assert.match(h.view.querySelector('[data-settings-notice]').textContent, /saved together/);
   } finally { h.close(); }
 });
+test('adapter-owned Discord panels are read-only while native removal settings remain independently editable', async () => {
+  const h = await harness(({ control }) => { control.saved.DiscordConfigurationOwnedByAdapter = true; });
+  try {
+    for (const group of ['discord', 'activity', 'messaging']) {
+      h.group(group); assert.ok([...h.view.querySelectorAll('[data-settings-panel="' + group + '"] input,[data-settings-panel="' + group + '"] select,[data-settings-panel="' + group + '"] button')].every(node => node.disabled));
+    }
+    assert.match(h.view.querySelector('[data-discord-ownership]').textContent, /separate Discord Integration/);
+    h.group('removal'); assert.equal(h.form.elements.deletionDays.disabled, false); h.change('deletionDays', '3'); h.submit(); await h.settle();
+    assert.equal(h.calls.length, 1); assert.equal(h.calls[0].body.DeletionDelayDays, 3); assert.equal(h.calls[0].body.DiscordToken, null);
+    assert.equal(h.form.elements.discordToken.disabled, true);
+  } finally { h.close(); }
+});
 
 test('failed and stale saves preserve drafts and are never automatically replayed', async () => {
   const h = await harness(({ control }) => { control.reply = async (_, body) => { if (body) throw new Error('Settings changed. Reload and review.'); }; });

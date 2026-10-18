@@ -6,12 +6,15 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using Moq;
 
 namespace MediaHub.Tests;
 
 internal sealed class FeatureFixture : IDisposable
 {
+    private readonly List<IDisposable> owned = [];
+    public T Own<T>(T value) where T : IDisposable { owned.Add(value); return value; }
     public readonly string Directory = Path.Combine(Path.GetTempPath(), "mediahub-features-" + Guid.NewGuid());
     public readonly User User = new("Viewer", "provider", "reset") { Id = Guid.NewGuid() };
     public readonly Mock<IUserManager> Users = new();
@@ -33,6 +36,7 @@ internal sealed class FeatureFixture : IDisposable
         Users.Setup(u => u.GetUserById(User.Id)).Returns(User);
         Library.Setup(l => l.GetItemList(It.IsAny<InternalItemsQuery>())).Returns(Array.Empty<BaseItem>());
         var session = new SessionInfo(Sessions.Object, NullLogger.Instance) { Id = "browser", UserId = User.Id, DeviceId = "device" };
+        Sessions.SetupGet(s => s.Sessions).Returns([session]);
         Sessions.Setup(s => s.GetSessionByAuthenticationToken("token", "device", It.IsAny<string>())).ReturnsAsync(session);
         var code = Store.BeginLink("42"); Store.Approve(code, User.Id, "42", Settings.ProtectLink("token", "42", User.Id, "device"), "device");
         Identity = new(Store, Settings, Users.Object, Sessions.Object);
@@ -54,5 +58,14 @@ internal sealed class FeatureFixture : IDisposable
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) });
         }
     }
-    public void Dispose() { if (System.IO.Directory.Exists(Directory)) System.IO.Directory.Delete(Directory, true); }
+    public void Dispose() { foreach (var value in owned.AsEnumerable().Reverse()) value.Dispose(); if (System.IO.Directory.Exists(Directory)) System.IO.Directory.Delete(Directory, true); }
+}
+
+internal sealed class ThrowingLogger<T> : ILogger<T>
+{
+    public int Calls;
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel level) => true;
+    public void Log<TState>(LogLevel level, EventId id, TState state, Exception? error, Func<TState, Exception?, string> format)
+    { Interlocked.Increment(ref Calls); throw new IOException("Simulated unavailable host logging sink"); }
 }

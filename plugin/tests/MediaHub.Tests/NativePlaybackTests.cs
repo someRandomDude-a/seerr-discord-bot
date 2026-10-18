@@ -22,14 +22,27 @@ public sealed class NativePlaybackTests
         var movie = new Mock<Movie>(); movie.Object.Id = Guid.NewGuid(); movie.Object.Name = "Visible movie"; movie.Setup(m => m.IsVisibleStandalone(f.User)).Returns(true); movie.SetupGet(m => m.MediaType).Returns(MediaType.Video);
         f.Library.Setup(l => l.GetItemById(movie.Object.Id)).Returns(movie.Object); return (actor, target, movie.Object.Id);
     }
-    private static NativePlayback Service(FeatureFixture f) => new(f.Store, f.Settings, f.Identity, f.Sessions.Object, f.Library.Object);
+    private static NativePlayback Service(FeatureFixture f)
+    {
+        var guard = new Mock<INativePlaybackGuard>(); guard.Setup(g => g.Check(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        return new(f.Store, f.Settings, f.Identity, f.Sessions.Object, f.Library.Object, guard.Object);
+    }
     [Fact]
     public async Task NativeDevicePlaybackCannotBypassCompanionPartyPlaybackAuthority()
     {
-        using var f = new FeatureFixture(); var (actor, target, item) = await Setup(f); var provider = new Mock<Jellyfin.Plugin.PrivateSyncPlay.Api.IWatchPartyService>(); provider.SetupGet(p => p.IsAvailable).Returns(true);
-        provider.Setup(p => p.GetCurrentPartyAsync(f.User.Id, actor.Id, It.IsAny<CancellationToken>())).ReturnsAsync(new Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyInfo(Guid.NewGuid(), f.User.Id, Jellyfin.Plugin.PrivateSyncPlay.Api.WatchPartyVisibility.Private, 4, 1, null));
+        using var f = new FeatureFixture(); var (actor, target, item) = await Setup(f); var provider = new Mock<INativePlaybackGuard>();
+        provider.Setup(p => p.Check(f.User.Id, actor.Id, target.Id, It.IsAny<CancellationToken>())).ThrowsAsync(new HubError("Player is in a party."));
         var service = new NativePlayback(f.Store, f.Settings, f.Identity, f.Sessions.Object, f.Library.Object, provider.Object); var plan = service.Prepare(actor, target.Id, item);
         await Assert.ThrowsAsync<HubError>(() => service.Confirm(actor, plan.Id, () => Task.CompletedTask, default));
+        f.Sessions.Verify(s => s.SendPlayCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlayRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+    [Fact]
+    public async Task MissingIntegrationCannotBypassPlaybackGuard()
+    {
+        using var f = new FeatureFixture(); var (actor, target, item) = await Setup(f);
+        var service = new NativePlayback(f.Store, f.Settings, f.Identity, f.Sessions.Object, f.Library.Object); var plan = service.Prepare(actor, target.Id, item);
+        await Assert.ThrowsAsync<HubError>(() => service.Confirm(actor, plan.Id, () => Task.CompletedTask, default));
+        Assert.Equal("prepared", service.Receipt(actor, plan.Id).State);
         f.Sessions.Verify(s => s.SendPlayCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlayRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
     [Fact]

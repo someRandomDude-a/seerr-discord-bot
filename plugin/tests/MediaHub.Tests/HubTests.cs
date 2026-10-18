@@ -4,7 +4,6 @@ using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.MediaHub;
-using Jellyfin.Plugin.PrivateSyncPlay.Api;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using Microsoft.AspNetCore.Http;
@@ -109,7 +108,7 @@ public sealed class HubTests : IDisposable
     }
     private ServiceProvider WatchPartyServices() => new ServiceCollection()
         .AddSingleton(identity).AddSingleton(store).AddSingleton(settings).AddSingleton(sessions.Object)
-        .AddPrivateSyncPlayClient().AddSingleton<WatchPartyIntegration>().AddSingleton<WebIntegration>().BuildServiceProvider();
+        .AddSingleton<WatchPartyIntegration>().AddSingleton<WebIntegration>().BuildServiceProvider();
     private HubController Controller(IServiceProvider services, bool apiKey = false) => new(services)
     {
         ControllerContext = new() { HttpContext = new DefaultHttpContext { User = Principal(apiKey) } }
