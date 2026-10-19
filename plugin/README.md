@@ -33,10 +33,14 @@ The latest security, Discord-surface and personal-navigation changes are recorde
 The [completion handoff](COMPLETION.md) lists local verification tools and the exact external
 access/human acceptance needed for the remaining gates; none is silently waived.
 
-**First installation? Open Media Hub's settings as the Jellyfin administrator.** The conventional
-**Server connections and permissions** workspace provides section/mode dropdowns, contextual Help,
-expandable Discord/OAuth details, saved-service profile/folder choices and structured destination
-approval. One **Save server settings** action saves all sections; switching sections never saves.
+**There are two independently installed plugins.** Install **Watchlist Deletion (Preview)**
+for native deletion requests/watchlists, and optionally install **Media Hub Discord Integration
+(Preview)** for Discord. See [installation](#install-the-core-and-the-discord-plugin) below.
+Open the **core's** settings as a Jellyfin administrator for service connections, approved Arr
+destinations and deletion permissions; open the **Discord plugin's separate** settings for
+bot/OAuth/Activity/messaging configuration. The core's **Server connections and permissions**
+workspace provides section dropdowns, contextual Help and saved-service profile/folder choices.
+Each page has its own explicit save boundary; switching sections never saves.
 Draft review, explicit credential removal, disconnect controls and confirmed reload replace the
 walkthrough. Nothing is auto-enabled and no progress/drafts/secrets enter browser storage.
 The [settings reference](ONBOARDING.md) is supplementary to the in-place help.
@@ -48,8 +52,9 @@ Use one plugin instance per Discord application token.
 
 ## Jellyfin safety boundary
 
-- All plugin state is isolated under **`<Jellyfin data>/media-hub/`**. The plugin does not
-  directly open/attach/migrate Jellyfin databases or write Jellyfin server/user/network settings.
+- Core state is isolated under **`<Jellyfin data>/media-hub/`** and adapter configuration
+  under **`<Jellyfin data>/media-hub-discord/`**. Neither plugin
+  directly opens/attaches/migrates Jellyfin databases or writes Jellyfin server/user/network settings.
   No replacement host assemblies, EF migrations, triggers or server-configuration overrides.
 - Own schema migrations are transactional and additive. A database ownership marker and
   native-preview schema checks reject unrelated files; unknown future schemas and corrupt
@@ -142,7 +147,7 @@ remaining real-skin acceptance limits.
   identities using one-use state, optional PKCE and a Secure/HttpOnly callback cookie. Callback
   GET only records proof; a signed-in explicit POST confirms the displayed accounts. Forwarded
   authorization URLs without the original cookie cannot produce proof. Real-browser acceptance remains.
-- Native watch parties use the public **Private SyncPlay SDK 1.1.0** with the separately installed
+- With the Discord plugin installed, native watch parties use the public **Private SyncPlay SDK 1.1.0** with the separately installed
   **0.1.5** provider. Exact-player status, private creation with a one-use signed-in invitation,
   owner invitation/revocation and explicit leave/end are integrated without a duplicate engine.
   Missing/unhealthy providers fail safely; Activity and the old Discord invitation flow cannot
@@ -231,21 +236,99 @@ real-host installation compatibility, native playback behavior or feature comple
 No native TV/mobile controls are promised without those clients' own supported integrations.
 See [FEATURES.md](FEATURES.md) and [SAFETY.md](SAFETY.md) for the remaining coding gates and operation boundaries.
 
-## Install from the plugin repository
+## Install the core and the Discord plugin
 
-**The repository is not published by these source changes.** After the owner runs the release
-workflow successfully, its default GitHub Pages catalog URL will be:
+These are **two separate plugin packages**, not two modes of a single installation.
+Both target **Jellyfin 12.2.0 / .NET 10**. SDK/Node tools below are for development,
+not an additional service you must install alongside Jellyfin.
+
+| Package | Catalog / My Plugins name | Requirements |
+| --- | --- | --- |
+| `Jellyfin.Plugin.MediaHub_<core-version>.zip` | **Watchlist Deletion (Preview)** | Jellyfin 12.2; compatible File Transformation and Plugin Pages for native Web controls/pages |
+| `Jellyfin.Plugin.MediaHub.Discord_<discord-version>.zip` | **Media Hub Discord Integration (Preview)** | The core with public API 1.0, plus separately installed Private SyncPlay 0.1.5 / API 1.1.0 |
+
+The historical `MediaHub` core filename/GUID is retained for safe upgrades. The core
+does **not** bundle Discord. Bundled API/SDK DLLs are dependencies, not extra project
+plugins to install independently. The Private SyncPlay **provider** is a separate
+third-party installation; its bundled API DLL alone does not install the provider.
+
+### Install Watchlist Deletion only
+
+1. Install Jellyfin-12.2-compatible **File Transformation**, then **Plugin Pages**,
+   using the [dependency guide](WEB_DEPENDENCIES.md).
+2. Install **Watchlist Deletion (Preview)** through the catalog when published, or
+   install its full core ZIP manually using the instructions linked below. Restart Jellyfin.
+3. Open **Dashboard → Plugins → My Plugins → Watchlist Deletion (Preview) → Settings**.
+   Configure existing Jellyfin/Seerr services and explicit Arr destination approvals;
+   use the separate deletion-permission editor for default/individual account scopes.
+4. Leave automatic removal off during setup and verify the native queue, notifications
+   and user access first. Users use normal Jellyfin accounts.
+
+**This installation needs no Discord bot, token, account link or Private SyncPlay.**
+
+### Add Discord Integration
+
+1. Install the core first.
+2. Separately install the reviewed **Private SyncPlay 0.1.5 / public API 1.1.0** provider
+   following [its upstream instructions](https://github.com/someRandomDude-a/private-syncplay-groups).
+3. Install the separate **Media Hub Discord Integration (Preview)** ZIP/catalog entry.
+   Keep its files separate from the core; restart Jellyfin and verify both plugins are Active.
+4. Configure the existing public Jellyfin HTTPS base URL in the core. Then open
+   **Media Hub Discord Integration (Preview) → Settings**, not the core's retained
+   legacy Discord fields. Set the bot token and explicit server allowlist. Configure
+   the matching Discord application ID/OAuth secret when using OAuth linking or Activity;
+   see [Activity setup](ACTIVITY.md). Save explicitly, then enable the desired features.
+5. Link each user's own accounts through `/hub-link` and explicit native approval.
+   Do not grant the bot Administrator or reuse its token in another running instance.
+
+The adapter reads no development `.env` at runtime. Enter secrets through its native
+administrator configuration page; do not copy credentials, source trees or test files
+into Jellyfin's plugins directory. Missing dependencies leave gateway/player controls unavailable.
+
+### Catalog availability and manual ZIPs
+
+**These source changes do not publish either package.** The catalog publication target is:
 
 ```text
 https://somerandomdude-a.github.io/seerr-discord-bot/manifest.json
 ```
 
-1. Confirm the HTTPS URL returns the catalog JSON and its referenced release ZIP exists.
-2. In Jellyfin **Dashboard → Plugins → Repositories**, add that manifest URL (not the Git URL).
-3. Install **Media Hub (Preview)** from the catalog on latest stable test Jellyfin (currently 12.2.0), then restart.
-4. Install compatible Plugin Pages/File Transformation for the ordinary-user page.
-5. Configure the external Jellyfin HTTPS base URL (including any base path), allowed guild
-   IDs and a **test** Discord token in the elevated settings section. Discord is off by default.
+Add it under **Dashboard → Plugins → Repositories** only after verifying the manifest
+and referenced ZIPs exist. Each published plugin is a separate **Catalog** entry.
+The shared **Publish Jellyfin plugin repository** workflow builds and publishes both
+plugins to this one catalog. Add the repository once, then install each desired entry
+separately. Dependencies are not installed automatically. Until an authorized successful
+run of the updated publisher, live entries may still be older or missing.
+Discord CI also offers an unpublished **discord-integration-development-only** artifact
+for deliberate manual preview testing. A legacy all-in-one release is not a split package.
+
+For manual extraction, stopping/starting Jellyfin, versioned folder examples and how
+to unpack the outer Actions artifact, follow the
+[main README ZIP-install instructions](../README.md#catalog-installation-versus-manual-zip-installation).
+Extract the complete core ZIP to `MediaHub_<core-version>/` and the complete adapter
+ZIP to `MediaHub.Discord_<discord-version>/`, each inside Jellyfin's configured
+`plugins` directory. Do not merge folders, deduplicate SDK DLLs across plugins,
+or copy host assemblies. Validate each ZIP's `SHA256SUMS` first.
+
+The two release numbers need not be equal, but both must explicitly support Jellyfin
+12.2 and the same core API contract. Do not install an arbitrary older core/adapter.
+
+### Upgrade from the monolith or an earlier split build
+
+Pause the bot and automatic removal explicitly before maintenance. Stop Jellyfin and
+back up the complete `media-hub/` and, if present, `media-hub-discord/` state directories
+as a matching snapshot, including databases/WAL, keys, settings and authentication roots.
+Upgrade the existing core identity; never erase or recreate its data directory. Do not
+load the old monolith beside the split core. Use Jellyfin's supported upgrade flow,
+or retain old **binary** folders outside the scanned plugin directory during manual replacement.
+
+After installing the selected core and optional adapter/dependencies, restart. In the
+core settings, explicitly review/save any legacy configuration flagged for review first.
+If installing the adapter, then review **Discord Integration → Settings**. Its first confirmed save/import migrates
+configuration ownership, not the database, links or history. Do not copy the core's
+database/key into the adapter directory. Verify retained state before enabling anything.
+Missing/corrupt state or a downgrade requires matching stopped backups, not deleting
+keys or promoting an isolated previous file. See [adapter migration](discord/README.md#configuration-ownership-and-safe-migration).
 
 The plugin uses its hosting instance's native services, not a separately configured internal
 Jellyfin API key. Seerr/Arr services remain external. No Docker/network settings or DNS are
@@ -253,10 +336,22 @@ changed and no new public/LAN port is needed.
 
 ## Build and test
 
+### Which workflow builds which plugin?
+
+| Workflow file | GitHub Actions name | Output / installation behavior |
+| --- | --- | --- |
+| `.github/workflows/plugin.yml` | **Media Hub plugin CI** | Compiles/tests the core and Web code; no server deployment |
+| `.github/workflows/plugin-release.yml` | **Publish Jellyfin plugin repository** | Builds/tests/packages both separate plugins, checks disposable acceptance servers, verifies both prerelease downloads, then publishes one combined catalog |
+| `.github/workflows/plugin-discord.yml` | **Discord integration CI** | Separately tests/builds/packages the adapter; download **discord-integration-development-only** from the completed run's Artifacts section; no release/catalog publication |
+
+No workflow installs either plugin onto your own Jellyfin server. Use the catalog
+or manual ZIP steps above. One shared publication run releases both plugins;
+the separate Discord CI workflow remains build/test-only.
+
 Requires **.NET 10 SDK** and **Node 22.12+** for browser tests and the bundled Activity build.
 The installed plugin needs its Jellyfin host runtime. Only the latest stable Jellyfin, currently
-12.2.0, is targeted; older/unreviewed API overrides are rejected. Optional watch parties additionally
-require the matching Private SyncPlay provider. Review the pinned API/SDK/catalog ABI together when
+12.2.0, is targeted; older/unreviewed API overrides are rejected. Watch parties require
+the Discord plugin and matching Private SyncPlay provider. Review the pinned API/SDK/catalog ABI together when
 a new stable Jellyfin is released; no floating dependency or older-version fallback is used.
 CI/release checks compare the reviewed release tag with Jellyfin's latest stable release and fail
 closed on drift or lookup failure instead of silently publishing an older target or auto-upgrading it.
@@ -268,13 +363,24 @@ npm ci --prefix plugin/web
 npm test --prefix plugin/web
 npm ci --ignore-scripts --prefix plugin/activity
 npm run build --prefix plugin/activity
+dotnet test plugin/tests/MediaHub.Discord.Tests/MediaHub.Discord.Tests.csproj -c Release -p:RequireActivityBundle=true
 ```
 
-Build a local preview package (use a new/empty repository output directory each time):
+Build the **core** preview (no Activity/Node build is required for this assembly).
+Use new/empty output directories and substitute the intended version when creating a release:
 
 ```sh
-dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release -p:RequireActivityBundle=true -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -o plugin/artifacts/build
-dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --input plugin/artifacts/build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
+dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -o plugin/artifacts/core-build
+dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --plugin core --input plugin/artifacts/core-build --output plugin/artifacts/core-repository --metadata plugin/repository/plugin.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
+```
+
+Build the **separate Discord plugin** preview, including its Activity assets:
+
+```sh
+npm ci --ignore-scripts --prefix plugin/activity
+npm run build --prefix plugin/activity
+dotnet build plugin/src/Jellyfin.Plugin.MediaHub.Discord/Jellyfin.Plugin.MediaHub.Discord.csproj -c Release -p:RequireActivityBundle=true -p:Version=0.1.0.0 -p:AssemblyVersion=0.1.0.0 -p:FileVersion=0.1.0.0 -p:InformationalVersion=0.1.0.0 -o plugin/artifacts/discord-build
+dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --plugin discord --input plugin/artifacts/discord-build --output plugin/artifacts/discord-repository --metadata plugin/repository/discord.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
 ```
 
 Output: versioned ZIP, `manifest.json`, `SHA256SUMS` and a catalog landing page. Local generation
@@ -284,7 +390,23 @@ cannot be overwritten and each new version must increase. Only allowlisted runti
 license notices are zipped: no host DLLs, secrets, tests, PDBs or developer-machine native assets.
 Do not install the test application's build output into Jellyfin.
 
+For the **shared catalog**, use both build directories above and a new empty output directory:
+
+```sh
+dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --plugin both --input plugin/artifacts/core-build --discord-input plugin/artifacts/discord-build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --discord-metadata plugin/repository/discord.json --repository someRandomDude-a/seerr-discord-bot --version 0.1.0.0
+```
+
+This produces two separate ZIPs, a two-entry manifest, combined `SHA256SUMS` and landing page.
+For an existing repository, pass `--history <directory>` containing downloaded authoritative
+release snapshots named `manifest.json` in separate subdirectories. Conflicting immutable
+version records are rejected; neither plugin's older versions are dropped. Do not deploy a
+single-plugin development manifest over the shared catalog.
+
 ### Publish the repository
+
+These steps publish **both separate plugins in one catalog**, using the same new
+four-part version for this publication run. The core remains installable without Discord.
+Publishing does not enable the bot or automatic removal, or certify production readiness.
 
 1. Commit/push the plugin and workflows. Enable repository Actions, permit release writes,
    and set **Settings → Pages → Source → GitHub Actions**. Review the `github-pages` environment
@@ -292,15 +414,18 @@ Do not install the test application's build output into Jellyfin.
    to host both; this workflow owns the Pages root.
 2. Run **Publish Jellyfin plugin repository** with a new four-part version (for example
    `0.1.0.0`), or push its `plugin-v0.1.0.0` tag.
-3. The workflow tests the latest stable API target and the independent browser suite, stamps/builds the
-   matching assembly, preserves catalog history from the highest published plugin release,
-   creates an immutable **prerelease**, downloads/verifies its ZIP and then deploys Pages.
-   Missing/corrupt prior history fails closed, even if Pages is unavailable.
-4. Verify the live manifest and install its downloaded ZIP on a test Jellyfin. Upstream-host
+3. The workflow tests both plugins and the browser suite against the reviewed stable API,
+   stamps/builds both assemblies, and merges history from the highest published core and
+   Discord release snapshots. It checks both exact ZIPs, creates separate draft **prereleases**
+   (`plugin-v…` and `discord-v…`), downloads/verifies both packages and their shared manifest,
+   publishes both releases, then deploys Pages. Missing/corrupt/conflicting history or either
+   failed download blocks catalog deployment, even if Pages is unavailable.
+4. Verify both live manifest entries and install each desired entry through the catalog on a test Jellyfin. Upstream-host
    dependency resolution, first install, upgrade/restart and web routing still require this test.
 
-If Pages fails after release creation, rerun the failed repository deployment job using its
-existing artifacts. Do not overwrite the published version or delete its assets to retry;
+If publication or Pages fails, rerun only the failed release/deployment jobs using their
+existing artifacts. The publisher resumes missing draft assets only, rejects different existing
+bytes, and never overwrites published assets. Do not rebuild the same version or delete its assets to retry;
 if artifacts expired, publish a higher version, which retains the preceding release history.
 
 ## State and manual acceptance

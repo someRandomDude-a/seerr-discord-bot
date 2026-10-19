@@ -9,6 +9,47 @@ This is a **separate plugin**, not the watchlist/deletion engine. It requires:
 Plugin GUID: `8456d36a-3c89-4b6d-9959-9a74566cc252`.
 The core retains `c70297bf-77bd-4ad4-93c9-f67598519777` and `media-hub/`.
 
+## Install this plugin
+
+1. Install **Watchlist Deletion (Preview)** and its native Web dependencies first.
+   Follow the [core-only installation steps](../../README.md#install-the-two-plugins).
+2. Separately install the compatible **Private SyncPlay 0.1.5 / API 1.1.0** provider
+   from [upstream](https://github.com/someRandomDude-a/private-syncplay-groups).
+   The API DLL in the adapter ZIP is not the provider installation.
+3. Add the [shared project catalog](../../README.md#catalog-installation-versus-manual-zip-installation)
+   once under **Dashboard → Plugins → Repositories**, then install **Media Hub Discord
+   Integration (Preview)** from **Catalog**. The core and adapter are separate entries
+   in that same catalog; neither is silently installed with the other.
+4. Restart Jellyfin. For an optional manual installation, obtain
+   **`Jellyfin.Plugin.MediaHub.Discord_<discord-version>.zip`**, not the core ZIP,
+   from its matching release and verify its `SHA256SUMS`. Stop Jellyfin and extract the
+   entire adapter ZIP to its own `MediaHub.Discord_<discord-version>/` folder inside
+   Jellyfin's configured plugins directory. Do not merge it with the core folder or
+   remove its bundled SDK DLLs. Restart Jellyfin and verify both project plugins are Active.
+5. Open **Dashboard → Plugins → My Plugins → Media Hub Discord Integration (Preview)
+   → Settings**. Configure the bot token and server allowlist here; configure the
+   matching application ID/client secret for OAuth or Activity. The public Jellyfin
+   HTTPS base URL and media-service/deletion settings belong in the core's settings.
+   Enable the bot deliberately, using one running instance per token.
+6. Users run `/hub-link` and confirm their own accounts in a signed-in native browser.
+   Follow [Activity configuration](../ACTIVITY.md) before enabling Activity.
+
+This plugin does not read a development `.env` at runtime. No extra server, runtime
+listener or Node/.NET SDK installation is needed for a packaged plugin. Without
+the core and provider, gateway/player controls remain unavailable. For native deletion
+requests alone, **neither this adapter nor Private SyncPlay is required**.
+
+The shared **Publish Jellyfin plugin repository** workflow now builds and publishes
+both plugins into one catalog, preserving both histories. It uses separate `plugin-v…`
+and `discord-v…` prereleases and verifies both downloads before deploying the catalog.
+These source changes have not published anything: the live entry appears only after
+an authorized successful run. The separate **Discord integration CI** still offers an
+unpublished **discord-integration-development-only** artifact; unpack that outer
+artifact to find the actual plugin ZIP if deliberately testing development builds.
+Compatible core and adapter release numbers may differ, but must target the same Jellyfin ABI and core API 1.0.
+See the [main installation/upgrade guide](../../README.md#install-the-two-plugins)
+for the catalog URL, both folder layouts and retained-state migration precautions.
+
 ## Boundary and retained features
 
 Discord gateway/REST transport and native watch-party management now compile in
@@ -68,6 +109,9 @@ real native-menu, embedded Discord SDK and broader client acceptance are still
 gates. Source compilation and synthetic identity tests are not live parity proof.
 
 ## Development
+
+The complete [two-package build commands and workflow/output table](../README.md#build-and-test)
+are in the core reference. Build/package this project independently of the core:
 
 ```powershell
 npm ci --ignore-scripts --prefix plugin/activity

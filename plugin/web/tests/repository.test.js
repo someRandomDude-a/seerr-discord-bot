@@ -22,8 +22,9 @@ test('repository product sources are confined to the plugin and its documentatio
   assert.deepEqual(directories, ['docs', 'plugin']);
   for (const path of await sources()) assert.ok(!['.py', '.pyc', '.pyo'].includes(extname(path).toLowerCase()), `Unexpected standalone runtime source: ${path}`);
   const readme = await readFile(join(root, 'README.md'), 'utf8');
-  assert.match(readme, /^# Media Hub for Jellyfin 12/);
-  assert.match(readme, /integrated settings UI/);
+  assert.match(readme, /^# Watchlist Deletion and Discord Integration for Jellyfin 12/);
+  assert.match(readme, /two separate in-process/);
+  assert.match(readme, /Discord settings belong to/);
   assert.match(readme, /plugin\/FEATURES\.md/);
 });
 
@@ -92,4 +93,26 @@ test('native web smoke uses pinned upstream dependencies but runtime checks foll
   assert.ok(smoke.indexOf('Test-WebDependencies.ps1') < smoke.indexOf('Test-NativeUi.mjs'));
   const native = await readFile(join(root, 'plugin/tools/Test-NativeUi.mjs'), 'utf8');
   assert.doesNotMatch(native, /addScriptTag/); assert.match(native, /OrdinaryViewerPages: true/); assert.match(native, /assert\.equal\(viewerWrites, 0\)/);
+});
+
+test('one shared catalog publisher builds and verifies both separate plugins before Pages deployment', async () => {
+  const release = await readFile(join(root, '.github/workflows/plugin-release.yml'), 'utf8');
+  for (const project of ['MediaHub.Tests', 'MediaHub.Discord.Tests']) assert.ok(release.includes(`plugin/tests/${project}/`));
+  assert.match(release, /--plugin both/);
+  assert.match(release, /--discord-metadata plugin\/repository\/discord\.json/);
+  assert.match(release, /for prefix in plugin discord/);
+  assert.match(release, /Test-CataloguePublication\.ps1/);
+  assert.match(release, /Test-Split\.ps1[^\n]+-DiscordPackage/);
+  assert.match(release, /Publish-PluginCatalogue\.ps1[^\n]+-Publish/);
+  assert.match(release, /repository:\s+needs: release/);
+  const publisher = await readFile(join(root, 'plugin/tools/Publish-PluginCatalogue.ps1'), 'utf8');
+  assert.match(publisher, /'plugin-v'/); assert.match(publisher, /'discord-v'/);
+  assert.match(publisher, /SHA256/); assert.match(publisher, /--draft=false/);
+  assert.ok(publisher.indexOf('foreach ($asset in $files) { if (!(Same-File') < publisher.indexOf('--draft=false'));
+  assert.doesNotMatch(publisher, /['"]--clobber['"]/);
+  for (const path of ['README.md', 'plugin/README.md', 'plugin/discord/README.md']) {
+    const readme = await readFile(join(root, path), 'utf8');
+    assert.match(readme, /Publish Jellyfin plugin repository/);
+    assert.doesNotMatch(readme, /core publisher does not currently publish|core release workflow publishes the core/);
+  }
 });

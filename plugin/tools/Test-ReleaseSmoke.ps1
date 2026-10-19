@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$PlaywrightModule,
     [Parameter(Mandatory)][string]$AxeFile,
     [Parameter(Mandatory)][string]$ProviderZip,
+    [Parameter(Mandatory)][string]$DiscordPackage,
     [ValidateRange(10, 300)][int]$StartupTimeoutSeconds = 180
 )
 $ErrorActionPreference = 'Stop'
@@ -14,6 +15,7 @@ $null = New-Item -ItemType Directory -Path $root -Force
 $harness = Join-Path $PSScriptRoot 'Test-Jellyfin.ps1'
 $arguments = @{ Name = $name; Port = 18296; PackageVersion = $Version; StartupTimeoutSeconds = $StartupTimeoutSeconds }
 $digest = (Get-FileHash -Algorithm SHA256 $Package).Hash
+$discordDigest = (Get-FileHash -Algorithm SHA256 $DiscordPackage).Hash
 $dockerHelper = Join-Path $PSScriptRoot 'Invoke-TestDocker.ps1'
 $existing = @(& $dockerHelper -Arguments @('ps', '-a', '--format', '{{.Names}}') -TimeoutSeconds 15)
 if ((Test-Path (Join-Path $root ($name + '.json'))) -or $existing -contains $name) { throw 'Fresh release smoke refuses retained fixture state. Nothing was started or stopped.' }
@@ -28,9 +30,10 @@ try {
     & $harness @arguments -Mode Uninstall
     & $harness @arguments -Mode Install -Package $Package
     & (Join-Path $PSScriptRoot 'Test-Completion.ps1') -Package $Package -Version $Version -PlaywrightModule $PlaywrightModule -AxeFile $AxeFile
-    & (Join-Path $PSScriptRoot 'Test-LibraryAcceptance.ps1') -Package $Package -PackageVersion $Version -PlaywrightModule $PlaywrightModule
+    & (Join-Path $PSScriptRoot 'Test-LibraryAcceptance.ps1') -Package $Package -PackageVersion $Version -PlaywrightModule $PlaywrightModule -DiscordPackage $DiscordPackage -ProviderZip $ProviderZip
     & (Join-Path $PSScriptRoot 'Test-ProviderAcceptance.ps1') -ProviderZip $ProviderZip -PlaywrightModule $PlaywrightModule
     if ((Get-FileHash -Algorithm SHA256 $Package).Hash -ne $digest) { throw 'Release ZIP changed during smoke tests.' }
+    if ((Get-FileHash -Algorithm SHA256 $DiscordPackage).Hash -ne $discordDigest) { throw 'Discord release ZIP changed during smoke tests.' }
     Write-Output ('Exact-ZIP lifecycle/native-browser gate passed. SHA256=' + $digest.ToLowerInvariant())
 } finally {
     # Label-guarded stop only. Retain volumes/state for runner-local failure diagnosis.

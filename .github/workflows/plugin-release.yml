@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'New immutable four-part preview version, e.g. 0.1.0.0'
+        description: 'New immutable four-part version for both separate catalogue plugins'
         required: true
         default: '0.1.0.0'
   push:
@@ -54,20 +54,30 @@ jobs:
         working-directory: plugin/activity
       - run: npm run build
         working-directory: plugin/activity
-      - name: Test the bundled release-version assembly
+      - name: Test the core release-version assembly
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: dotnet test plugin/tests/MediaHub.Tests/MediaHub.Tests.csproj -c Release --nologo -p:RequireActivityBundle=true -p:Version="$RELEASE_VERSION" -p:AssemblyVersion="$RELEASE_VERSION" -p:FileVersion="$RELEASE_VERSION" -p:InformationalVersion="$RELEASE_VERSION" -p:ContinuousIntegrationBuild=true
+      - name: Test the separate Discord release-version assembly
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: dotnet test plugin/tests/MediaHub.Discord.Tests/MediaHub.Discord.Tests.csproj -c Release --nologo -p:RequireActivityBundle=true -p:Version="$RELEASE_VERSION" -p:AssemblyVersion="$RELEASE_VERSION" -p:FileVersion="$RELEASE_VERSION" -p:InformationalVersion="$RELEASE_VERSION" -p:ContinuousIntegrationBuild=true
       - name: Check direct and transitive NuGet advisories
         shell: pwsh
-        run: ./plugin/tools/Test-Dependencies.ps1
+        run: |
+          ./plugin/tools/Test-Dependencies.ps1 -Plugin Core
+          ./plugin/tools/Test-Dependencies.ps1 -Plugin Discord
       - run: npm audit --omit=dev --audit-level=low
         working-directory: plugin/activity
-      - name: Build release assembly
+      - name: Build core release assembly
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: dotnet build plugin/src/Jellyfin.Plugin.MediaHub/Jellyfin.Plugin.MediaHub.csproj -c Release --nologo -p:RequireActivityBundle=true -p:Version="$RELEASE_VERSION" -p:AssemblyVersion="$RELEASE_VERSION" -p:FileVersion="$RELEASE_VERSION" -p:InformationalVersion="$RELEASE_VERSION" -p:ContinuousIntegrationBuild=true -o plugin/artifacts/build
-      - name: Build ZIP and preserve repository history
+      - name: Build separate Discord release assembly
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: dotnet build plugin/src/Jellyfin.Plugin.MediaHub.Discord/Jellyfin.Plugin.MediaHub.Discord.csproj -c Release --nologo -p:RequireActivityBundle=true -p:Version="$RELEASE_VERSION" -p:AssemblyVersion="$RELEASE_VERSION" -p:FileVersion="$RELEASE_VERSION" -p:InformationalVersion="$RELEASE_VERSION" -p:ContinuousIntegrationBuild=true -o plugin/artifacts/discord-build
+      - name: Build two ZIPs and preserve both catalogue histories
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
           GH_TOKEN: ${{ github.token }}
@@ -75,14 +85,17 @@ jobs:
         run: |
           # Release assets are authoritative even if a previous Pages deployment failed.
           # API/download errors fail closed instead of silently replacing history.
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.tag_name | startswith("plugin-v")) | .tag_name' > release-tags.txt
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.draft == false) | select(.tag_name | test("^(plugin|discord)-v")) | .tag_name' > release-tags.txt
           previous=()
-          if [[ -s release-tags.txt ]]; then
-            latest=$(sort -V release-tags.txt | tail -n 1)
-            gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir previous
-            previous=(--previous previous/manifest.json)
-          fi
-          dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --input plugin/artifacts/build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --repository "$GITHUB_REPOSITORY" --version "$RELEASE_VERSION" "${previous[@]}"
+          for prefix in plugin discord; do
+            latest=$(grep "^${prefix}-v" release-tags.txt | sort -V | tail -n 1 || true)
+            if [[ -n "$latest" ]]; then
+              [[ "$latest" =~ ^(plugin|discord)-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+              gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir "previous/$prefix"
+              previous=(--history previous)
+            fi
+          done
+          dotnet run --project plugin/tools/MediaHub.Packager -c Release -- --plugin both --input plugin/artifacts/build --discord-input plugin/artifacts/discord-build --output plugin/artifacts/repository --metadata plugin/repository/plugin.json --discord-metadata plugin/repository/discord.json --repository "$GITHUB_REPOSITORY" --version "$RELEASE_VERSION" "${previous[@]}"
       - name: Install isolated browser tooling
         run: npm install --prefix "$RUNNER_TEMP/mediahub-browser" --ignore-scripts --no-audit --no-fund playwright-core@1.64.1 axe-core@4.14.0
       - name: Install test Chromium
@@ -92,7 +105,7 @@ jobs:
         run: |
           curl --fail --location --max-time 90 --output "$RUNNER_TEMP/PrivateSyncPlay-0.1.5.zip" https://github.com/someRandomDude-a/private-syncplay-groups/releases/download/v0.1.5/PrivateSyncPlay-0.1.5.zip
           echo "d467ba8f4122dcb015f80afac5c18bad02037200fcf727c3bff88d8ea0d2ea8a  $RUNNER_TEMP/PrivateSyncPlay-0.1.5.zip" | sha256sum --check -
-      - name: Gate the exact ZIP on native lifecycle and browser smoke
+      - name: Gate both exact ZIPs on native lifecycle and browser smoke
         shell: pwsh
         env:
           LOCALAPPDATA: ${{ runner.temp }}/mediahub-acceptance
@@ -100,7 +113,9 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           ./plugin/tools/Test-StartupDiagnostic.ps1
-          ./plugin/tools/Test-ReleaseSmoke.ps1 -Package "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub_$env:RELEASE_VERSION.zip" -Version $env:RELEASE_VERSION -PlaywrightModule "$env:RUNNER_TEMP/mediahub-browser/node_modules/playwright-core/index.mjs" -AxeFile "$env:RUNNER_TEMP/mediahub-browser/node_modules/axe-core/axe.min.js" -ProviderZip "$env:RUNNER_TEMP/PrivateSyncPlay-0.1.5.zip"
+          ./plugin/tools/Test-CataloguePublication.ps1
+          ./plugin/tools/Test-ReleaseSmoke.ps1 -Package "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub_$env:RELEASE_VERSION.zip" -DiscordPackage "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub.Discord_$env:RELEASE_VERSION.zip" -Version $env:RELEASE_VERSION -PlaywrightModule "$env:RUNNER_TEMP/mediahub-browser/node_modules/playwright-core/index.mjs" -AxeFile "$env:RUNNER_TEMP/mediahub-browser/node_modules/axe-core/axe.min.js" -ProviderZip "$env:RUNNER_TEMP/PrivateSyncPlay-0.1.5.zip"
+          ./plugin/tools/Test-Split.ps1 -CorePackage "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub_$env:RELEASE_VERSION.zip" -DiscordPackage "plugin/artifacts/repository/Jellyfin.Plugin.MediaHub.Discord_$env:RELEASE_VERSION.zip" -Version $env:RELEASE_VERSION
       - name: Retain sanitized startup diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -124,19 +139,12 @@ jobs:
         with:
           name: plugin-repository
           path: repository
-      - name: Publish immutable preview release
+      - name: Publish both verified preview releases for the combined catalogue
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.package.outputs.version }}
-        run: gh release create "plugin-v${RELEASE_VERSION}" "repository/Jellyfin.Plugin.MediaHub_${RELEASE_VERSION}.zip" repository/manifest.json repository/SHA256SUMS --target "$GITHUB_SHA" --title "Media Hub plugin preview ${RELEASE_VERSION}" --notes-file plugin/repository/RELEASE_NOTES.md --prerelease --latest=false
-      - name: Download the published ZIP and checksum
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ needs.package.outputs.version }}
-        run: gh release download "plugin-v${RELEASE_VERSION}" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --pattern SHA256SUMS --dir published
-      - name: Verify downloaded release bytes before catalog deployment
-        run: sha256sum --check SHA256SUMS
-        working-directory: published
+        run: ./plugin/tools/Publish-PluginCatalogue.ps1 -Directory repository -Version $env:RELEASE_VERSION -Repository $env:GITHUB_REPOSITORY -Commit $env:GITHUB_SHA -Publish
   repository:
     needs: release
     runs-on: ubuntu-latest

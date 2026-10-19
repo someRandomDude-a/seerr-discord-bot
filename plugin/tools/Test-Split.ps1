@@ -4,13 +4,14 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$Version = '0.1.0.0',
     [ValidatePattern('^mediahub-test-[a-z0-9-]{1,35}$')][string]$Name = 'mediahub-test-split',
     [ValidateRange(1024, 65535)][int]$Port = 18596,
+    [ValidateRange(10, 300)][int]$StartupTimeoutSeconds = 180,
     [switch]$ResumeAfterCore
 )
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $env:LOCALAPPDATA 'Temp/opencode'
 $stateFile = Join-Path $root ($name + '.json')
 $harness = Join-Path $PSScriptRoot 'Test-Jellyfin.ps1'
-$arguments = @{ Name = $name; Port = $port; PackageVersion = $Version }
+$arguments = @{ Name = $name; Port = $port; PackageVersion = $Version; StartupTimeoutSeconds = $StartupTimeoutSeconds }
 $dockerHelper = Join-Path $PSScriptRoot 'Invoke-TestDocker.ps1'
 $existing = @(& $dockerHelper -Arguments @('ps', '-a', '--format', '{{.Names}}') -TimeoutSeconds 15)
 if (!$ResumeAfterCore -and ((Test-Path $stateFile) -or $existing -contains $name)) { throw 'Split acceptance requires a fresh owned fixture; existing state was not changed.' }
@@ -37,12 +38,21 @@ function Api($path, $method = 'GET', $viewer = $false) {
     catch { throw ('Split API verification failed for ' + $path + '. Credentials and response withheld.') }
 }
 function Ready {
-    $deadline = [DateTime]::UtcNow.AddSeconds(60)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        try { if ((Invoke-RestMethod -Uri ('http://127.0.0.1:' + $port + '/health') -TimeoutSec 2) -eq 'Healthy') { return } } catch { }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $StartupTimeoutSeconds) {
+        try {
+            $info = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $port + '/System/Info/Public') -TimeoutSec 2
+            $health = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $port + '/health') -TimeoutSec 2
+            if ($info.Version -ceq '12.2.0' -and $health -is [string] -and $health.Trim() -ceq 'Healthy') { return }
+        } catch { }
         [Threading.Tasks.Task]::Delay(1000).GetAwaiter().GetResult()
     }
-    throw 'The owned split fixture did not become healthy.'
+    try {
+        $diagnostic = & (Join-Path $PSScriptRoot 'Get-TestStartupDiagnostic.ps1') -Name $name -Phase install-restart
+        $encoded = $diagnostic | ConvertTo-Json -Depth 4; Write-Host $encoded
+        [IO.File]::WriteAllText((Join-Path $root ($name + '.startup-diagnostic.json')), $encoded, (New-Object Text.UTF8Encoding($false)))
+    } catch { Write-Warning 'Sanitized split startup diagnostics could not be retained; private content withheld.' }
+    throw ('The owned split fixture did not become healthy within ' + $StartupTimeoutSeconds + ' seconds.')
 }
 function Status($installed) {
     $status = Api 'MediaHub/Status' 'GET' $true

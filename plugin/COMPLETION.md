@@ -121,6 +121,69 @@ before resuming exact-ZIP tests; do not reset or replace retained state to proce
 
 ## Local gap closure
 
+### Shared two-plugin catalogue publisher
+
+The requested catalogue installation path now uses one publication workflow and
+the existing repository URL for **both separate plugin entries**. The packager's
+`--plugin both` mode emits distinct core/Discord ZIPs, a combined manifest and both
+SHA-256 checksums. It merges authoritative core/Discord release snapshots without
+dropping older versions; immutable-history conflicts and non-empty output fail closed.
+The core remains independently installable. Dependencies are still separately installed.
+
+The shared publisher builds/tests both release-version assemblies, checks both
+dependency graphs, and includes exact-ZIP split lifecycle gates. Generated-media
+player gates now receive the separate adapter and checksum-pinned provider instead
+of assuming the old monolith contains them. Publication creates/resumes drafts,
+downloads/verifies both ZIPs and the identical combined manifest, publishes separate
+`plugin-v…`/`discord-v…` prereleases, then allows Pages deployment. Existing bytes
+are never overwritten; an interrupted run can resume only from its retained artifact.
+
+Local verification: **352 core / 71 adapter / 113 browser** tests pass, including
+seven new catalogue-packaging tests. Offline publication simulations pass for
+explicit authorization, immutable reruns, missing/conflicting assets, partial
+draft recovery, corrupt downloads, incomplete visibility proof and interrupted
+create/publish recovery. PowerShell syntax checks, startup-diagnostic self-tests,
+actionlint 1.7.12 and a real two-ZIP CLI packaging/checksum check also pass.
+One stale browser assertion expecting the old monolithic README title was updated
+to check the documented split and independent settings instead.
+
+This is source/local-tool verification, **not** a live catalogue installation or
+a new pass of the full Docker/provider acceptance matrix. No commit, push, remote
+workflow, publication or production activation was performed. The live catalogue
+will change only after an authorized successful publication; production readiness
+and `FeatureParityComplete` remain false. Installation docs distinguish that state
+from the newly implemented shared publisher and the build-only Discord CI artifact.
+
+### Release startup timeout follow-up
+
+Docker Desktop is now running. A fresh, separately labelled
+`mediahub-test-release-diag` fixture configured successfully on loopback port 18896.
+The exact `split-20261019-r2` core ZIP passed install, explicit restart, pinned Web
+dependency installation and native API checks using the **original 60-second**
+startup budget. Native fixture state and user isolation remained intact, malformed
+bodies were rejected, and Discord/automatic deletion stayed disabled. This does
+not reproduce or explain the reported GitHub runner timeout, and is not acceptance
+of an unspecified runner artifact or the entire dual-plugin release matrix.
+
+The harness now defaults to a bounded **180-second** startup budget for slower
+workers (`-StartupTimeoutSeconds`, range 10–300), still requiring public info and
+the actual healthy endpoint together. Every wait identifies its lifecycle phase.
+Failure diagnostics contain only allowlisted container state/exit/OOM metadata,
+probe status and fixed failure-category flags. No raw logs, environment, account
+identities, credentials or HTTP response bodies are written or uploaded. A separate
+diagnostic self-test checks redaction/ownership/error handling without Docker.
+The release workflow retains only `*.startup-diagnostic.json` on failure; the
+extra dot cannot appear in a validated fixture name, so private
+fixture credential JSON files are excluded. Docker cleanup is bounded and scoped
+to the exact owned fixture, and never resets a daemon or deletes volumes.
+
+Root-path browser/keyboard/deep-link and scoped axe checks also passed on that
+fresh fixture, with zero reported WCAG violations in the tested surfaces and no
+implicit settings/viewer writes. Native uninstall/reinstall passed, retaining
+plugin state and the unchanged native baseline. Only the owned fixture was then
+stopped; its private credentials/volumes were retained. Non-root, dual-plugin,
+generated-media/provider and the GitHub-runner artifact remain separate gates.
+
 - Non-root Plugin Pages links resolve the server base path **once**, including bookmark,
   notification and login-handoff links. `Test-Completion.ps1` uses a distinct owned Jellyfin
   fixture with `/mediahub`, automatic dependency injection and authenticated deep-link reloads.

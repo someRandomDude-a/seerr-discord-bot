@@ -205,11 +205,25 @@ public static class Program
         {
             var options = new Dictionary<string, string>(StringComparer.Ordinal);
             if (args.Length % 2 != 0) throw new ArgumentException("Use --input DIR --output DIR --metadata FILE --repository OWNER/REPO --version A.B.C.D [--previous FILE].");
-            var allowed = new[] { "--input", "--output", "--metadata", "--repository", "--version", "--previous", "--plugin" };
+            var allowed = new[] { "--input", "--output", "--metadata", "--repository", "--version", "--previous", "--plugin", "--discord-input", "--discord-metadata", "--history" };
             for (var i = 0; i < args.Length; i += 2)
                 if (!allowed.Contains(args[i]) || !options.TryAdd(args[i], args[i + 1])) throw new ArgumentException("Unknown or repeated option.");
             foreach (var required in allowed[..5]) if (!options.ContainsKey(required)) throw new ArgumentException("Missing option: " + required);
-            var plugin = options.GetValueOrDefault("--plugin", "core") switch { "core" => PluginPackage.Core, "discord" => PluginPackage.Discord, _ => throw new ArgumentException("Use --plugin core or discord.") };
+            if (options.GetValueOrDefault("--plugin") == "both")
+            {
+                if (!options.ContainsKey("--discord-input") || !options.ContainsKey("--discord-metadata")) throw new ArgumentException("Both-plugin packaging requires --discord-input and --discord-metadata.");
+                var history = new List<string>(); if (options.TryGetValue("--previous", out var prior)) history.Add(prior);
+                if (options.TryGetValue("--history", out var directory)) {
+                    if (!Directory.Exists(directory)) throw new DirectoryNotFoundException("Published history directory does not exist.");
+                    var files = Directory.GetFiles(directory, "manifest.json", SearchOption.AllDirectories);
+                    if (files.Length == 0) throw new InvalidDataException("Published history directory is empty; refusing to silently reset history.");
+                    history.AddRange(files.Order(StringComparer.Ordinal));
+                }
+                var repository = CatalogBuilder.CreateRepository(options["--input"], options["--discord-input"], options["--output"], options["--metadata"], options["--discord-metadata"], options["--repository"], options["--version"], history);
+                Console.WriteLine("Created separate core/Discord ZIPs and combined catalog: " + repository.Manifest); return 0;
+            }
+            if (options.ContainsKey("--discord-input") || options.ContainsKey("--discord-metadata") || options.ContainsKey("--history")) throw new ArgumentException("Repository options require --plugin both.");
+            var plugin = options.GetValueOrDefault("--plugin", "core") switch { "core" => PluginPackage.Core, "discord" => PluginPackage.Discord, _ => throw new ArgumentException("Use --plugin core, discord or both.") };
             var result = CatalogBuilder.Create(options["--input"], options["--output"], options["--metadata"], options["--repository"], options["--version"], options.GetValueOrDefault("--previous"), plugin);
             Console.WriteLine("Created " + result.Archive); Console.WriteLine("Created " + result.Manifest); return 0;
         }

@@ -2,6 +2,8 @@ param(
     [Parameter(Mandatory)][string]$Package,
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')][string]$PackageVersion = '0.1.0.0',
     [string]$PlaywrightModule,
+    [string]$DiscordPackage,
+    [string]$ProviderZip,
     [switch]$ResumeEmptyFixture
 )
 $ErrorActionPreference = 'Stop'
@@ -9,6 +11,8 @@ $name = 'mediahub-test-visibility'; $port = 18496
 $root = Join-Path $env:LOCALAPPDATA 'Temp/opencode'
 $stateFile = Join-Path $root ($name + '.json')
 if (!(Test-Path $Package -PathType Leaf)) { throw 'A selected exact plugin ZIP is required before any fixture change.' }
+if ([bool]$DiscordPackage -ne [bool]$ProviderZip) { throw 'Real player acceptance needs both the separate Discord package and the pinned provider before any fixture change.' }
+if ($DiscordPackage -and (!(Test-Path -LiteralPath $DiscordPackage -PathType Leaf) -or !(Test-Path -LiteralPath $ProviderZip -PathType Leaf))) { throw 'Both selected test dependency ZIPs must exist before any fixture change.' }
 if ((Test-Path $stateFile) -and !$ResumeEmptyFixture) { throw 'This fresh media fixture refuses retained state. Nothing was replaced.' }
 $dockerExe = (Get-Command docker -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 function Docker {
@@ -48,6 +52,9 @@ try {
     } else { & (Join-Path $PSScriptRoot 'Test-Jellyfin.ps1') -Mode Start -Name $name -Port $port -PackageVersion $PackageVersion }
     & (Join-Path $PSScriptRoot 'Test-Jellyfin.ps1') -Mode Install -Name $name -Port $port -Package $Package -PackageVersion $PackageVersion
     & (Join-Path $PSScriptRoot 'Test-WebDependencies.ps1') -Name $name -Port $port
+    if ($DiscordPackage -or $ProviderZip) {
+        & (Join-Path $PSScriptRoot 'Install-TestDiscord.ps1') -Name $name -Port $port -Version $PackageVersion -DiscordPackage $DiscordPackage -ProviderZip $ProviderZip
+    }
     & (Join-Path $PSScriptRoot 'Test-Jellyfin.ps1') -Mode Check -Name $name -Port $port -PackageVersion $PackageVersion
     Own
     $state=Get-Content $stateFile -Raw|ConvertFrom-Json
